@@ -484,3 +484,7 @@ $RECYCLE.BIN/
 # Other
 output/
 *.raw
+*.mp4
+*.csv
+*.m4a
+*.png
