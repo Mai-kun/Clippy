@@ -154,18 +154,20 @@ internal sealed class AudioCapture : IDisposable
         if (firstBufferHundredNanos == 0)
             Interlocked.CompareExchange(ref firstBufferHundredNanos, qpcPosition, 0);
 
-        // First packet: emit the measured gap as silence so the audio origin lands on the video's
-        // first frame. Derived from the shared Stopwatch every run, so it tracks this run's real start
-        // difference rather than a hardcoded constant. If audio began BEFORE video there is nothing
-        // to pre-pend; that case is reported instead of passing unnoticed.
+        // First packet: the measured gap is REPORTED, but no silence is prepended.
+        //
+        // The silence used to be necessary: in phase 3 audio went straight into ffmpeg, which had no
+        // per-packet timestamps, so the only way to move the audio origin onto the video origin was
+        // to physically insert silence. Phase 4 changed that -- every audio packet now carries a
+        // CaptureClockSeconds taken from the SAME shared Stopwatch as the video, and the ring slices
+        // and the muxer align on those timestamps. The gap is therefore already expressed in the
+        // timestamps, and prepending silence on top of it double-compensates: measured as a ~0.43 s
+        // constant offset between the video flash and the audio beep on the ring-buffer export.
         if (Interlocked.Increment(ref packetsSeen) == 1)
         {
             var gapSeconds = stopwatch.Elapsed.TotalSeconds - videoStartSeconds;
             Console.WriteLine($"[sync] first WASAPI callback at {stopwatch.Elapsed.TotalSeconds:F3}s " +
-                $"(video origin {videoStartSeconds:F3}s, gap {gapSeconds:F3}s)");
-            PrependSilence(gapSeconds);
-            if (gapSeconds < 0)
-                Console.WriteLine($"Audio: started {gapSeconds * 1000:F1} ms BEFORE video; cannot shift back.");
+                $"(video origin {videoStartSeconds:F3}s, gap {gapSeconds:F3}s; not prepended)");
         }
 
         // The QPC position is the packet's true capture time on the same system clock that
