@@ -4,6 +4,9 @@
 param([int]$Count = 15, [int]$GapMs = 4700, [int]$InitialDelayMs = 0)
 
 $wav = "$env:TEMP\av.wav"
+# ALWAYS verify a generated test media file with `ffprobe -show_entries format=duration` immediately
+# after creating it, before anything consumes it. A 60 s tone generated where a 0.15 s beep was
+# intended made the marker detector report dozens of phantom beeps, and cost whole rounds.
 if ($InitialDelayMs -gt 0) {
     # Artificial A/V error: start the audio marker late so the recorder's dynamic correction has a
     # known offset to remove. Used to validate the alignment path.

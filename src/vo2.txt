@@ -1,0 +1,43 @@
+Capture output: D:\_Usefull Trash\CodeProjects\Clippy\src\output
+Waiting for frames from Windows.Graphics.Capture.
+Recording D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-230659.mp4 [h264_nvenc]
+[sync] audio drain thread start at 0.797s
+Audio: system loopback [Extensible 48000 Hz, 2 ch, 32 bit]
+[sync] video drain thread start at 0.899s
+Encoding 1920x1080 into ring (max 190s)
+[sync] video WaitForReady 0.973s -> 0.979s (blocked 0.005s)
+[sync] audio capture started at 1.054s
+Both encoders are reading; recording.
+Capture FPS: 0.9; last interval: 408.9 ms.
+Capture FPS: 30.5; last interval: 15.3 ms.
+Capture FPS: 27.9; last interval: 229.5 ms.
+Capture FPS: 46.9; last interval: 17.9 ms.
+Capture FPS: 12.9; last interval: 104.3 ms.
+Capture FPS: 10.2; last interval: 207.9 ms.
+Capture FPS: 9.6; last interval: 225.8 ms.
+Capture FPS: 10.4; last interval: 101.1 ms.
+Capture FPS: 10.4; last interval: 100.9 ms.
+Capture FPS: 10.2; last interval: 102.2 ms.
+Capture FPS: 9.8; last interval: 41.4 ms.
+Capture FPS: 7.4; last interval: 147.5 ms.
+Capture FPS: 7.5; last interval: 188.0 ms.
+Stopping capture: capture duration 14s elapsed.
+Capture stopped after 207 frames.
+[sync] capture stop at 14.696s
+Capture FPS: 4.7; last interval: 271.8 ms.
+Capture FPS: 3.8; last interval: 333.5 ms.
+Capture FPS: 3.8; last interval: 374.2 ms.
+Capture FPS: 3.7; last interval: 479.2 ms.
+Capture FPS: 2.9; last interval: 499.5 ms.
+Capture FPS: 4.6; last interval: 84.2 ms.
+[sync] both drains joined at 20.708s
+[sync] video ring spans [0.953 .. 20.654]s
+Export: frames in 230, access units out 227, paired MISMATCH (3 pending)
+Export: capture/access-unit counts differ; timestamps may be mispaired.
+Export: no audio in range; writing a VIDEO-ONLY clip on purpose.
+Export: video slice 227 pkts, clock [6.802 .. 20.654] s, first is keyframe: False
+Export: wrote D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-230720259.mp4 (88 samples)
+Audio: 0 buffers, 0 bytes, started at 0.000s on the capture clock.
+Audio: 0 buffers encoded, none dropped.
+ffmpeg log: D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-230659.video.ffmpeg-debug.log
+Mux skipped: no audio file was produced.

@@ -1,0 +1,34 @@
+Capture output: D:\_Usefull Trash\CodeProjects\Clippy\output
+Waiting for frames from Windows.Graphics.Capture.
+Recording D:\_Usefull Trash\CodeProjects\Clippy\output\clip-20260927-203215.mp4 [h264_nvenc]
+Audio: system loopback [Extensible 48000 Hz, 2 ch, 32 bit]
+Encoding 1920x1080 into ring (max 190s)
+Both encoders are reading; recording.
+Audio: prepended 687.2 ms of silence to align with the video origin.
+Capture FPS: 0.5; last interval: 767.7 ms.
+Capture FPS: 5.0; last interval: 47.5 ms.
+Capture FPS: 15.0; last interval: 21.2 ms.
+Capture FPS: 15.6; last interval: 330.3 ms.
+Capture FPS: 14.0; last interval: 54.4 ms.
+Capture FPS: 35.9; last interval: 26.0 ms.
+Capture FPS: 29.5; last interval: 21.8 ms.
+Capture FPS: 18.6; last interval: 28.6 ms.
+Capture FPS: 46.3; last interval: 18.8 ms.
+Capture FPS: 42.9; last interval: 19.4 ms.
+Capture FPS: 45.2; last interval: 18.6 ms.
+Stopping capture: capture duration 12s elapsed.
+Capture stopped after 303 frames.
+Capture FPS: 28.6; last interval: 125.4 ms.
+Capture FPS: 13.6; last interval: 435.3 ms.
+Capture FPS: 45.8; last interval: 24.5 ms.
+Capture FPS: 33.8; last interval: 42.0 ms.
+Capture FPS: 8.8; last interval: 269.0 ms.
+Export: frames in 425, access units out 422, paired MISMATCH (3 pending)
+Export: capture/access-unit counts differ; timestamps may be mispaired.
+Export: video slice 703 pkts, clock [7.207 .. 18.823] s, first is keyframe: False
+Export: audio slice 560 pkts, clock [7.239 .. 19.102] s
+Export: wrote D:\_Usefull Trash\CodeProjects\Clippy\output\clip-203235076.mp4 (871 samples)
+Audio: 3476 buffers, 6696960 bytes, started at 261053792.112s on the capture clock.
+Audio: 3477 buffers encoded, none dropped.
+ffmpeg log: D:\_Usefull Trash\CodeProjects\Clippy\output\clip-20260927-203215.video.ffmpeg-debug.log
+Mux skipped: no audio file was produced.

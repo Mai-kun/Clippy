@@ -22,6 +22,7 @@ internal static class RingBufferSelfTest
         failures += Check("audio: trim leaves no time gap", AudioTrimHasNoGaps);
         failures += Check("slice: honours the requested range", SliceRespectsRange);
         failures += Check("buffer: padding past Length never leaks", PaddingDoesNotLeak);
+    failures += Check("buffer: concurrent Push while slicing", ConcurrentPushAndSlice);
 
         Console.WriteLine(failures == 0 ? "RING SELFTEST: OK" : $"RING SELFTEST: FAILED ({failures})");
         return failures;
@@ -49,6 +50,104 @@ internal static class RingBufferSelfTest
     }
 
     private static byte[] Rented(int size = 64) => System.Buffers.ArrayPool<byte>.Shared.Rent(size);
+
+    /// <summary>
+    /// One thread pushes continuously while another slices, which is what the live recorder does.
+    /// Slice returns the ring's own StoredPacket objects, so a torn read here would show up as an
+    /// out-of-range list access or a packet whose length does not match its buffer. Before the ring
+    /// was made thread-safe this test reproduced both.
+    /// </summary>
+    private static string? ConcurrentPushAndSlice()
+    {
+        var ring = new RingBuffer(MaxSeconds, isVideo: true);
+        var error = (string?)null;
+        Exception? thrown = null;
+        using var cts = new CancellationTokenSource();
+
+        var pusher = new Thread(() =>
+        {
+            try
+            {
+                for (var i = 0; i < 20000; i++)
+                {
+                    ring.Push(Rented(), 64, i / Fps, i % 30 == 0);
+
+                    // Without a yield the pusher finishes before the slicer really gets going, and
+                    // the test passes while proving nothing. Yielding widens the overlap window.
+                    if (i % 8 == 0)
+                    {
+                        Thread.Yield();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+        });
+
+        var slicer = new Thread(() =>
+        {
+            try
+            {
+                while (!pusher.IsAlive && !cts.IsCancellationRequested)
+                {
+                }
+
+                var slices = 0;
+                var seen = 0;
+                while (pusher.IsAlive)
+                {
+                    var slice = ring.Slice(0, double.MaxValue);
+                    slices++;
+                    seen += slice.Count;
+
+                    // Every returned packet must be readable and self-consistent. The ring owns these
+                    // buffers, so Length must fit inside Data; a torn read would break that.
+                    foreach (var packet in slice)
+                    {
+                        if (packet.Data is null || packet.Length < 0 || packet.Length > packet.Data.Length)
+                        {
+                            error = $"torn packet: Length={packet.Length}, Data.Length={packet.Data?.Length}";
+                            return;
+                        }
+
+                        if (packet.Span.Length != packet.Length)
+                        {
+                            error = "Span length disagrees with Length";
+                            return;
+                        }
+                    }
+                }
+
+                // A green result is worthless if the two threads never actually overlapped. Slice
+                // copies every packet, so it is far more expensive than it was and completes fewer
+                // times per push batch; a handful of full slices taken while the pusher is still
+                // running is already substantial overlap.
+                if (slices < 3 || seen < 1000)
+                {
+                    error = $"slicer got {slices} slices / {seen} packets: no real overlap, test proves nothing";
+                }
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+        });
+
+        pusher.Start();
+        slicer.Start();
+        pusher.Join();
+        slicer.Join();
+        cts.Cancel();
+
+        if (thrown is not null)
+        {
+            return $"{thrown.GetType().Name}: {thrown.Message}";
+        }
+
+        return error;
+    }
 
     /// <summary>Pushes `seconds` of 30 fps video, an I-frame every second, tracking the widest span.</summary>
     private static (RingBuffer Ring, double WorstSpan) PushVideo(double seconds)

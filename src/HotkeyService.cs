@@ -1,0 +1,174 @@
+﻿using System.Runtime.InteropServices;
+
+namespace Clippy;
+
+/// <summary>
+/// Global hotkeys for saving a clip while recording (phase 6). F9 saves 30 s, F10 saves 3 min.
+///
+/// A low-level keyboard hook (WH_KEYBOARD_LL) calls back on the thread that installed it, and the
+/// OS gives that callback roughly a second before it silently unhooks us. So the callback does the
+/// least possible work -- map the key, write a field, signal an event -- and a DEDICATED worker
+/// thread performs the export. Not a pool thread: an export takes seconds, and the pool is shared
+/// with everything else in the process.
+/// </summary>
+public sealed class HotkeyService : IDisposable
+{
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int VK_F9 = 0x78;
+    private const int VK_F10 = 0x79;
+
+    /// <summary>F9: 30 s. F10: 3 min. The longest is under the ring's 190 s capacity.</summary>
+    private const double F9Seconds = 30;
+    private const double F10Seconds = 180;
+
+    private readonly Action<double> export;
+    private readonly AutoResetEvent work = new(false);
+
+    // Milliseconds, as a long, so the hook can swap it atomically and the worker can drain it in
+    // one interlocked op. A double field cannot be volatile, and the exchange must be atomic.
+    private long pendingTicks;
+    private Thread? worker;
+    private Thread? pump;
+    private readonly ManualResetEvent hookReady = new(false);
+    private IntPtr hook = IntPtr.Zero;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Msg
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public System.Drawing.Point location;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern int GetMessage(out Msg msg, IntPtr hWnd, uint min, uint max);
+
+    [DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref Msg msg);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessage(ref Msg msg);
+
+    public HotkeyService(Action<double> export) => this.export = export;
+
+    public void Start()
+    {
+        worker = new Thread(WorkerLoop)
+        {
+            IsBackground = true,
+            Name = "clippy-export",
+        };
+        worker.Start();
+
+        // The hook MUST be installed on a thread that pumps messages. A low-level hook procedure is
+        // invoked by posting a message to the installing thread; the capture thread is parked in
+        // stopped.Wait() and pumps nothing, so the hook silently receives nothing and every key
+        // looks dead. That is exactly what we saw: SendInput of F9 produced no export at all.
+        pump = new Thread(HookThread)
+        {
+            IsBackground = true,
+            Name = "clippy-hotkey",
+        };
+        pump.Start();
+        hookReady.WaitOne(TimeSpan.FromSeconds(5));
+    }
+
+    private void HookThread()
+    {
+        hookReady.Reset();
+        hook = SetWindowsHookEx(WH_KEYBOARD_LL, HookProc, GetModuleHandle(null), 0);
+        hookReady.Set();
+
+        if (hook == IntPtr.Zero)
+        {
+            Console.WriteLine(
+                $"SetWindowsHookEx failed for WH_KEYBOARD_LL (error {Marshal.GetLastWin32Error()}).");
+            return;
+        }
+
+        // Standard message pump. Without it the hook callback is never invoked.
+        while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
+        {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+    }
+
+    private void WorkerLoop()
+    {
+        while (true)
+        {
+            work.WaitOne();
+
+            // Read the pending value ONCE and clear it, so a second press during an export is not
+            // lost -- it simply overwrites and runs as soon as this one finishes.
+            var seconds = Interlocked.Exchange(ref pendingTicks, 0);
+            if (seconds == 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                export(seconds / 1000.0);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Export failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
+
+    private IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam)
+    {
+        if (code >= 0 && (wParam.ToInt32() == WM_KEYDOWN || wParam.ToInt32() == WM_SYSKEYDOWN))
+        {
+            var vk = Marshal.ReadInt32(lParam);
+            double? seconds = vk switch
+            {
+                VK_F9 => F9Seconds,
+                VK_F10 => F10Seconds,
+                _ => null,
+            };
+
+            if (seconds is { } s)
+            {
+                // Everything below is the hook callback, so it stays trivial.
+                Interlocked.Exchange(ref pendingTicks, (long)(s * 1000));
+                work.Set();
+            }
+        }
+
+        return CallNextHookEx(hook, code, wParam, lParam);
+    }
+
+    public void Dispose()
+    {
+        if (hook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(hook);
+            hook = IntPtr.Zero;
+        }
+
+        work.Dispose();
+    }
+
+    private delegate IntPtr HookProcDelegate(int code, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, HookProcDelegate lpfn, IntPtr hMod, uint threadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
+}

@@ -1,0 +1,55 @@
+Capture output: D:\_Usefull Trash\CodeProjects\Clippy\output
+Waiting for frames from Windows.Graphics.Capture.
+Recording D:\_Usefull Trash\CodeProjects\Clippy\output\clip-20260927-211010.mp4 [h264_nvenc]
+[sync] audio drain thread start at 1.832s
+Audio: system loopback [Extensible 48000 Hz, 2 ch, 32 bit]
+[sync] video drain thread start at 2.213s
+Encoding 1920x1080 into ring (max 190s)
+Both encoders are reading; recording.
+Audio: prepended 1052.4 ms of silence to align with the video origin.
+Capture FPS: 0.4; last interval: 1087.0 ms.
+Capture FPS: 2.0; last interval: 968.3 ms.
+Capture FPS: 30.6; last interval: 32.0 ms.
+Capture FPS: 31.6; last interval: 49.5 ms.
+Capture FPS: 36.7; last interval: 21.5 ms.
+Capture FPS: 42.8; last interval: 34.8 ms.
+Capture FPS: 45.4; last interval: 18.8 ms.
+Capture FPS: 43.0; last interval: 49.5 ms.
+Capture FPS: 41.8; last interval: 20.7 ms.
+Capture FPS: 38.0; last interval: 19.4 ms.
+Capture FPS: 43.1; last interval: 25.1 ms.
+Capture FPS: 36.5; last interval: 18.5 ms.
+Capture FPS: 38.5; last interval: 52.3 ms.
+Capture FPS: 44.6; last interval: 20.6 ms.
+Capture FPS: 46.4; last interval: 21.1 ms.
+Capture FPS: 44.1; last interval: 37.4 ms.
+Capture FPS: 41.6; last interval: 18.9 ms.
+Capture FPS: 44.5; last interval: 17.2 ms.
+Capture FPS: 49.4; last interval: 18.1 ms.
+Capture FPS: 46.3; last interval: 30.6 ms.
+Capture FPS: 43.6; last interval: 16.5 ms.
+Capture FPS: 45.8; last interval: 20.8 ms.
+Capture FPS: 41.1; last interval: 41.4 ms.
+Capture FPS: 41.2; last interval: 39.5 ms.
+Stopping capture: capture duration 25s elapsed.
+Capture stopped after 959 frames.
+[sync] capture stop at 26.490s
+Capture FPS: 42.6; last interval: 19.8 ms.
+Capture FPS: 42.8; last interval: 34.8 ms.
+Capture FPS: 45.9; last interval: 20.2 ms.
+Capture FPS: 43.3; last interval: 17.8 ms.
+Capture FPS: 43.7; last interval: 36.5 ms.
+Capture FPS: 42.0; last interval: 20.8 ms.
+[sync] both drains joined at 32.517s
+[sync] video ring spans [2.259 .. 32.516]s
+[sync] audio ring spans [2.579 .. 32.476]s
+Export: frames in 1222, access units out 1218, paired MISMATCH (4 pending)
+Export: capture/access-unit counts differ; timestamps may be mispaired.
+Export: video slice 2236 pkts, clock [7.529 .. 32.516] s, first is keyframe: False
+Export: audio slice 1172 pkts, clock [7.574 .. 32.476] s
+Capture FPS: 41.9; last interval: 69.7 ms.
+Export: wrote D:\_Usefull Trash\CodeProjects\Clippy\output\clip-211043421.mp4 (2207 samples)
+Audio: 6121 buffers, 11784960 bytes, started at 263329307.405s on the capture clock.
+Audio: 6122 buffers encoded, none dropped.
+ffmpeg log: D:\_Usefull Trash\CodeProjects\Clippy\output\clip-20260927-211010.video.ffmpeg-debug.log
+Mux skipped: no audio file was produced.

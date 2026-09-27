@@ -161,6 +161,8 @@ internal sealed class AudioCapture : IDisposable
         if (Interlocked.Increment(ref packetsSeen) == 1)
         {
             var gapSeconds = stopwatch.Elapsed.TotalSeconds - videoStartSeconds;
+            Console.WriteLine($"[sync] first WASAPI callback at {stopwatch.Elapsed.TotalSeconds:F3}s " +
+                $"(video origin {videoStartSeconds:F3}s, gap {gapSeconds:F3}s)");
             PrependSilence(gapSeconds);
             if (gapSeconds < 0)
                 Console.WriteLine($"Audio: started {gapSeconds * 1000:F1} ms BEFORE video; cannot shift back.");

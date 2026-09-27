@@ -1,7 +1,14 @@
-# Visual marker for the A/V test: a normal maximised WinForms window (NOT exclusive fullscreen, which
+﻿# Visual marker for the A/V test: a normal maximised WinForms window (NOT exclusive fullscreen, which
 # WGC did not capture here) whose background alternates black/white every 5 s.
 #   powershell -File flash-window.ps1 [-PeriodMs 5000] [-OnMs 100]
-param([int]$PeriodMs = 5000, [int]$OnMs = 100)
+param([int]$PeriodMs = 5000, [int]$OnMs = 250)
+# OnMs must stay BELOW the 0.5 s marker-merge threshold in av-sync.py. A longer pulse makes one
+# flash register as two hits and the pairing then binds each half to a different beep. 250 ms is
+# several times the ~67 ms frame interval at 15 fps, so it is reliably captured.
+#
+# ALWAYS verify a generated test media file with `ffprobe -show_entries format=duration` immediately
+# after creating it, before anything consumes it. This project has twice lost rounds to unverified
+# files with an unexpected duration.
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -67,3 +74,5 @@ $form.Add_Shown({
     $clock.Start()
 })
 [void]$form.ShowDialog()
+
+

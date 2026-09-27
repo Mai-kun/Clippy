@@ -54,8 +54,24 @@ if (args.FirstOrDefault() == "--record")
     // Bisection: WASAPI runs, audio ffmpeg does not exist. Isolates Clippy's threads from the
     // coexistence of two ffmpeg processes.
     var audioCaptureOnly = args.Any(a => a.Equals("--audio-capture-only", StringComparison.OrdinalIgnoreCase));
+    // --export-at <seconds> exports while the recording is still running; --export-dur sets its
+    // length in seconds. Phase 6 replaces this timer with a hotkey.
+    TimeSpan? exportAt = null;
+    if (args.FirstOrDefault(a => a.StartsWith("--export-at=", StringComparison.Ordinal)) is { } atArg
+        && double.TryParse(atArg["--export-at=".Length..], CultureInfo.InvariantCulture, out var at) && at > 0)
+    {
+        exportAt = TimeSpan.FromSeconds(at);
+    }
+
+    double? exportDuration = null;
+    if (args.FirstOrDefault(a => a.StartsWith("--export-dur=", StringComparison.Ordinal)) is { } durArg
+        && double.TryParse(durArg["--export-dur=".Length..], CultureInfo.InvariantCulture, out var dur) && dur > 0)
+    {
+        exportDuration = dur;
+    }
     return Clippy.ScreenCapture.RunVideo(
-        TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode, withAudio || audioCaptureOnly, audioCaptureOnly);
+        TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode, withAudio || audioCaptureOnly, audioCaptureOnly,
+        args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration);
 }
 
 if (args.FirstOrDefault() == "--capture")

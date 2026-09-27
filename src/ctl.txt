@@ -1,0 +1,42 @@
+Capture output: D:\_Usefull Trash\CodeProjects\Clippy\src\output
+Waiting for frames from Windows.Graphics.Capture.
+Recording D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-214747.mp4 [h264_nvenc]
+[sync] audio drain thread start at 3.037s
+Audio: system loopback [Extensible 48000 Hz, 2 ch, 32 bit]
+[sync] video drain thread start at 3.612s
+Encoding 1920x1080 into ring (max 190s)
+[sync] video WaitForReady 3.915s -> 3.918s (blocked 0.002s)
+[sync] audio capture started at 4.091s
+Both encoders are reading; recording.
+[sync] first WASAPI callback at 4.171s (video origin 2.712s, gap 1.460s)
+Capture FPS: 0.2; last interval: 1679.2 ms.
+Audio: prepended 1459.7 ms of silence to align with the video origin.
+Capture FPS: 21.7; last interval: 24.6 ms.
+Capture FPS: 24.9; last interval: 148.8 ms.
+Capture FPS: 23.9; last interval: 16.0 ms.
+Capture FPS: 35.3; last interval: 23.9 ms.
+Capture FPS: 37.4; last interval: 20.4 ms.
+Capture FPS: 37.3; last interval: 21.8 ms.
+Capture FPS: 36.4; last interval: 86.7 ms.
+Capture FPS: 36.0; last interval: 19.1 ms.
+Stopping capture: capture duration 10s elapsed.
+Capture stopped after 263 frames.
+[sync] capture stop at 12.703s
+Capture FPS: 49.6; last interval: 17.4 ms.
+Capture FPS: 43.6; last interval: 19.5 ms.
+Capture FPS: 44.3; last interval: 24.3 ms.
+Capture FPS: 45.4; last interval: 20.7 ms.
+Capture FPS: 43.3; last interval: 23.0 ms.
+[sync] both drains joined at 18.728s
+[sync] video ring spans [3.680 .. 18.729]s
+[sync] audio ring spans [4.601 .. 18.669]s
+Capture FPS: 41.4; last interval: 17.1 ms.
+Export: frames in 533, access units out 529, paired MISMATCH (4 pending)
+Export: capture/access-unit counts differ; timestamps may be mispaired.
+Export: video slice 854 pkts, clock [8.770 .. 18.729] s, first is keyframe: False
+Export: audio slice 468 pkts, clock [8.773 .. 18.669] s
+Export: wrote D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-214806401.mp4 (873 samples)
+Audio: 2755 buffers, 5529600 bytes, started at 265587722.536s on the capture clock.
+Audio: 2756 buffers encoded, none dropped.
+ffmpeg log: D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-214747.video.ffmpeg-debug.log
+Mux skipped: no audio file was produced.

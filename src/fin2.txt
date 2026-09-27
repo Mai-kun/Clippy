@@ -1,0 +1,66 @@
+Capture output: D:\_Usefull Trash\CodeProjects\Clippy\src\output
+Waiting for frames from Windows.Graphics.Capture.
+Recording D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-232517.mp4 [h264_nvenc]
+Hotkeys: F9 saves 30 s, F10 saves 3 min.
+[sync] audio drain thread start at 0.795s
+Audio: system loopback [Extensible 48000 Hz, 2 ch, 32 bit]
+[sync] video drain thread start at 0.911s
+Encoding 1920x1080 into ring (max 190s)
+Both encoders are reading; recording.
+[sync] first WASAPI callback at 1.142s (video origin 0.698s, gap 0.444s)
+Capture FPS: 0.8; last interval: 479.9 ms.
+Audio: prepended 443.8 ms of silence to align with the video origin.
+Capture FPS: 20.0; last interval: 22.5 ms.
+Capture FPS: 27.9; last interval: 41.4 ms.
+Capture FPS: 31.0; last interval: 40.2 ms.
+Capture FPS: 31.0; last interval: 40.6 ms.
+Capture FPS: 30.4; last interval: 20.9 ms.
+Capture FPS: 30.8; last interval: 40.9 ms.
+Capture FPS: 31.0; last interval: 41.1 ms.
+Capture FPS: 31.3; last interval: 23.1 ms.
+Capture FPS: 29.8; last interval: 40.4 ms.
+Capture FPS: 29.6; last interval: 42.0 ms.
+Capture FPS: 31.3; last interval: 41.5 ms.
+Capture FPS: 26.6; last interval: 41.8 ms.
+Capture FPS: 32.3; last interval: 21.1 ms.
+Capture FPS: 29.0; last interval: 40.7 ms.
+Capture FPS: 29.8; last interval: 41.8 ms.
+Capture FPS: 30.0; last interval: 42.2 ms.
+Capture FPS: 31.3; last interval: 21.5 ms.
+Capture FPS: 31.0; last interval: 40.8 ms.
+Capture FPS: 29.8; last interval: 41.5 ms.
+Capture FPS: 30.4; last interval: 21.6 ms.
+Capture FPS: 29.8; last interval: 42.9 ms.
+Capture FPS: 29.8; last interval: 41.7 ms.
+Capture FPS: 31.3; last interval: 21.3 ms.
+Capture FPS: 29.0; last interval: 42.3 ms.
+Capture FPS: 29.8; last interval: 41.5 ms.
+Capture FPS: 31.0; last interval: 41.5 ms.
+Capture FPS: 30.9; last interval: 41.8 ms.
+Capture FPS: 29.9; last interval: 43.4 ms.
+Capture FPS: 31.5; last interval: 16.6 ms.
+Capture FPS: 30.5; last interval: 39.8 ms.
+Capture FPS: 29.9; last interval: 41.0 ms.
+Capture FPS: 30.4; last interval: 41.4 ms.
+Capture FPS: 30.8; last interval: 41.5 ms.
+Capture FPS: 30.4; last interval: 41.2 ms.
+Capture FPS: 29.4; last interval: 41.8 ms.
+Capture FPS: 30.2; last interval: 41.7 ms.
+Capture FPS: 30.2; last interval: 41.8 ms.
+Capture FPS: 31.0; last interval: 41.6 ms.
+Stopping capture: capture duration 40s elapsed.
+Capture stopped after 1187 frames.
+Capture FPS: 29.0; last interval: 40.8 ms.
+Capture FPS: 31.3; last interval: 21.7 ms.
+Capture FPS: 31.0; last interval: 22.3 ms.
+Capture FPS: 30.9; last interval: 16.9 ms.
+Capture FPS: 30.4; last interval: 42.6 ms.
+Capture FPS: 27.8; last interval: 21.7 ms.
+Export: frames in 1366, access units out 1363, paired MISMATCH
+Export: video slice 2532 pkts, clock [6.730 .. 46.715] s, first is keyframe: False
+Export: audio slice 1872 pkts, clock [6.810 .. 46.662] s
+Export: wrote D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-232603987.mp4 (3065 samples)
+Audio: 9107 buffers, 17529600 bytes, started at 271434415.054s on the capture clock.
+Audio: 9108 buffers encoded, none dropped.
+ffmpeg log: D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-232517.video.ffmpeg-debug.log
+Mux skipped: no audio file was produced.

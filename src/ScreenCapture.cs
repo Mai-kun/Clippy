@@ -41,7 +41,118 @@ internal sealed class ScreenCapture : IDisposable
     private bool audioCaptureOnly;
     private int discardedAudioBuffers;
     private double videoStartSeconds;
+    /// <summary>
+    /// Writes the last <paramref name="durationSeconds"/> still held in the rings to an MP4 file.
+    /// Called from the phase 6 hotkey worker thread, so it must not assume it owns the rings.
+    /// </summary>
+    public string? ExportClip(double durationSeconds)
+    {
+        if (videoRing is null || audioRing is null || encoder?.Sps is null || encoder.Pps is null)
+        {
+            Console.WriteLine("Export: nothing to export yet (recorder not started or no SPS/PPS seen).");
+            return null;
+        }
+
+        // Snapshot the clock first, then both slices. Slice copies, so the packets stay valid even
+        // though the drain threads keep pushing while this runs.
+        var to = stopwatch.Elapsed.TotalSeconds;
+        var from = to - durationSeconds;
+        var videoPackets = videoRing.Slice(from, to);
+        var audioPackets = audioRing.Slice(from, to);
+
+        // Raw ring data first, so a bad slice is visible here and not as an ffprobe error later.
+        var (captured, accessUnits) = encoder.TimingCounts;
+        Console.WriteLine($"Export: frames in {captured}, access units out {accessUnits}, " +
+            $"paired {(captured == accessUnits ? "1:1 OK" : "MISMATCH")}");
+
+        // DELIBERATE CHOICE: an empty audio slice produces a VIDEO-ONLY mp4, not a refusal. Loopback
+        // capture intermittently delivers zero buffers, and a user who asked to save a clip wants the
+        // clip; discarding the video because audio was missing is the worse failure. An empty video
+        // slice is still fatal -- there is nothing to save at all.
+        if (videoPackets.Count == 0)
+        {
+            Console.WriteLine("Export: video slice is empty, nothing to write.");
+            return null;
+        }
+
+        var audioMissing = audioPackets.Count == 0;
+        Console.WriteLine($"Export: video slice {videoPackets.Count} pkts, " +
+            $"clock [{videoPackets[0].CaptureClockSeconds:F3} .. {videoPackets[^1].CaptureClockSeconds:F3}] s, " +
+            $"first is keyframe: {(videoPackets[0].IsKeyframe ? "True" : "False")}");
+
+        if (audioMissing)
+        {
+            Console.WriteLine("Export: no audio in range; writing a VIDEO-ONLY clip on purpose.");
+        }
+        else
+        {
+            Console.WriteLine($"Export: audio slice {audioPackets.Count} pkts, " +
+                $"clock [{audioPackets[0].CaptureClockSeconds:F3} .. {audioPackets[^1].CaptureClockSeconds:F3}] s");
+        }
+
+        // KNOWN AND EXPECTED: the clip is advanced to the first keyframe at or after the requested
+        // start, because a slice beginning on a P/B frame decodes as garbage until the next I-frame.
+        // With a ~1 s GOP this costs about a second of video at the head of every export, which is
+        // why an export's video duration runs shorter than its audio. This is NOT A/V drift: do not
+        // "fix" it, and do not read it as desynchronisation.
+        var start = videoPackets.FindIndex(p => p.IsKeyframe);
+        if (start < 0)
+        {
+            Console.WriteLine("Export: no keyframe in the requested window, refusing to write.");
+            return null;
+        }
+
+        var writer = new Mp4Writer();
+        writer.SetParameterSets(encoder.Sps, encoder.Pps);
+        writer.SetDimensions(videoWidth, videoHeight);
+
+        // One MP4 sample per access unit. A VCL NAL is one picture; the non-VCL NALs that PRECEDE it
+        // belong to it, so they buffer until the VCL arrives. Emitting on the VCL is what keeps the
+        // boundaries honest: a non-VCL NAL after a VCL already starts the NEXT access unit.
+        var pending = new List<ReadOnlyMemory<byte>>();
+        foreach (var packet in videoPackets.Skip(start))
+        {
+            var nalType = packet.Span[0] & 0x1F;
+            var isVcl = nalType is >= 1 and <= 5;
+            pending.Add(packet.Data.AsMemory(0, packet.Length));
+
+            if (isVcl)
+            {
+                // The VCL NAL's own capture time is the picture's time; the leading non-VCL NALs may
+                // have arrived a fraction earlier and would skew the sample backwards.
+                writer.AddVideoSample(pending, packet.CaptureClockSeconds);
+                pending.Clear();
+            }
+        }
+
+        foreach (var packet in audioPackets)
+        {
+            writer.AddAudioSample(packet.Span, packet.CaptureClockSeconds);
+        }
+
+        var path = Path.Combine(outputDirectory, $"clip-{DateTime.Now:HHmmssfff}.mp4");
+        File.WriteAllBytes(path, writer.Build());
+        Console.WriteLine($"Export: wrote {path} ({writer.SampleCount} samples)");
+        return path;
+    }
+
     private FfmpegEncoder? encoder;
+
+    // Phase 4: the encoders feed these in-memory rings instead of writing files, and a clip is
+    // produced by slicing them. The only thing the two share is the capture clock on each packet.
+    private RingBuffer? videoRing;
+    private RingBuffer? audioRing;
+    private int videoWidth;
+    private int videoHeight;
+
+    // Ring capacity: longer than any clip we export, so an export never hits the trim.
+    private const double RingSeconds = 190;
+
+    // Phase 6 hotkeys and the optional timed mid-recording export (the same call, different trigger).
+    private bool hotkeysEnabled;
+    private double? exportAtSeconds;
+    private double? exportDurationSeconds;
+
 
     private TimeSpan lastFrameTime;
     private TimeSpan lastFpsLogTime;
@@ -79,7 +190,7 @@ internal sealed class ScreenCapture : IDisposable
     }
 
     /// <summary>Records a raw video stream: every captured frame is piped to ffmpeg.</summary>
-    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false)
+    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null)
     {
         // Without audio there is no mux, so the encoder writes a raw Annex B stream. Naming that file
         // .mp4 would be actively misleading: the bytes are correct but the extension lies.
@@ -94,6 +205,9 @@ internal sealed class ScreenCapture : IDisposable
             fpsMode = fpsMode,
             withAudio = withAudio,
             audioCaptureOnly = audioCaptureOnly,
+            hotkeysEnabled = hotkeys,
+            exportAtSeconds = exportAt,
+            exportDurationSeconds = exportDuration,
         };
         return capture.Capture(duration);
     }
@@ -126,8 +240,29 @@ internal sealed class ScreenCapture : IDisposable
                 ? new Timer(_ => Stop($"capture duration {timeout.TotalSeconds:F0}s elapsed"), null, timeout, Timeout.InfiniteTimeSpan)
                 : null;
 
+            using var midExport = exportAtSeconds is { } at
+                ? new Timer(_ => ExportClip(exportDurationSeconds ?? 10), null, TimeSpan.FromSeconds(at), Timeout.InfiniteTimeSpan)
+                : null;
+
+            // Phase 6: the low-level keyboard hook only records the key and signals an event; a
+            // dedicated worker thread performs the export. Not a pool thread -- an export takes
+            // seconds, and the pool is shared with everything else in the process.
+            HotkeyService? hotkeys = null;
+            if (hotkeysEnabled)
+            {
+                hotkeys = new HotkeyService(seconds => ExportClip(seconds));
+                hotkeys.Start();
+                Console.WriteLine("Hotkeys: F9 saves 30 s, F10 saves 3 min.");
+            }
+
             stopped.Wait();
             Console.WriteLine($"Capture stopped after {frameCount} frames.");
+
+            // Phase 4: the file is produced by slicing the rings, not by the encoders. Let the drains
+            // hand over what ffmpeg already emitted, then export whatever the rings still hold.
+            encoder?.WaitForDrain(TimeSpan.FromSeconds(3));
+            audioEncoder?.WaitForDrain(TimeSpan.FromSeconds(3));
+            ExportClip(duration?.TotalSeconds ?? 10);
             return 0;
         }
         finally
@@ -286,11 +421,18 @@ internal sealed class ScreenCapture : IDisposable
                     videoStartSeconds = stopwatch.Elapsed.TotalSeconds;
 
                 var videoTexture = CaptureInterop.GetTexture(frame.Surface);
-                var pixels = CopyTextureToCpu(videoTexture, out var videoWidth, out var videoHeight);
+                var pixels = CopyTextureToCpu(videoTexture, out var frameVideoWidth, out var frameVideoHeight);
                 videoTexture.Dispose();
 
                 if (encoder is null)
                 {
+                    videoWidth = frameVideoWidth;
+                    videoHeight = frameVideoHeight;
+                    // Phase 4: both encoders feed in-memory rings. A clip is produced by slicing
+                    // those rings, not by reading back files.
+                    videoRing = new RingBuffer(RingSeconds, isVideo: true);
+                    audioRing = new RingBuffer(RingSeconds, isVideo: false);
+
                     if (withAudio)
                     {
                         // Bisection mode: real WASAPI buffers arrive and the callback really runs,
@@ -310,13 +452,13 @@ internal sealed class ScreenCapture : IDisposable
                         }
                         else
                         {
-                        audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
-                        audio = new AudioCapture(stopwatch, videoStartSeconds);
-                        audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch);
-                        audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
-                        // An f32le input probes without data, so audio reaches ready on its own.
-                        audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
-                        Console.WriteLine($"Audio: system loopback [{audio.Format}] -> {Path.GetFileName(audioOnlyPath)}");
+                            audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
+                            audio = new AudioCapture(stopwatch, videoStartSeconds);
+                            audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing);
+                            audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
+                            // An f32le input probes without data, so audio reaches ready on its own.
+                            audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
+                            Console.WriteLine($"Audio: system loopback [{audio.Format}]");
                         }
 
                         encoder = FfmpegEncoder.Start(
@@ -326,7 +468,8 @@ internal sealed class ScreenCapture : IDisposable
                             videoEncoder ?? "h264_nvenc",
                             stopwatch,
                             fpsMode);
-                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} -> {Path.GetFileName(videoOnlyPath)}");
+                        encoder.StartDrain(videoRing);
+                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring (max {RingSeconds:F0}s)");
                     }
                     else
                     {
@@ -344,6 +487,10 @@ internal sealed class ScreenCapture : IDisposable
                 // SystemRelativeTime is Windows' own capture timestamp: the same clock ffmpeg reads
                 // -use_wallclock_as_timestamps against, so it is the reference for PTS verification.
                 var isFirstFrame = currentFrame == 1;
+                // Enqueue before Write so the queue order is exactly the byte order into ffmpeg. The
+                // clock is read here, at frame arrival, not when the encoded bytes come back out: the
+                // elementary stream on stdout carries no timestamps of its own.
+                encoder.EnqueueCaptureTime(stopwatch.Elapsed.TotalSeconds);
                 encoder.Write(pixels, frame.SystemRelativeTime.TotalMilliseconds);
 
                 // The first write is what lets ffmpeg finish probing and open its input; only then is

@@ -43,12 +43,24 @@ internal sealed class RingBuffer
         }
     }
 
+    /// <summary>
+    /// The two encoders' drain threads push here while an export may be slicing at the same time,
+    /// so every access to the list is serialised. Slice returns the ring's own StoredPacket objects
+    /// (callers must not release them), which is why the lock can only cover the list traversal.
+    /// </summary>
+    private readonly object gate = new();
+
     /// <summary>Takes ownership of a rented buffer.</summary>
     public void Push(byte[] rented, int length, double captureClockSeconds, bool isKeyframe)
     {
-        packets.Add(new StoredPacket(rented, length, captureClockSeconds, isKeyframe));
-        if (!TrimDisabledForTest)
-            Trim();
+        lock (gate)
+        {
+            packets.Add(new StoredPacket(rented, length, captureClockSeconds, isKeyframe));
+            if (!TrimDisabledForTest)
+            {
+                Trim();
+            }
+        }
     }
 
     public void Trim()
@@ -75,17 +87,33 @@ internal sealed class RingBuffer
         Compact();
     }
 
-    /// <summary>Packets whose capture time falls in [from, to]. Does not release the buffers.</summary>
+    /// <summary>
+    /// Packets whose capture time falls in [from, to], COPIED into fresh buffers.
+    ///
+    /// Copies, not references, and that is deliberate. Trim() returns evicted buffers to the
+    /// ArrayPool, so a slice holding the ring's own packets can be invalidated by a concurrent Push
+    /// the moment the lock is released. Today ExportClip reads its slice synchronously, so this is
+    /// safe by accident -- but phase 6 calls ExportClip from a hotkey on another thread, where the
+    /// window is real. Copying a few hundred kilobytes once every few minutes is nothing; a
+    /// use-after-return from the pool corrupts a clip in a way nobody can reproduce.
+    /// </summary>
     public List<StoredPacket> Slice(double from, double to)
     {
         var result = new List<StoredPacket>();
-        for (var i = head; i < packets.Count; i++)
+        lock (gate)
         {
-            var t = packets[i].CaptureClockSeconds;
-            if (t < from || t > to)
-                continue;
-            result.Add(packets[i]);
+            for (var i = head; i < packets.Count; i++)
+            {
+                var t = packets[i].CaptureClockSeconds;
+                if (t < from || t > to)
+                    continue;
+                var src = packets[i];
+                var copy = new byte[src.Length];
+                src.Span.CopyTo(copy);
+                result.Add(new StoredPacket(copy, src.Length, src.CaptureClockSeconds, src.IsKeyframe));
+            }
         }
+
         return result;
     }
 

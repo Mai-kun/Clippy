@@ -1,3 +1,4 @@
+﻿using System.Buffers;
 using System.Diagnostics;
 
 namespace Clippy;
@@ -73,7 +74,7 @@ internal sealed class FfmpegEncoder : IDisposable
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardError = true,
-            RedirectStandardOutput = false,
+            RedirectStandardOutput = true,
             CreateNoWindow = true,
         };
 
@@ -115,8 +116,10 @@ internal sealed class FfmpegEncoder : IDisposable
             // Raw Annex B elementary stream, not an MP4 container. Phase 4: an elementary stream has
             // no container timestamps at all, which is exactly the problem mp4 caused in B/C (it
             // rebased start_time to 0 while m4a kept epoch, destroying the A/V relationship).
-            "-f", "h264",
-            outputPath,
+            // Raw Annex B to STDOUT, not to a file: the ring buffer slices these NAL units in memory.
+            // An elementary stream carries no timestamps at all, which is exactly why every packet
+            // gets its CaptureClockSeconds stamped here, on arrival, outside ffmpeg.
+            "-f", "h264", "pipe:1",
         })
         {
             startInfo.ArgumentList.Add(argument);
@@ -146,6 +149,111 @@ internal sealed class FfmpegEncoder : IDisposable
         var stdin = process.StandardInput.BaseStream;
         return new FfmpegEncoder(process, stdin, outputPath, stopwatch, timingLog, debugLog, gate);
     }
+
+    private Thread? drain;
+    private byte[]? sps;
+    private byte[]? pps;
+    private RingBuffer? ring;
+
+    // Real capture times, taken in OnFrameArrived before any processing, in the order the frames were
+    // handed to ffmpeg. The elementary stream on stdout carries no timestamps at all, and timestamping
+    // at Read() time is far too coarse: one 64K read covers several frames, so they all collapse onto
+    // the same clock value and the muxer sees duplicate DTS. So the time is carried across here, in
+    // order, and each VCL NAL on the way out consumes the next one.
+    private readonly Queue<double> captureTimes = new();
+    private int captureTimeCount;
+    private int accessUnitCount;
+
+    /// <summary>
+    /// Records the capture time of a frame that is about to be written to ffmpeg. Must be called
+    /// immediately before <see cref="Write"/> so the queue order matches the byte order.
+    /// </summary>
+    public void EnqueueCaptureTime(double captureClockSeconds)
+    {
+        lock (captureTimes)
+        {
+            captureTimes.Enqueue(captureClockSeconds);
+            captureTimeCount++;
+        }
+    }
+
+    /// <summary>Frames written in, versus access units seen out. Equal means no drops or reordering.</summary>
+    public (int Captured, int AccessUnits) TimingCounts => (captureTimeCount, accessUnitCount);
+
+    /// <summary>
+    /// Reads ffmpeg's stdout on a background thread, splits it into NAL units and pushes each into the
+    /// ring buffer stamped with the capture clock at the moment the bytes ARRIVED. The elementary stream
+    /// carries no timestamps at all, so this is the only place the timeline is established.
+    /// </summary>
+    public void StartDrain(RingBuffer target)
+    {
+        ring = target;
+        var stdout = process.StandardOutput.BaseStream;
+        var parser = new H264AnnexBParser();
+        var buffer = new byte[64 * 1024];
+        var clock = stopwatch;
+
+        drain = new Thread(() =>
+        {
+            try
+            {
+                int read;
+                while ((read = stdout.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    parser.Append(buffer.AsSpan(0, read), clock.Elapsed.TotalSeconds, Push);
+                }
+
+                parser.Flush(clock.Elapsed.TotalSeconds, Push);
+            }
+            catch (IOException)
+            {
+                // ffmpeg closed stdout on shutdown; packets already pushed stay in the ring.
+            }
+        })
+        { IsBackground = true, Name = "clippy-h264-drain" };
+        drain.Start();
+        Console.WriteLine($"[sync] video drain thread start at {clock.Elapsed.TotalSeconds:F3}s");
+    }
+
+    private void Push(byte[] data, int length, bool isIdr, double readClockSeconds)
+    {
+        var type = data[0] & 0x1F;
+        if (type == 7)
+            sps ??= data;
+        else if (type == 8)
+            pps ??= data;
+
+        // Only a VCL NAL is a picture, so only a VCL NAL consumes a capture time. Non-VCL NALs travel
+        // with whatever picture follows them and must not shift the timeline.
+        var isVcl = type is >= 1 and <= 5;
+        var captureSeconds = readClockSeconds;
+        if (isVcl)
+        {
+            lock (captureTimes)
+            {
+                if (captureTimes.Count > 0)
+                {
+                    captureSeconds = captureTimes.Dequeue();
+                }
+
+                accessUnitCount++;
+            }
+        }
+
+        var rented = ArrayPool<byte>.Shared.Rent(length);
+        data.CopyTo(rented, 0);
+        ring!.Push(rented, length, captureSeconds, isIdr);
+    }
+
+    /// <summary>Parameter sets captured from the live stream, needed for the muxer avcC box.</summary>
+    public byte[]? Sps => sps;
+
+    public byte[]? Pps => pps;
+
+    /// <summary>Blocks until the stdout drain thread has finished, or the timeout expires.</summary>
+    public void WaitForDrain(TimeSpan timeout) => drain?.Join(timeout);
+
+
 
     /// <summary>
     /// Blocks until ffmpeg opened its input. MUST be called only after the first Write: a rawvideo
@@ -231,3 +339,6 @@ internal sealed class FfmpegEncoder : IDisposable
         process.Dispose();
     }
 }
+
+
+

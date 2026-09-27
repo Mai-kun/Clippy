@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 
 namespace Clippy;
@@ -53,7 +53,7 @@ internal sealed class AudioEncoder : IDisposable
         this.queueLimit = queueLimit;
     }
 
-    public static AudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, int queueLimit = 512)
+    public static AudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, RingBuffer ring, int queueLimit = 512)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         if (File.Exists(path))
@@ -65,7 +65,7 @@ internal sealed class AudioEncoder : IDisposable
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardError = true,
-            CreateNoWindow = true,
+            RedirectStandardOutput = true,
         };
         var arguments = new List<string>
         {
@@ -84,8 +84,8 @@ internal sealed class AudioEncoder : IDisposable
             "-c:a", "aac", "-b:a", "192k",
             // Raw ADTS elementary stream, not an m4a container. Phase 4: no container timestamps at
             // all, so there is nothing to disagree with the video stream about where time starts.
-            "-f", "adts",
-            path,
+            // Raw ADTS to STDOUT, like the video path: the ring buffer slices these frames in memory
+            "-f", "adts", "pipe:1",
         ]);
 
         foreach (var argument in arguments)
@@ -123,8 +123,54 @@ internal sealed class AudioEncoder : IDisposable
         encoder.pumpRunning = true;
         encoder.pump = new Thread(encoder.Drain) { IsBackground = true, Name = "clippy-audio-encoder" };
         encoder.pump.Start();
+        encoder.StartDrain(ring);
         return encoder;
     }
+
+    private Thread? drain;
+    private RingBuffer? ring;
+
+    /// <summary>
+    /// Reads ffmpeg's stdout on a background thread, splits it into ADTS frames and pushes each into
+    /// the ring buffer stamped with the capture clock at the moment the bytes ARRIVED, mirroring the
+    /// video path. The elementary stream carries no timestamps, so this is where the audio timeline
+    /// is established.
+    /// </summary>
+    public void StartDrain(RingBuffer target)
+    {
+        ring = target;
+        var stdout = process.StandardOutput.BaseStream;
+        var parser = new AdtsFrameParser();
+        var buffer = new byte[32 * 1024];
+        var clock = stopwatch;
+
+        drain = new Thread(() =>
+        {
+            try
+            {
+                int read;
+                while ((read = stdout.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    parser.Append(buffer.AsSpan(0, read), clock.Elapsed.TotalSeconds, (data, length, t) =>
+                    {
+                        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
+                        data.CopyTo(rented, 0);
+                        ring!.Push(rented, length, t, isKeyframe: true);
+                    });
+                }
+            }
+            catch (IOException)
+            {
+                // ffmpeg closed stdout on shutdown; packets already pushed stay in the ring.
+            }
+        })
+        { IsBackground = true, Name = "clippy-adts-drain" };
+        drain.Start();
+        Console.WriteLine($"[sync] audio drain thread start at {stopwatch.Elapsed.TotalSeconds:F3}s");
+    }
+
+    /// <summary>Blocks until the stdout drain thread has finished, or the timeout expires.</summary>
+    public void WaitForDrain(TimeSpan timeout) => drain?.Join(timeout);
 
     /// <summary>
     /// Blocks until ffmpeg has opened its input. Safe here because an f32le input probes without
@@ -227,4 +273,6 @@ internal sealed class AudioEncoder : IDisposable
             : $"Audio: {bufferCount} buffers encoded, none dropped.");
     }
 }
+
+
 

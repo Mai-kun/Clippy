@@ -1,0 +1,35 @@
+Capture output: D:\_Usefull Trash\CodeProjects\Clippy\src\output
+Waiting for frames from Windows.Graphics.Capture.
+Recording D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-231547.mp4 [h264_nvenc]
+Hotkeys: F9 saves 30 s, F10 saves 3 min.
+[sync] audio drain thread start at 1.945s
+Audio: system loopback [Extensible 48000 Hz, 2 ch, 32 bit]
+[sync] video drain thread start at 2.248s
+Encoding 1920x1080 into ring (max 190s)
+Both encoders are reading; recording.
+Capture FPS: 0.4; last interval: 1409.9 ms.
+Capture FPS: 1.7; last interval: 977.7 ms.
+Capture FPS: 1.0; last interval: 979.9 ms.
+Capture FPS: 1.7; last interval: 980.3 ms.
+Capture FPS: 1.0; last interval: 980.8 ms.
+Capture FPS: 22.0; last interval: 16.9 ms.
+Capture FPS: 42.4; last interval: 227.8 ms.
+Capture FPS: 1.6; last interval: 834.8 ms.
+Export: frames in 81, access units out 78, paired MISMATCH
+Export: video slice 176 pkts, clock [5.609 .. 12.764] s, first is keyframe: False
+Export: no audio in range; writing a VIDEO-ONLY clip on purpose.
+Export: wrote D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-231600433.mp4 (73 samples)
+Capture FPS: 1.8; last interval: 999.1 ms.
+Capture FPS: 1.0; last interval: 975.1 ms.
+Capture FPS: 1.0; last interval: 979.3 ms.
+Capture FPS: 1.0; last interval: 999.7 ms.
+Capture FPS: 1.8; last interval: 145.9 ms.
+Capture FPS: 1.0; last interval: 979.2 ms.
+Capture FPS: 2.0; last interval: 39.7 ms.
+Capture FPS: 1.0; last interval: 979.9 ms.
+Stopping capture: capture duration 25s elapsed.
+Capture stopped after 96 frames.
+Audio: 0 buffers, 0 bytes, started at 0.000s on the capture clock.
+Audio: 0 buffers encoded, none dropped.
+ffmpeg log: D:\_Usefull Trash\CodeProjects\Clippy\src\output\clip-20260927-231547.video.ffmpeg-debug.log
+Mux skipped: no audio file was produced.
