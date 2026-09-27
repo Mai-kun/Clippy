@@ -290,9 +290,9 @@ internal sealed class ScreenCapture : IDisposable
                         // Bisection mode: real WASAPI buffers arrive and the callback really runs,
                         // but no audio ffmpeg exists and nothing is written anywhere. Isolates
                         // "Clippy's own threads upset video capture" from "two ffmpeg processes".
-                        // The video ffmpeg writes the video-only file in every audio mode, so the mux
-                        // inputs exist regardless of whether audio is encoded or merely discarded.
-                        videoOnlyPath = Path.ChangeExtension(videoPath, ".video.mp4");
+                        // Elementary streams, not containers (phase 4.0): the ring buffer slices these
+                        // byte streams directly, so there is no container to carry timestamps.
+                        videoOnlyPath = Path.ChangeExtension(videoPath, ".video.h264");
 
                         if (audioCaptureOnly)
                         {
@@ -304,7 +304,7 @@ internal sealed class ScreenCapture : IDisposable
                         }
                         else
                         {
-                        audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.m4a");
+                        audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
                         audio = new AudioCapture(stopwatch, videoStartSeconds);
                         audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch);
                         audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);

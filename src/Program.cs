@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Runtime.CompilerServices;
 
 if (args.Contains("--smoke"))
@@ -9,6 +9,10 @@ if (args.Contains("--smoke"))
 if (args.Contains("--audio-probe"))
 {
     return Clippy.AudioCapture.RunAudioProbe();
+}
+
+{
+    return Clippy.ParserSelfTest.Run();
 }
 
 if (args is ["--capture"])

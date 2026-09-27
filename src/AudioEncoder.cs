@@ -80,9 +80,11 @@ internal sealed class AudioEncoder : IDisposable
         [
             "-i", "-",
             "-vn",
-            // Muxed later with -c copy, so the encoder here only has to be cheap and stable.
+            // Re-encoded here, muxed later with -c copy, so the encoder only has to be cheap.
             "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
+            // Raw ADTS elementary stream, not an m4a container. Phase 4: no container timestamps at
+            // all, so there is nothing to disagree with the video stream about where time starts.
+            "-f", "adts",
             path,
         ]);
 

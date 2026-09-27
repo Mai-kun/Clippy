@@ -97,8 +97,14 @@ internal sealed class FfmpegEncoder : IDisposable
             "-an", "-fps_mode", fpsMode,
             "-c:v", encoder, "-preset", "p1", "-b:v", "8M",
             "-maxrate", "12M", "-bufsize", "16M",
+            // -g 60 is a frame count, and WGC delivers a variable frame rate (measured 11-55 fps), so
+            // the keyframe interval in seconds would drift. Phase 4.2 replaces it with a time-based
+            // -force_key_frames; keeping -g as a ceiling still bounds GOP length.
             "-g", "60", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
+            // Raw Annex B elementary stream, not an MP4 container. Phase 4: an elementary stream has
+            // no container timestamps at all, which is exactly the problem mp4 caused in B/C (it
+            // rebased start_time to 0 while m4a kept epoch, destroying the A/V relationship).
+            "-f", "h264",
             outputPath,
         })
         {
