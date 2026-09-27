@@ -204,8 +204,12 @@ internal sealed class AudioEncoder : IDisposable
             throw new InvalidOperationException("Audio ffmpeg did not exit within 30s and was killed.");
         }
 
-        timingLog.Dispose();
-        debugLog.Dispose();
+        // Same lock discipline as FfmpegEncoder: the stderr reader thread writes debugLog.
+        lock (debugLog)
+        {
+            timingLog.Dispose();
+            debugLog.Dispose();
+        }
 
         if (process.ExitCode != 0)
         {

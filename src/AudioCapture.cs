@@ -35,11 +35,12 @@ internal sealed class AudioCapture : IDisposable
     private readonly StreamWriter? timingLog;
     private readonly CaptureDataAvailableHandler handler;
 
-    // Written on the WASAPI callback thread, read on the recording thread in Dispose, so all four
-    // need atomic or volatile access. They were plain fields, which is a data race.
+    // Written on the WASAPI callback thread, read on the recording thread in Dispose, so these need
+    // atomic or volatile access. They were plain fields, which is a data race. Note volatile cannot
+    // apply to double, so the first-value latch uses Interlocked instead.
     private int bufferCount;
     private long totalBytes;
-    private volatile double firstBufferSeconds;
+    private long firstBufferHundredNanos;
     private volatile bool disposed;
 
     public AudioCapture(Stopwatch stopwatch)
@@ -143,8 +144,8 @@ internal sealed class AudioCapture : IDisposable
         var copy = buffer.ToArray();
         Interlocked.Increment(ref bufferCount);
         Interlocked.Add(ref totalBytes, copy.Length);
-        if (firstBufferSeconds == 0)
-            firstBufferSeconds = qpcPosition / 10_000.0;
+        if (firstBufferHundredNanos == 0)
+            Interlocked.CompareExchange(ref firstBufferHundredNanos, qpcPosition, 0);
 
         // The QPC position is the packet's true capture time on the same system clock that
         // -use_wallclock_as_timestamps reads, which is what keeps audio on the video timeline.
@@ -169,6 +170,6 @@ internal sealed class AudioCapture : IDisposable
 
         capture.Dispose();
         Console.WriteLine(
-            $"Audio: {bufferCount} buffers, {totalBytes} bytes, started at {firstBufferSeconds:F3}s on the capture clock.");
+            $"Audio: {bufferCount} buffers, {totalBytes} bytes, started at {Interlocked.Read(ref firstBufferHundredNanos) / 10_000.0:F3}s on the capture clock.");
     }
 }

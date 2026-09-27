@@ -196,8 +196,13 @@ internal sealed class FfmpegEncoder : IDisposable
 
         // Release the file handles before reading: a live StreamWriter locks its file exclusively.
         var debugPath = DebugLogPath(outputPath);
-        timingLog.Dispose();
-        debugLog.Dispose();
+        // The stderr reader thread writes debugLog under lock(debugLog); Dispose must take the same
+        // lock or it can dispose the writer mid-write.
+        lock (debugLog)
+        {
+            timingLog.Dispose();
+            debugLog.Dispose();
+        }
         var stderr = string.Join(Environment.NewLine, File.ReadAllLines(debugPath));
 
         if (process.ExitCode != 0)
