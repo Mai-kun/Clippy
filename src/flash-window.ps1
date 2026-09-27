@@ -35,19 +35,23 @@ $sweep.Add_Tick({
     $block.Location = [System.Drawing.Point]::new($script:x, 300)
 })
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = $PeriodMs
-$state = @{ on = $false }
-
-# Flash white briefly on each tick, then black for the rest of the period: a short bright pulse is
-# easy to detect by mean luma, and unambiguous against the black background.
-$timer.Add_Tick({
-    if ($script:state.on) {
-        $panel.BackColor = [System.Drawing.Color]::Black
-        $script:state.on = $false
-    } else {
+# A true short pulse, not a square wave: a fast timer turns the panel white only for the first
+# OnMs of each period and black afterwards. The earlier toggle-per-period version left the screen
+# white for a whole period, so the detector split one flash into several and matching was impossible.
+$clock = New-Object System.Windows.Forms.Timer
+$clock.Interval = 100
+$elapsed = @{ ms = 0 }
+$clock.Add_Tick({
+    $script:elapsed.ms = $script:elapsed.ms + $clock.Interval
+    if ($script:elapsed.ms -ge $PeriodMs) {
+        $script:elapsed.ms = 0
+    }
+    # The middle case must set BLACK explicitly. Without it the panel kept the last colour, so a
+    # 300 ms "pulse" stayed white for the whole 5 s period and the detector split it into many hits.
+    if ($script:elapsed.ms -le $OnMs) {
         $panel.BackColor = [System.Drawing.Color]::White
-        $script:state.on = $true
+    } else {
+        $panel.BackColor = [System.Drawing.Color]::Black
     }
     $panel.Refresh()
 })
@@ -59,6 +63,7 @@ $form.Add_Shown({
     # period after launch and the marker timeline has a bogus origin.
     $panel.BackColor = [System.Drawing.Color]::Black
     $panel.Refresh()
-    $timer.Start()
+    $elapsed.ms = 0
+    $clock.Start()
 })
 [void]$form.ShowDialog()

@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
@@ -20,6 +20,10 @@ internal sealed class AudioCapture : IDisposable
 
     private readonly Stopwatch stopwatch;
     private readonly WasapiRecorder capture;
+    // Wallclock reading (same Stopwatch as the video) of the first video frame written. Audio that
+    // starts later must be shifted back onto the video's origin, otherwise the muxer rebases each
+    // stream to its own zero and the real A/V offset is lost. Measured per run, never hardcoded.
+    private readonly double videoStartSeconds;
 
     /// <summary>
     /// Set after construction, read on the WASAPI callback thread. volatile because the assignment
@@ -41,11 +45,14 @@ internal sealed class AudioCapture : IDisposable
     private int bufferCount;
     private long totalBytes;
     private long firstBufferHundredNanos;
+    private int packetsSeen;
+    private double silencePrependedMs;
     private volatile bool disposed;
 
-    public AudioCapture(Stopwatch stopwatch)
+    public AudioCapture(Stopwatch stopwatch, double videoStartSeconds)
     {
         this.stopwatch = stopwatch;
+        this.videoStartSeconds = videoStartSeconds;
         this.timingLog = null;
 
         var render = new MMDeviceEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
@@ -113,7 +120,7 @@ internal sealed class AudioCapture : IDisposable
         long bytes = 0;
         var buffers = 0;
         var firstMs = -1.0;
-        using var capture = new AudioCapture(stopwatch)
+        using var capture = new AudioCapture(stopwatch, 0)
         {
             Sink = (buffer, qpc) =>
             {
@@ -147,9 +154,39 @@ internal sealed class AudioCapture : IDisposable
         if (firstBufferHundredNanos == 0)
             Interlocked.CompareExchange(ref firstBufferHundredNanos, qpcPosition, 0);
 
+        // First packet: emit the measured gap as silence so the audio origin lands on the video's
+        // first frame. Derived from the shared Stopwatch every run, so it tracks this run's real start
+        // difference rather than a hardcoded constant. If audio began BEFORE video there is nothing
+        // to pre-pend; that case is reported instead of passing unnoticed.
+        if (Interlocked.Increment(ref packetsSeen) == 1)
+        {
+            var gapSeconds = stopwatch.Elapsed.TotalSeconds - videoStartSeconds;
+            PrependSilence(gapSeconds);
+            if (gapSeconds < 0)
+                Console.WriteLine($"Audio: started {gapSeconds * 1000:F1} ms BEFORE video; cannot shift back.");
+        }
+
         // The QPC position is the packet's true capture time on the same system clock that
         // -use_wallclock_as_timestamps reads, which is what keeps audio on the video timeline.
         sink?.Invoke(copy, qpcPosition);
+    }
+
+    /// <summary>Feeds leading silence so the stream starts `seconds` earlier than the first real packet.</summary>
+    private void PrependSilence(double seconds)
+    {
+        if (seconds <= 0)
+            return;
+
+        var format = capture.WaveFormat;
+        var frameSize = format.Channels * (format.BitsPerSample / 8);
+        var frames = (int)Math.Round(seconds * format.SampleRate);
+        if (frames <= 0)
+            return;
+
+        var silence = new byte[frames * frameSize]; // all-zero == digital silence for PCM and float
+        silencePrependedMs += seconds * 1000;
+        sink?.Invoke(silence, 0);
+        Console.WriteLine($"Audio: prepended {seconds * 1000:F1} ms of silence to align with the video origin.");
     }
 
     public void Dispose()

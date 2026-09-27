@@ -15,11 +15,16 @@ src = sys.argv[2] if len(sys.argv) > 2 else None
 
 def video_flash_times(path, threshold=200.0):
     """Mean luma of every frame; a flash is a frame far brighter than its neighbours."""
+    # Only the central 20%x20% of the frame is analysed. The player window repaints its edges and
+    # title bar, and the whole-frame mean turned those repaints into false flashes (measured: a
+    # 2.083 s cadence instead of the source's 5 s, and nothing after ~21 s). The centre is pure
+    # video content, so a flash there is unambiguous.
+    vf = 'crop=iw/5:ih/5:iw*2/5:ih*2/5,scale=32:18,format=gray'
     out = subprocess.run(
-        ['ffmpeg', '-v', 'error', '-i', path, '-vf', 'scale=64:36,format=gray',
+        ['ffmpeg', '-v', 'error', '-i', path, '-vf', vf,
          '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
         capture_output=True).stdout
-    n = 64 * 36
+    n = 32 * 18
     luma = [sum(out[i:i + n]) / n for i in range(0, len(out) - n + 1, n)]
     fps = 60.0
     # A flash spans several captured frames, and at ~15 fps those frames are >3 apart in index, so an

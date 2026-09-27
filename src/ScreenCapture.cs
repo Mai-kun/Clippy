@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
@@ -40,6 +40,7 @@ internal sealed class ScreenCapture : IDisposable
     private string? audioOnlyPath;
     private bool audioCaptureOnly;
     private int discardedAudioBuffers;
+    private double videoStartSeconds;
     private FfmpegEncoder? encoder;
 
     private TimeSpan lastFrameTime;
@@ -272,6 +273,12 @@ internal sealed class ScreenCapture : IDisposable
 
             if (videoPath is not null)
             {
+                // The video origin on the shared Stopwatch, taken before anything else in this frame.
+                // AudioCapture needs it at construction to prepend the right amount of silence, and the
+                // GPU copy below costs milliseconds that would otherwise land in the measured gap.
+                if (currentFrame == 1)
+                    videoStartSeconds = stopwatch.Elapsed.TotalSeconds;
+
                 var videoTexture = CaptureInterop.GetTexture(frame.Surface);
                 var pixels = CopyTextureToCpu(videoTexture, out var videoWidth, out var videoHeight);
                 videoTexture.Dispose();
@@ -289,7 +296,7 @@ internal sealed class ScreenCapture : IDisposable
 
                         if (audioCaptureOnly)
                         {
-                            audio = new AudioCapture(stopwatch);
+                            audio = new AudioCapture(stopwatch, videoStartSeconds);
                             audio.Sink = (buffer, qpc) => Interlocked.Increment(ref discardedAudioBuffers);
                             audioEncoder = null;
                             audioOnlyPath = null;
@@ -298,7 +305,7 @@ internal sealed class ScreenCapture : IDisposable
                         else
                         {
                         audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.m4a");
-                        audio = new AudioCapture(stopwatch);
+                        audio = new AudioCapture(stopwatch, videoStartSeconds);
                         audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch);
                         audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
                         // An f32le input probes without data, so audio reaches ready on its own.
