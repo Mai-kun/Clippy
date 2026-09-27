@@ -6,6 +6,11 @@ if (args.Contains("--smoke"))
     return Clippy.SmokeTest.Run();
 }
 
+if (args.Contains("--audio-probe"))
+{
+    return Clippy.AudioCapture.RunAudioProbe();
+}
+
 if (args is ["--capture"])
 {
     return Clippy.ScreenCapture.Run(null);
@@ -26,9 +31,16 @@ if (args.FirstOrDefault() == "--record")
     var videoPath = Path.Combine(Environment.CurrentDirectory, "output", $"clip-{DateTime.Now:yyyyMMdd-HHmmss}.mp4");
     var videoEncoder = args.FirstOrDefault(a => a.StartsWith("--encoder=", StringComparison.Ordinal))?["--encoder=".Length..]
         ?? "h264_nvenc";
+    // passthrough is the default: vfr makes ffmpeg resample onto a 1/25 grid and drop frames
+    // (measured: 658 captured -> 346 encoded). Pass --fps-mode=vfr to reproduce that for debugging.
     var fpsMode = args.FirstOrDefault(a => a.StartsWith("--fps-mode=", StringComparison.Ordinal))?["--fps-mode=".Length..]
-        ?? "vfr";
-    return Clippy.ScreenCapture.RunVideo(TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode);
+        ?? "passthrough";
+    var withAudio = args.Any(a => a.Equals("--audio", StringComparison.OrdinalIgnoreCase));
+    // Bisection: WASAPI runs, audio ffmpeg does not exist. Isolates Clippy's threads from the
+    // coexistence of two ffmpeg processes.
+    var audioCaptureOnly = args.Any(a => a.Equals("--audio-capture-only", StringComparison.OrdinalIgnoreCase));
+    return Clippy.ScreenCapture.RunVideo(
+        TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode, withAudio || audioCaptureOnly, audioCaptureOnly);
 }
 
 if (args.FirstOrDefault() == "--capture")
@@ -40,5 +52,5 @@ if (args.FirstOrDefault() == "--capture")
 Console.WriteLine("Hello");
 Console.WriteLine($"NativeAOT: {!RuntimeFeature.IsDynamicCodeSupported}");
 Console.WriteLine("Capture: --capture [duration-seconds]");
-Console.WriteLine("Record:  --record [seconds] [--encoder=h264_nvenc|h264_qsv|h264_amf]");
+Console.WriteLine("Record:  --record [seconds] [--audio] [--encoder=h264_nvenc|h264_qsv|h264_amf] [--fps-mode=passthrough|vfr|cfr]");
 return 0;

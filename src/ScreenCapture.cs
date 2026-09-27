@@ -32,7 +32,14 @@ internal sealed class ScreenCapture : IDisposable
     // ffmpeg stamps frames on read, so no warm-up buffer and no frame-rate guess are needed.
     private string? videoPath;
     private string? videoEncoder;
-    private string fpsMode = "vfr";
+    private string fpsMode = "passthrough";
+    private bool withAudio;
+    private AudioCapture? audio;
+    private AudioEncoder? audioEncoder;
+    private string? videoOnlyPath;
+    private string? audioOnlyPath;
+    private bool audioCaptureOnly;
+    private int discardedAudioBuffers;
     private FfmpegEncoder? encoder;
 
     private TimeSpan lastFrameTime;
@@ -71,13 +78,15 @@ internal sealed class ScreenCapture : IDisposable
     }
 
     /// <summary>Records a real video file: every captured frame is piped to ffmpeg.</summary>
-    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "vfr")
+    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false)
     {
         using var capture = new ScreenCapture(Path.GetDirectoryName(outputPath)!)
         {
             videoPath = outputPath,
             videoEncoder = encoderName,
             fpsMode = fpsMode,
+            withAudio = withAudio,
+            audioCaptureOnly = audioCaptureOnly,
         };
         return capture.Capture(duration);
     }
@@ -86,6 +95,10 @@ internal sealed class ScreenCapture : IDisposable
     {
         Console.WriteLine($"Capture output: {outputDirectory}");
         Console.WriteLine("Waiting for frames from Windows.Graphics.Capture.");
+
+        // One trace for every thread of this recording, all stamped from the same Stopwatch.
+        EventLog.Clock = stopwatch;
+        EventLog.Start(Path.Combine(outputDirectory, $"events-{DateTime.Now:yyyyMMdd-HHmmssfff}.csv"));
 
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
         {
@@ -114,19 +127,128 @@ internal sealed class ScreenCapture : IDisposable
         {
             Console.CancelKeyPress -= cancelHandler;
 
-            // Close ffmpeg's stdin after the last frame so it finalises the mp4 container.
-            if (encoder is not null)
+            // Stop the callback first: once the session is disposed no new frame can be delivered, so
+            // taking the lock afterwards is bounded instead of racing an in-flight Write.
+            framePool.FrameArrived -= OnFrameArrived;
+
+            // Tear down INSIDE the same lock OnFrameArrived uses. Doing it outside let Dispose race a
+            // concurrent Write -- closing stdin while another thread writes to it -- which is exactly
+            // the kind of timing-dependent fault that makes a run pass or hang at random.
+            lock (sync)
             {
-                encoder.Dispose();
+                disposed = true;
+
+                // Audio first: it feeds the audio ffmpeg's stdin, which must close before it exits.
+                audio?.Dispose();
+                audio = null;
+                audioEncoder?.Dispose();
+                audioEncoder = null;
+
+                // Close ffmpeg's stdin after the last frame so it finalises the mp4 container.
+                encoder?.Dispose();
                 encoder = null;
             }
+
+            if (withAudio && videoOnlyPath is not null && audioOnlyPath is not null)
+                MuxVideoAndAudio(videoOnlyPath, audioOnlyPath, videoPath!);
+            else if (audioCaptureOnly)
+                Console.WriteLine($"Bisection run: {discardedAudioBuffers} WASAPI buffers received and discarded; no mux.");
         }
+    }
+
+    /// <summary>
+    /// Combines the two recordings into the final file.
+    ///
+    /// No -itsoffset: both ffmpeg processes stamped their packets with the same system clock
+    /// (-use_wallclock_as_timestamps) starting at the same instant, so both files already share one
+    /// zero. An offset here would paper over a real misalignment instead of measuring it, so the
+    /// start_time of each input is compared instead and reported.
+    /// </summary>
+    private void MuxVideoAndAudio(string videoInput, string audioInput, string output)
+    {
+        if (!File.Exists(audioInput))
+        {
+            Console.WriteLine("Mux skipped: no audio file was produced.");
+            return;
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "ffmpeg",
+            UseShellExecute = false,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (var argument in new[]
+        {
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i", videoInput,
+            "-i", audioInput,
+            // -c copy: both streams are already encoded, and re-encoding here would add delay.
+            // -shortest: without it a long silent tail would pad the file.
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c", "copy", "-shortest",
+            "-movflags", "+faststart",
+            output,
+        })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Failed to start ffmpeg for muxing.");
+        var stderr = process.StandardError.ReadToEnd();
+        if (!process.WaitForExit(120_000))
+        {
+            process.Kill(entireProcessTree: true);
+            throw new InvalidOperationException("Mux ffmpeg did not exit within 120s and was killed.");
+        }
+
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"Mux ffmpeg exited with {process.ExitCode}: {stderr.Trim()}");
+
+        // Report the two start times so A/V alignment is a measured number, not an assumption.
+        var starts = new[] { videoInput, audioInput }
+            .Select(path => $"{(Path.GetFileNameWithoutExtension(path))}={ReadStartSeconds(path):F4}s")
+            .ToArray();
+        Console.WriteLine($"Muxed -> {output} (stream start times: {string.Join(", ", starts)})");
+    }
+
+    private static double ReadStartSeconds(string path)
+    {
+        var probe = new ProcessStartInfo
+        {
+            FileName = "ffprobe",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (var argument in new[]
+        {
+            "-v", "error",
+            "-show_entries", "format=start_time",
+            "-of", "csv=p=0",
+            path,
+        })
+        {
+            probe.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(probe)!;
+        var text = process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+        return double.TryParse(text.Trim(), System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? value
+            : double.NaN;
     }
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object _)
     {
+        EventLog.Mark("FB_ENTER");
         lock (sync)
         {
+            EventLog.Mark("FB_LOCK");
             if (disposed)
                 return;
 
@@ -156,21 +278,74 @@ internal sealed class ScreenCapture : IDisposable
 
                 if (encoder is null)
                 {
-                    // No -r and no warm-up: ffmpeg stamps each frame as it reads it, so the file
-                    // duration follows the real capture cadence. A fixed rate would drift.
-                    encoder = FfmpegEncoder.Start(
-                        videoPath,
-                        videoWidth,
-                        videoHeight,
-                        videoEncoder ?? "h264_nvenc",
-                        stopwatch,
-                        fpsMode);
-                    Console.WriteLine($"Encoding {videoWidth}x{videoHeight} -> {videoPath} [{videoEncoder}]");
+                    if (withAudio)
+                    {
+                        // Bisection mode: real WASAPI buffers arrive and the callback really runs,
+                        // but no audio ffmpeg exists and nothing is written anywhere. Isolates
+                        // "Clippy's own threads upset video capture" from "two ffmpeg processes".
+                        // The video ffmpeg writes the video-only file in every audio mode, so the mux
+                        // inputs exist regardless of whether audio is encoded or merely discarded.
+                        videoOnlyPath = Path.ChangeExtension(videoPath, ".video.mp4");
+
+                        if (audioCaptureOnly)
+                        {
+                            audio = new AudioCapture(stopwatch);
+                            audio.Sink = (buffer, qpc) => Interlocked.Increment(ref discardedAudioBuffers);
+                            audioEncoder = null;
+                            audioOnlyPath = null;
+                            Console.WriteLine($"Audio: capture-only [{audio.Format}], buffers will be discarded");
+                        }
+                        else
+                        {
+                        audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.m4a");
+                        audio = new AudioCapture(stopwatch);
+                        audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch);
+                        audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
+                        // An f32le input probes without data, so audio reaches ready on its own.
+                        audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
+                        Console.WriteLine($"Audio: system loopback [{audio.Format}] -> {Path.GetFileName(audioOnlyPath)}");
+                        }
+
+                        encoder = FfmpegEncoder.Start(
+                            videoOnlyPath,
+                            videoWidth,
+                            videoHeight,
+                            videoEncoder ?? "h264_nvenc",
+                            stopwatch,
+                            fpsMode);
+                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} -> {Path.GetFileName(videoOnlyPath)}");
+                    }
+                    else
+                    {
+                        encoder = FfmpegEncoder.Start(
+                            videoPath,
+                            videoWidth,
+                            videoHeight,
+                            videoEncoder ?? "h264_nvenc",
+                            stopwatch,
+                            fpsMode);
+                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} -> {videoPath}");
+                    }
                 }
 
                 // SystemRelativeTime is Windows' own capture timestamp: the same clock ffmpeg reads
                 // -use_wallclock_as_timestamps against, so it is the reference for PTS verification.
+                var isFirstFrame = currentFrame == 1;
                 encoder.Write(pixels, frame.SystemRelativeTime.TotalMilliseconds);
+
+                // The first write is what lets ffmpeg finish probing and open its input; only then is
+                // it meaningful to wait for readiness. Both processes are confirmed up before any
+                // further frames go in, so neither can miss early data.
+                if (isFirstFrame)
+                {
+                    encoder.WaitForReady(TimeSpan.FromSeconds(15));
+                    if (audio is not null)
+                    {
+                        audio.Start();
+                        Console.WriteLine("Both encoders are reading; recording.");
+                    }
+                }
+
                 return;
             }
 
