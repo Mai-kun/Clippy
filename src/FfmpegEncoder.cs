@@ -91,16 +91,27 @@ internal sealed class FfmpegEncoder : IDisposable
             // constant ~9 ms pipeline delay (GPU copy + 8 MB write) against the capture instant.
             // That offset is constant, so it shifts the whole timeline without accumulating.
             // It is a demuxer option, so it must precede the -i it applies to.
+            // Per-frame wallclock PTS, unchanged from parts A-C: confirmed 0 dropped frames, no PTS
+            // drift (-0.71 us/frame) and a constant ~9 ms pipeline delay. Phase 4.2 briefly removed it
+            // to test whether absolute timestamps broke -force_key_frames; it did not, so it stays.
             "-use_wallclock_as_timestamps", "1",
             "-thread_queue_size", "1024",
             "-i", "-",
             "-an", "-fps_mode", fpsMode,
             "-c:v", encoder, "-preset", "p1", "-b:v", "8M",
             "-maxrate", "12M", "-bufsize", "16M",
-            // -g 60 is a frame count, and WGC delivers a variable frame rate (measured 11-55 fps), so
-            // the keyframe interval in seconds would drift. Phase 4.2 replaces it with a time-based
-            // -force_key_frames; keeping -g as a ceiling still bounds GOP length.
-            "-g", "60", "-pix_fmt", "yuv420p",
+            // -g is a FRAME count, and WGC delivers a variable frame rate (measured 11-55 fps), so a
+            // keyframe every N frames would land at an unpredictable interval in seconds. Phase 4.2
+            // needs clip cutting accurate in real time, so the I-frame interval is forced in seconds.
+            //
+            // -forced-idr is REQUIRED with h264_nvenc: without it this ffmpeg build silently ignores
+            // -force_key_frames. Measured on a clean CFR source, 15 s at 25 fps:
+            //   h264_nvenc + -force_key_frames            ->  2 I-frames  (broken)
+            //   h264_nvenc + -force_key_frames -forced-idr 1 -> 15 I-frames  (correct)
+            //   libx264    + -force_key_frames            -> 15 I-frames  (correct, so it is NVENC-specific)
+            "-force_key_frames", "expr:gte(t,n_forced*1)",
+            "-forced-idr", "1",
+            "-pix_fmt", "yuv420p",
             // Raw Annex B elementary stream, not an MP4 container. Phase 4: an elementary stream has
             // no container timestamps at all, which is exactly the problem mp4 caused in B/C (it
             // rebased start_time to 0 while m4a kept epoch, destroying the A/V relationship).

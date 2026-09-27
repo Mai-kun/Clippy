@@ -11,8 +11,19 @@ if (args.Contains("--audio-probe"))
     return Clippy.AudioCapture.RunAudioProbe();
 }
 
+if (args.Contains("--test-parsers"))
 {
     return Clippy.ParserSelfTest.Run();
+}
+
+if (args.Contains("--test-ring"))
+{
+    return Clippy.RingBufferSelfTest.Run();
+}
+
+if (args.Contains("--test-mp4"))
+{
+    return Clippy.Mp4WriterSelfTest.Run();
 }
 
 if (args is ["--capture"])

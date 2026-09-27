@@ -78,12 +78,18 @@ internal sealed class ScreenCapture : IDisposable
         return capture.Capture(duration);
     }
 
-    /// <summary>Records a real video file: every captured frame is piped to ffmpeg.</summary>
+    /// <summary>Records a raw video stream: every captured frame is piped to ffmpeg.</summary>
     public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false)
     {
-        using var capture = new ScreenCapture(Path.GetDirectoryName(outputPath)!)
+        // Without audio there is no mux, so the encoder writes a raw Annex B stream. Naming that file
+        // .mp4 would be actively misleading: the bytes are correct but the extension lies.
+        var videoPath = withAudio
+            ? outputPath
+            : Path.ChangeExtension(outputPath, ".h264");
+
+        using var capture = new ScreenCapture(Path.GetDirectoryName(videoPath)!)
         {
-            videoPath = outputPath,
+            videoPath = videoPath,
             videoEncoder = encoderName,
             fpsMode = fpsMode,
             withAudio = withAudio,
