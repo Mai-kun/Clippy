@@ -46,6 +46,9 @@ internal sealed class ScreenCapture : IDisposable
     // Video mode: ffmpeg is started lazily on the first frame, when the true capture size is known.
     // ffmpeg stamps frames on read, so no warm-up buffer and no frame-rate guess are needed.
     private string? videoPath;
+    /// <summary>Set by RunVideo when --tray is active, so ExportClip can raise a system notification
+    /// without ScreenCapture taking a dependency on the tray's lifetime.</summary>
+    public Action<string, string>? notify;
     private string? videoEncoder;
     private string fpsMode = "passthrough";
     private bool withAudio;
@@ -298,6 +301,21 @@ internal sealed class ScreenCapture : IDisposable
             Console.WriteLine("Export: played the confirmation sound.");
         }
 
+        // Alongside the beep, not instead of it: the sound confirms to a user who is already looking
+        // at the screen, the balloon confirms to one who has switched away. The clip name is what
+        // they are actually looking for.
+        try
+        {
+            notify?.Invoke(
+                "Clippy",
+                $"Clip saved: {Path.GetFileName(path)} ({durationSeconds:F0}s)");
+        }
+        catch (Exception ex)
+        {
+            // A notification is never worth failing an export that already wrote its bytes.
+            Console.WriteLine($"Export: notification failed ({ex.GetType().Name}: {ex.Message}).");
+        }
+
         return path;
     }
 
@@ -364,6 +382,19 @@ internal sealed class ScreenCapture : IDisposable
             item.Size);
         session = framePool.CreateCaptureSession(item);
 
+        // Windows draws a yellow-green border around the captured item by default, which is exactly
+        // the thing a screen recorder must not add to the user's desktop. Setting it false is
+        // available from Windows 10 2004, so an older build throws and the border simply stays.
+        try
+        {
+            session.IsBorderRequired = false;
+        }
+        catch (Exception ex) when (ex is COMException or InvalidOperationException or NotSupportedException)
+        {
+            Console.WriteLine($"Capture: could not remove the capture border " +
+                $"({ex.GetType().Name}: {ex.Message}). A highlighted edge will show around the screen.");
+        }
+
         // Seeded from the monitor so the very first frame is not mistaken for a resolution change
         // and does not trigger a pointless encoder restart before recording has begun.
         videoWidth = item.Size.Width;
@@ -406,6 +437,8 @@ internal sealed class ScreenCapture : IDisposable
         using var trayIcon = tray ? new TrayIcon(capture.Config, Path.GetDirectoryName(videoPath)!, capture.RequestStop) : null;
         trayIcon?.Start();
         trayIcon?.HideConsole();
+        if (trayIcon is not null)
+            capture.notify = trayIcon.ShowNotification;
 
         return capture.Capture(duration);
     }
@@ -673,6 +706,7 @@ internal sealed class ScreenCapture : IDisposable
                             videoWidth,
                             videoHeight,
                             videoEncoder ?? config.VideoEncoder,
+                            config.VideoBitrateMbps,
                             stopwatch,
                             fpsMode);
                         encoder.StartDrain(videoRing);
@@ -685,6 +719,7 @@ internal sealed class ScreenCapture : IDisposable
                             videoWidth,
                             videoHeight,
                             videoEncoder ?? config.VideoEncoder,
+                            config.VideoBitrateMbps,
                             stopwatch,
                             fpsMode);
 
@@ -825,6 +860,7 @@ internal sealed class ScreenCapture : IDisposable
             newWidth,
             newHeight,
             videoEncoder ?? config.VideoEncoder,
+            config.VideoBitrateMbps,
             stopwatch,
             fpsMode);
         encoder.StartDrain(ring);

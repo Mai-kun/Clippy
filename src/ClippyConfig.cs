@@ -33,6 +33,15 @@ public sealed class ClippyConfig
     /// </summary>
     public string VideoEncoder { get; set; } = "h264_nvenc";
 
+    /// <summary>
+    /// Video bitrate in Mbps, used by the hardware (NVENC) rate control. The ring buffer holds
+    /// ENCODED NAL units, so this value is close to a direct multiplier on its memory use:
+    /// 8 Mbps cost ~380 MB, and 6 Mbps costs proportionally less. Clamped to 2-50, because below 2
+    /// the picture falls apart and above 50 the buffer grows without any visible gain.
+    /// Ignored by the software fallback, which is CRF-controlled and quality-targeted by design.
+    /// </summary>
+    public int VideoBitrateMbps { get; set; } = 6;
+
     /// <summary>Where config.json is looked up: beside the binary, not the current directory.</summary>
     public static string Path => System.IO.Path.Combine(AppContext.BaseDirectory, "config.json");
 
@@ -76,6 +85,8 @@ public sealed class ClippyConfig
                 config.LongClipHotkey = "F10";
             if (string.IsNullOrWhiteSpace(config.OutputFolder))
                 config.OutputFolder = "output";
+            if (config.VideoBitrateMbps is < 2 or > 50)
+                config.VideoBitrateMbps = 6;
 
             return config;
         }

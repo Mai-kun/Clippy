@@ -28,9 +28,16 @@ public sealed partial class TrayIcon : IDisposable
 
     private const int NIM_ADD = 0x00000000;
     private const int NIM_DELETE = 0x00000002;
+    private const int NIM_MODIFY = 0x00000001;
     private const int NIF_MESSAGE = 0x00000001;
     private const int NIF_ICON = 0x00000002;
     private const int NIF_TIP = 0x00000004;
+    private const int NIF_INFO = 0x00000010;
+    private const int NIIF_INFO = 0x00000001;
+
+    /// <summary>Identifies our one icon. Shell_NotifyIcon matches on (hWnd, uID), so a NIM_MODIFY
+    /// aimed at a notification has to repeat the same pair NIM_ADD used or it silently no-ops.</summary>
+    private const uint IconId = 1;
 
     private const uint MF_STRING = 0x00000000;
     private const uint MF_SEPARATOR = 0x00000800;
@@ -247,6 +254,50 @@ public sealed partial class TrayIcon : IDisposable
         return iconAdded;
     }
 
+    /// <summary>
+    /// Shows a native Windows notification balloon through the existing tray icon.
+    ///
+    /// This is the same mechanism the shell draws its own toasts with, so it costs nothing while the
+    /// process is idle: one Shell_NotifyIcon call, no extra window, no message loop of our own.
+    /// It targets the (hWnd, uID) pair that NIM_ADD established -- a notification aimed at any other
+    /// pair is accepted and then silently dropped, which looks exactly like the feature being broken.
+    ///
+    /// Callers must tolerate this failing (it will, if there is no tray in this session), so it only
+    /// ever logs.
+    /// </summary>
+    public unsafe void ShowNotification(string title, string message)
+    {
+        if (!iconAdded || window == 0)
+            return;
+
+        NotifyIconData nid = default;
+        nid.cbSize = (uint)sizeof(NotifyIconData);
+        nid.hWnd = window;
+        nid.uID = IconId;
+        // Only NIF_INFO: with the other flags set, NIM_MODIFY rewrites the tip and the icon as well,
+        // which is not what this call is for.
+        nid.uFlags = NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO;
+
+        // CopyTo stops at the NUL but throws if the text is longer than the fixed buffer, so the
+        // length is clamped first. Windows truncates a balloon silently otherwise, and a notification
+        // that silently loses its filename is worse than one that admits it was cut.
+        var titleSpan = AsSpan(title, 64);
+        var messageSpan = AsSpan(message, 256);
+        titleSpan.CopyTo(MemoryMarshal.CreateSpan(ref nid.szInfoTitle[0], 64));
+        messageSpan.CopyTo(MemoryMarshal.CreateSpan(ref nid.szInfo[0], 256));
+
+        if (Shell_NotifyIcon(NIM_MODIFY, &nid) == 0)
+        {
+            Console.WriteLine($"Tray: notification failed (error {Marshal.GetLastWin32Error()}). " +
+                "Windows may be suppressing notifications for this app.");
+        }
+    }
+
+    /// <summary>Clamps to the fixed buffer's capacity, reserving room for the terminating NUL.</summary>
+    private static ReadOnlySpan<char> AsSpan(string text, int capacity) =>
+        text.AsSpan(0, Math.Min(text.Length, capacity - 1));
+
     private unsafe void Pump()
     {
         wndProc = WndProc;
@@ -295,7 +346,7 @@ public sealed partial class TrayIcon : IDisposable
         NotifyIconData nid = default;
         nid.cbSize = (uint)sizeof(NotifyIconData);
         nid.hWnd = window;
-        nid.uID = 1;
+        nid.uID = IconId;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
 
@@ -496,7 +547,7 @@ public sealed partial class TrayIcon : IDisposable
                 NotifyIconData nid = default;
                 nid.cbSize = (uint)sizeof(NotifyIconData);
                 nid.hWnd = window;
-                nid.uID = 1;
+                nid.uID = IconId;
                 Shell_NotifyIcon(NIM_DELETE, &nid);
             }
 

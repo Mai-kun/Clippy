@@ -5,5 +5,7 @@
   "ShortClipHotkey": "F9",
   "LongClipHotkey": "F10",
   "PlaySoundNotification": true,
-  "StartMinimizedToTray": false
+  "StartMinimizedToTray": false,
+  "VideoEncoder": "h264_nvenc",
+  "VideoBitrateMbps": 6
 }

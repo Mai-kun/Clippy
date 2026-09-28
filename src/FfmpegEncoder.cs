@@ -56,7 +56,7 @@ internal sealed class FfmpegEncoder : IDisposable
     /// triple; libx264 wants its own preset and CRF, and passing NVENC's "-preset p1" to it is a hard
     /// error. Keeping them apart here is what makes the software fallback possible at all.
     /// </summary>
-    private static IEnumerable<string> CodecArguments(string encoder)
+    private static IEnumerable<string> CodecArguments(string encoder, int bitrateMbps)
     {
         var isSoftware = encoder.StartsWith("libx", StringComparison.OrdinalIgnoreCase);
 
@@ -67,14 +67,19 @@ internal sealed class FfmpegEncoder : IDisposable
                 "-c:v", encoder,
                 // ultrafast, not a quality setting for its own sake: this is a real-time recorder and
                 // a slow preset drops frames on the pipe. crf 20 is visually clean for gameplay.
+                // No bitrate here on purpose: a CRF target IS the quality setting, and adding -b:v
+                // on top of it would only fight it.
                 "-preset", "ultrafast", "-crf", "20",
             };
         }
 
+        // maxrate and bufsize scale with the target so the VBR window keeps the same 1.5x/2x ratio it
+        // had at the old fixed 8M/12M/16M, instead of staying at constants that mean something quite
+        // different at 2 Mbps than at 50.
         return new[]
         {
-            "-c:v", encoder, "-preset", "p1", "-b:v", "8M",
-            "-maxrate", "12M", "-bufsize", "16M",
+            "-c:v", encoder, "-preset", "p1", "-b:v", $"{bitrateMbps}M",
+            "-maxrate", $"{bitrateMbps * 1.5:F0}M", "-bufsize", $"{bitrateMbps * 2}M",
             // REQUIRED for the hardware encoders and unknown to libx264, so it lives here rather
             // than in the shared argument list. Without it h264_nvenc silently ignores
             // -force_key_frames and produces 2 I-frames where 15 are asked for.
@@ -87,6 +92,7 @@ internal sealed class FfmpegEncoder : IDisposable
         int width,
         int height,
         string encoder,
+        int bitrateMbps,
         Stopwatch stopwatch,
         string fpsMode = "vfr")
     {
@@ -133,7 +139,7 @@ internal sealed class FfmpegEncoder : IDisposable
             "-i", "-",
             "-an", "-fps_mode", fpsMode,
         }
-        .Concat(CodecArguments(encoder))
+        .Concat(CodecArguments(encoder, bitrateMbps))
         .Concat(new[]
         {
             // -g is a FRAME count, and WGC delivers a variable frame rate (measured 11-55 fps), so a
@@ -198,6 +204,7 @@ internal sealed class FfmpegEncoder : IDisposable
         int width,
         int height,
         string encoder,
+        int bitrateMbps,
         Stopwatch stopwatch,
         string fpsMode = "vfr")
     {
@@ -205,9 +212,9 @@ internal sealed class FfmpegEncoder : IDisposable
 
         // Already a software encoder: there is nothing to fall back to.
         if (encoder.StartsWith("libx", StringComparison.OrdinalIgnoreCase))
-            return Start(outputPath, width, height, encoder, stopwatch, fpsMode);
+            return Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode);
 
-        var attempt = Start(outputPath, width, height, encoder, stopwatch, fpsMode);
+        var attempt = Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode);
         if (attempt.Probe(TimeSpan.FromMilliseconds(700)))
         {
             Console.WriteLine($"Video: encoder {encoder} started.");
@@ -218,7 +225,7 @@ internal sealed class FfmpegEncoder : IDisposable
             $"(ffmpeg exited immediately). Falling back to {software}.");
         attempt.Dispose();
 
-        return Start(outputPath, width, height, software, stopwatch, fpsMode);
+        return Start(outputPath, width, height, software, bitrateMbps, stopwatch, fpsMode);
     }
 
     /// <summary>
