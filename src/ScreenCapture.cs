@@ -28,6 +28,17 @@ internal sealed class ScreenCapture : IDisposable
     private readonly ManualResetEventSlim stopped = new(false);
     private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
+    // ONE hardware zero for both tracks, taken at construction, before WGC and WASAPI exist.
+    //
+    // The Stopwatch origin used to be re-derived lazily at first use, long after the D3D and audio
+    // devices had been created, so the "zero" sat hundreds of milliseconds away from when the
+    // recording actually began, and that entire delay was folded into every timestamp. Both tracks
+    // now subtract this single value from their own native clocks -- the video from the compositor's
+    // SystemRelativeTime, the audio from WASAPI's qpcPosition -- so they share one physical instant
+    // and no C# dispatch delay can leak into either.
+    private readonly double masterZeroSeconds =
+        System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
+
     // Video mode: ffmpeg is started lazily on the first frame, when the true capture size is known.
     // ffmpeg stamps frames on read, so no warm-up buffer and no frame-rate guess are needed.
     private string? videoPath;
@@ -168,6 +179,24 @@ internal sealed class ScreenCapture : IDisposable
         }
 
         var alignment = TrackAligner.Align(videoTimes, audioPackets.Select(p => p.CaptureClockSeconds).ToList());
+
+        // Full provenance of the alignment, so a shift can be attributed to a specific stage instead
+        // of guessed at. Everything here is an absolute capture time on the shared clock.
+        var rawVideoStart = videoPackets[0].CaptureClockSeconds;
+        var rawVideoEnd = videoPackets[^1].CaptureClockSeconds;
+        var rawAudioStart = audioPackets.Count > 0 ? audioPackets[0].CaptureClockSeconds : double.NaN;
+        var rawAudioEnd = audioPackets.Count > 0 ? audioPackets[^1].CaptureClockSeconds : double.NaN;
+        var videoSnappedStart = videoTimes.Count > 0 ? videoTimes[0] : double.NaN;
+
+        Console.WriteLine($"[align] video slice raw  [{rawVideoStart:F3} .. {rawVideoEnd:F3}] s");
+        Console.WriteLine($"[align] video after keyframe snap: {videoSnappedStart:F3} s " +
+            $"(advanced {(videoSnappedStart - rawVideoStart) * 1000:F0} ms from the slice start)");
+        Console.WriteLine($"[align] audio slice raw  [{rawAudioStart:F3} .. {rawAudioEnd:F3}] s");
+        Console.WriteLine($"[align] t0 (shared zero) = {alignment.Zero:F3} s, " +
+            $"dropped video {alignment.DroppedVideo * 1000:F0} ms, audio {alignment.DroppedAudio * 1000:F0} ms");
+        Console.WriteLine($"[align] first sample to Mp4Writer: video {FirstOrNaN(alignment.VideoTimes):F3} s, " +
+            $"audio {FirstOrNaN(alignment.AudioTimes):F3} s");
+
         Console.WriteLine($"Export: zero at {alignment.Zero:F3}s, " +
             $"dropped {alignment.DroppedVideo * 1000:F0} ms of video, {alignment.DroppedAudio * 1000:F0} ms of audio");
 
@@ -193,9 +222,64 @@ internal sealed class ScreenCapture : IDisposable
             }
         }
 
-        for (var i = 0; i < audioPackets.Count && i < alignment.AudioTimes.Count; i++)
+        // Build the audio track's packets and their timestamps in ONE pass over one source of truth.
+        // These used to be two independent lists (all audioPackets paired with all AudioTimes), so
+        // filtering one without the other silently discarded or mislabelled samples -- a change to
+        // the drop rule had no effect on the bytes actually written.
+        //
+        // The clip's zero is ALWAYS the video keyframe: H.264 cannot be decoded from anything
+        // earlier, so no clip can begin before it, and the audio track has to be made to agree.
+        // Audio recorded before the keyframe is DROPPED; silence is inserted only when the first
+        // surviving audio packet is still after the keyframe, which is a real gap.
+        var t0 = alignment.Zero;
+        var finalAudio = new List<byte[]>();
+        var finalAudioTimes = new List<double>();
+        var droppedAudioPackets = 0;
+        foreach (var packet in audioPackets)
         {
-            writer.AddAudioSample(audioPackets[i].Span, alignment.AudioTimes[i]);
+            var relative = packet.CaptureClockSeconds - t0;
+            if (relative < 0)
+            {
+                droppedAudioPackets++;
+                continue;
+            }
+
+            finalAudio.Add(packet.Span.ToArray());
+            finalAudioTimes.Add(relative);
+        }
+
+        var leadIn = finalAudioTimes.Count > 0 ? finalAudioTimes[0] : 0.0;
+        Console.WriteLine($"Export: t0 = video keyframe at {t0:F3}s; dropped {droppedAudioPackets} " +
+            $"audio packets recorded before it; first surviving audio at {leadIn * 1000:F1} ms");
+
+        if (leadIn > 0.0005 && finalAudio.Count > 0)
+        {
+            // A real ADTS frame with a zeroed payload is a valid silent frame, and reusing the first
+            // frame's own header keeps the sample rate and channel count exactly right.
+            var frameLength = finalAudio[0].Length;
+            const int headerLength = 7;
+            var silentFrame = new byte[frameLength];
+            finalAudio[0].AsSpan(0, headerLength).CopyTo(silentFrame);
+            var secondsPerFrame = 1024.0 / 48000.0;
+            var frames = (int)Math.Ceiling(leadIn / secondsPerFrame);
+            Console.WriteLine($"Export: padding audio head with {leadIn * 1000:F0} ms of silence " +
+                $"({frames} AAC frames) so both tracks start at the same instant");
+
+            for (var k = 0; k < frames; k++)
+            {
+                writer.AddAudioSample(silentFrame, k * secondsPerFrame);
+            }
+        }
+
+        if (finalAudio.Count != finalAudioTimes.Count)
+        {
+            throw new InvalidOperationException(
+                $"audio packet/timestamp desync: {finalAudio.Count} vs {finalAudioTimes.Count}");
+        }
+
+        for (var i = 0; i < finalAudio.Count; i++)
+        {
+            writer.AddAudioSample(finalAudio[i], finalAudioTimes[i]);
         }
 
         var path = Path.Combine(outputDirectory, $"clip-{DateTime.Now:HHmmssfff}.mp4");
@@ -222,6 +306,19 @@ internal sealed class ScreenCapture : IDisposable
 
     // A 3-minute clip runs to a few hundred MB, and a half-written mp4 is worse than no clip.
     private const long MinFreeSpaceBytes = 300L * 1024 * 1024;
+
+    /// <summary>
+    /// The Stopwatch origin expressed in the QPC scale (100 ns units since boot). Video frames carry
+    /// the compositor's SystemRelativeTime and audio packets carry WASAPI's qpcPosition, both on that
+    /// scale, so subtracting this once puts every timestamp onto the shared Stopwatch.
+    /// </summary>
+    private double? stopwatchZeroQpcSeconds;
+
+    private static double FirstOrNaN(IReadOnlyList<double> values) => values.Count > 0 ? values[0] : double.NaN;
+
+    private double StopwatchZeroQpcSeconds =>
+        stopwatchZeroQpcSeconds ??= (System.Diagnostics.Stopwatch.GetTimestamp() -
+            (long)(stopwatch.Elapsed.TotalSeconds * System.Diagnostics.Stopwatch.Frequency)) / 10_000_000.0;
 
     // Phase 6 hotkeys and the optional timed mid-recording export (the same call, different trigger).
     private bool hotkeysEnabled;
@@ -531,7 +628,7 @@ internal sealed class ScreenCapture : IDisposable
                         {
                             audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
                             audio = new AudioCapture(stopwatch, videoStartSeconds);
-                            audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing);
+                            audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing, masterZeroSeconds);
                             audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
                             // An f32le input probes without data, so audio reaches ready on its own.
                             audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
@@ -569,10 +666,29 @@ internal sealed class ScreenCapture : IDisposable
                 // SystemRelativeTime is Windows' own capture timestamp: the same clock ffmpeg reads
                 // -use_wallclock_as_timestamps against, so it is the reference for PTS verification.
                 var isFirstFrame = currentFrame == 1;
-                // Enqueue before Write so the queue order is exactly the byte order into ffmpeg. The
-                // clock is read here, at frame arrival, not when the encoded bytes come back out: the
-                // elementary stream on stdout carries no timestamps of its own.
-                encoder.EnqueueCaptureTime(stopwatch.Elapsed.TotalSeconds);
+
+                // Startup cross-check: the compositor's own QPC for the first video frame, against
+                // the first audio packet's QPC. Their difference is the whole A/V offset, measured
+                // directly on the hardware clock, with no alignment or muxer in the way.
+                if (isFirstFrame)
+                {
+                    Console.WriteLine($"[start] first VIDEO frame: sysRelTicks={frame.SystemRelativeTime.Ticks} " +
+                        $"qpc={(frame.SystemRelativeTime.Ticks / 1e7):F6} " +
+                        $"arrivalStopwatch={stopwatch.Elapsed.TotalSeconds:F3} " +
+                        $"arrivalQpc={(System.Diagnostics.Stopwatch.GetTimestamp() / 1e7):F6} " +
+                        $"stopwatchZeroQpc={StopwatchZeroQpcSeconds:F6}");
+                }
+
+                // Enqueue before Write so the queue order is exactly the byte order into ffmpeg.
+                //
+                // The time is the frame's OWN SystemRelativeTime -- the QPC at which the compositor
+                // rendered it -- not the moment OnFrameArrived runs. Taking the arrival time stamps
+                // every frame later than it really appeared, by however long the event dispatch and
+                // the GPU copy took, and that lands directly on the A/V offset. SystemRelativeTime is
+                // 100 ns units from boot, the same 10 MHz scale as the audio's qpcPosition, so the
+                // stopwatch origin is subtracted once and both tracks share one hardware clock.
+                var frameQpcSeconds = frame.SystemRelativeTime.Ticks / (double)System.Diagnostics.Stopwatch.Frequency;
+                encoder.EnqueueCaptureTime(frameQpcSeconds - masterZeroSeconds);
                 encoder.Write(pixels, frame.SystemRelativeTime.TotalMilliseconds);
 
                 // The first write is what lets ffmpeg finish probing and open its input; only then is

@@ -11,19 +11,23 @@ public readonly record struct TrackAlignment(
     IReadOnlyList<double> VideoTimes,
     IReadOnlyList<double> AudioTimes,
     double DroppedVideo,
-    double DroppedAudio);
+    double DroppedAudio,
+    double VideoStart,
+    double AudioStart)
+{
+    /// <summary>How much silence the audio track must be padded with at its head, in seconds.</summary>
+    public double AudioLeadIn => AudioStart > VideoStart ? AudioStart - VideoStart : 0.0;
+}
 
 /// <summary>
 /// Puts both tracks on ONE shared zero, so a video frame and an audio sample that came from the same
 /// physical moment keep that relationship in the exported file.
 /// </summary>
 /// <remarks>
-/// Both cases are deliberate, and neither is privileged:
-/// video later than audio -> the early audio is dropped, because before that moment there is no
-/// picture to pair it with; audio later than video -> the early video is dropped, symmetrically.
-/// Whichever track starts later defines the zero, and the earlier one loses its head.
-/// Without this, each track was written relative to its own first sample and the origins differed
-/// by the start-up gap between WASAPI loopback and the first video frame.
+/// t=0 is ALWAYS the video keyframe. H.264 cannot be decoded from anything earlier, so no clip can
+/// begin before it. Audio recorded before that instant is reported as negative times and dropped by
+/// the caller; when audio starts later, the resulting gap is a real one and is reported as
+/// <see cref="AudioLeadIn"/> to be filled with silence. Video is never cut.
 /// </remarks>
 public static class TrackAligner
 {
@@ -34,7 +38,7 @@ public static class TrackAligner
     {
         if (videoCaptureTimes.Count == 0 && audioCaptureTimes.Count == 0)
         {
-            return new TrackAlignment(0, [], [], 0, 0);
+            return new TrackAlignment(0, [], [], 0, 0, 0, 0);
         }
 
         // With alignment off, every track keeps its own origin -- the bug this exists to prevent.
@@ -47,18 +51,25 @@ public static class TrackAligner
                 videoCaptureTimes.Select(t => t - vZero).ToList(),
                 audioCaptureTimes.Select(t => t - aZero).ToList(),
                 0,
-                0);
+                0,
+                vZero,
+                aZero);
         }
 
-        var zero = Math.Max(
-            videoCaptureTimes.Count > 0 ? videoCaptureTimes[0] : double.MinValue,
-            audioCaptureTimes.Count > 0 ? audioCaptureTimes[0] : double.MinValue);
+        // The zero is ALWAYS the video keyframe when there is one. H.264 cannot be decoded from
+        // anything earlier, so no clip can begin before it; the audio track has to be made to agree.
+        //
+        // An MP4 written without an edit list always plays both tracks from 0.000, so a start offset
+        // that lives only in the timestamps is discarded by the container. Anything before the
+        // keyframe has to be either dropped (the normal case: sound was already playing) or filled
+        // with real silent frames (a clip that begins before audio exists).
+        var videoStart = videoCaptureTimes.Count > 0 ? videoCaptureTimes[0] : double.NaN;
+        var audioStart = audioCaptureTimes.Count > 0 ? audioCaptureTimes[0] : double.NaN;
+        var zero = videoCaptureTimes.Count > 0 ? videoStart : audioStart;
 
-        var v = videoCaptureTimes.Where(t => t >= zero).Select(t => t - zero).ToList();
-        var a = audioCaptureTimes.Where(t => t >= zero).Select(t => t - zero).ToList();
-        var droppedVideo = videoCaptureTimes.Count > 0 ? zero - videoCaptureTimes[0] : 0;
-        var droppedAudio = audioCaptureTimes.Count > 0 ? zero - audioCaptureTimes[0] : 0;
-        return new TrackAlignment(zero, v, a, droppedVideo, droppedAudio);
+        var v = videoCaptureTimes.Select(t => t - zero).ToList();
+        var a = audioCaptureTimes.Select(t => t - zero).ToList();
+        return new TrackAlignment(zero, v, a, 0, 0, videoStart, audioStart);
     }
 }
 
