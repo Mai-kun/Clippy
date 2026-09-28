@@ -172,8 +172,13 @@ internal sealed class FfmpegEncoder : IDisposable
     {
         lock (captureTimes)
         {
+            var n = captureTimeCount++;
+            if (n < 10)
+            {
+                Console.WriteLine($"[vq] in  #{n} ts={captureClockSeconds:F4} depth={captureTimes.Count}");
+            }
+
             captureTimes.Enqueue(captureClockSeconds);
-            captureTimeCount++;
         }
     }
 
@@ -248,7 +253,14 @@ internal sealed class FfmpegEncoder : IDisposable
                     captureSeconds = captureTimes.Dequeue();
                 }
 
-                accessUnitCount++;
+                var m = accessUnitCount++;
+                if (m < 10)
+                {
+                    // remaining AFTER this dequeue: how many timestamps were still waiting when the
+                    // encoder produced this access unit. A large value means the encoder is lagging
+                    // behind the capture; a small one means they are in step.
+                    Console.WriteLine($"[vq] out #{m} ts={captureSeconds:F4} remaining={captureTimes.Count}");
+                }
             }
         }
 

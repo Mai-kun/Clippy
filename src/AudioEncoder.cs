@@ -53,7 +53,7 @@ internal sealed class AudioEncoder : IDisposable
         this.queueLimit = queueLimit;
     }
 
-    public static AudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, RingBuffer ring, int queueLimit = 512)
+    public static AudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, RingBuffer ring, double masterZeroSeconds, int queueLimit = 512)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         if (File.Exists(path))
@@ -120,6 +120,7 @@ internal sealed class AudioEncoder : IDisposable
             gate,
             queueLimit);
         encoder.sampleRate = format.SampleRate;
+        encoder.masterZeroSeconds = masterZeroSeconds;
         encoder.bytesPerSampleFrame = format.BlockAlign;
         timingLog.WriteLine("buffer,swCaptureMs,bytes,totalBytes,qpcPosition");
         encoder.pumpRunning = true;
@@ -145,6 +146,9 @@ internal sealed class AudioEncoder : IDisposable
     private int sampleRate;
     private int frameOrdinal;
     private int anchorSet;
+
+    /// <summary>The single hardware zero shared with the video track. Set once, at Start.</summary>
+    private double masterZeroSeconds;
 
     // Sample accounting: queued in, written to ffmpeg's stdin, dropped before it was ready, and
     // ADTS frames that came back out. queued - dropped should equal written, and written/1024
@@ -261,19 +265,13 @@ internal sealed class AudioEncoder : IDisposable
         // pipe latency can never leak into a timestamp.
         if (Interlocked.CompareExchange(ref anchorSet, 1, 0) == 0)
         {
-            // Anchor on the packet's OWN capture time, not on when it reached C#.
-            //
-            // A loopback buffer contains audio rendered up to a full buffer ago, so anchoring on
-            // arrival stamps every frame later than its content really is -- a constant A/V offset
-            // (measured ~260 ms, against ~18 ms of true loopback latency). qpcPosition and
-            // Stopwatch.GetTimestamp() are both 10 MHz from system boot, so the stopwatch origin can
-            // be expressed in the QPC scale and the two subtracted directly.
-            var ticks = System.Diagnostics.Stopwatch.GetTimestamp();
-            var elapsed = stopwatch.Elapsed.TotalSeconds;
-            var stopwatchZeroQpc = ticks - (long)(elapsed * Stopwatch.Frequency);
-            anchorSeconds = (qpcPosition - stopwatchZeroQpc) / (double)Stopwatch.Frequency;
-            Console.WriteLine($"[sync] audio timeline anchored at {anchorSeconds:F3}s from the first " +
-                $"packet's qpcPosition (arrival was {elapsed:F3}s), {sampleRate} Hz");
+            // Both tracks subtract the SAME hardware zero, taken once before WGC and WASAPI existed.
+            // Deriving the zero here instead -- from Stopwatch.GetTimestamp() minus elapsed -- put
+            // "zero" hundreds of milliseconds late, after the audio device had been created, and that
+            // entire delay landed in every audio timestamp.
+            anchorSeconds = (qpcPosition / (double)Stopwatch.Frequency) - masterZeroSeconds;
+            Console.WriteLine($"[sync] audio anchored at {anchorSeconds:F3}s from the first packet's " +
+                $"qpcPosition minus masterZero={masterZeroSeconds:F3}, {sampleRate} Hz");
         }
 
         if (queue.Count >= queueLimit)
