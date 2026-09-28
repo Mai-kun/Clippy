@@ -74,6 +74,11 @@ if (args.FirstOrDefault() == "--record")
         args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration);
 }
 
+if (args.FirstOrDefault() == "--test-audio-timeline")
+{
+    return Clippy.AudioEncoder.SelfTest() ? 0 : 1;
+}
+
 if (args.FirstOrDefault() == "--capture")
 {
     Console.Error.WriteLine("Usage: --capture [duration-seconds]");

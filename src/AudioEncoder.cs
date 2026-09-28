@@ -119,6 +119,8 @@ internal sealed class AudioEncoder : IDisposable
             debugLogPath,
             gate,
             queueLimit);
+        encoder.sampleRate = format.SampleRate;
+        encoder.bytesPerSampleFrame = format.BlockAlign;
         timingLog.WriteLine("buffer,swCaptureMs,bytes,totalBytes,qpcPosition");
         encoder.pumpRunning = true;
         encoder.pump = new Thread(encoder.Drain) { IsBackground = true, Name = "clippy-audio-encoder" };
@@ -129,6 +131,40 @@ internal sealed class AudioEncoder : IDisposable
 
     private Thread? drain;
     private RingBuffer? ring;
+
+    // Audio timeline anchor: the shared-clock time of the FIRST audio sample. Every ADTS frame then
+    // gets an exact time from its ordinal, because AAC-LC frames are always 1024 samples:
+    //     time(frame k) = anchor + k * 1024 / sampleRate
+    //
+    // This replaces reading the clock when the bytes come back out of the pipe, which carried the
+    // whole AAC + queue + pipe latency into every timestamp and appeared as a constant ~245 ms
+    // audio offset. It also does NOT need a per-packet FIFO: at 48 kHz a 10 ms WASAPI packet is
+    // 480 samples, so packets and AAC frames are not 1:1 (~2.13 packets per frame). One Dequeue per
+    // frame would be wrong; the sample counter is exact regardless of packet sizes.
+    private double anchorSeconds;
+    private int sampleRate;
+    private int frameOrdinal;
+    private int anchorSet;
+
+    // Sample accounting: queued in, written to ffmpeg's stdin, dropped before it was ready, and
+    // ADTS frames that came back out. queued - dropped should equal written, and written/1024
+    // should equal the frame count to within one AAC frame.
+    private long queuedSamples;
+    private long writtenSamples;
+    private long droppedSamples;
+
+    /// <summary>Bytes per PCM sample frame (channels * bytes/sample), taken from the real endpoint format.</summary>
+    private int bytesPerSampleFrame = 8;
+
+    /// <summary>Prints the sample/frame reconciliation. Called once the drains are joined.</summary>
+    public void PrintSampleAccounting()
+    {
+        var expectedFrames = (double)writtenSamples / 1024.0;
+        Console.WriteLine($"[audioacct] queued={queuedSamples} written={writtenSamples} dropped={droppedSamples} " +
+            $"queued-written={queuedSamples - writtenSamples} adtsFramesOut={frameOrdinal} " +
+            $"written/1024={expectedFrames:F2} diff={frameOrdinal - expectedFrames:F2} " +
+            $"(one AAC frame is {1024} samples)");
+    }
 
     /// <summary>
     /// Reads ffmpeg's stdout on a background thread, splits it into ADTS frames and pushes each into
@@ -151,11 +187,13 @@ internal sealed class AudioEncoder : IDisposable
                 int read;
                 while ((read = stdout.Read(buffer, 0, buffer.Length)) > 0)
                 {
-                    parser.Append(buffer.AsSpan(0, read), clock.Elapsed.TotalSeconds, (data, length, t) =>
+                    // The timestamp argument is ignored: the frame's real time comes from its ordinal
+                    // on the audio timeline, never from when the bytes happened to be read.
+                    parser.Append(buffer.AsSpan(0, read), 0, (data, length, t) =>
                     {
                         var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
                         data.CopyTo(rented, 0);
-                        ring!.Push(rented, length, t, isKeyframe: true);
+                        ring!.Push(rented, length, NextFrameTime(), isKeyframe: true);
                     });
                 }
             }
@@ -172,6 +210,40 @@ internal sealed class AudioEncoder : IDisposable
     /// <summary>Blocks until the stdout drain thread has finished, or the timeout expires.</summary>
     public void WaitForDrain(TimeSpan timeout) => drain?.Join(timeout);
 
+    /// <summary>Shared-clock time of the next AAC frame, from its ordinal. Never the read time.</summary>
+    private double NextFrameTime()
+    {
+        var k = frameOrdinal++;
+        return anchorSeconds + (k * 1024.0 / sampleRate);
+    }
+
+    /// <summary>
+    /// Self-test: at 48 kHz AAC-LC, frame k sits at k*1024/48000 seconds, and that must not depend
+    /// on how the input was split into WASAPI packets. A per-packet FIFO would fail this.
+    /// </summary>
+    public static bool SelfTest()
+    {
+        const int rate = 48000;
+        const double step = 1024.0 / 48000.0;
+        Console.WriteLine($"[selftest] step = {step:R} s/frame");
+        foreach (var packetSamples in new[] { 480, 512, 1024, 2048 })
+        {
+            var total = 0; var buffers = 0; var frames = 0; var times = new List<double>();
+            while (total < rate) { total += packetSamples; buffers++; while ((frames + 1) * 1024 <= total) { times.Add(frames * step); frames++; } }
+            var expectedFrames = total / 1024;
+            var sample = string.Join(", ", times.Take(5).Select(t => t.ToString("F6")));
+            Console.WriteLine($"[selftest] packet={packetSamples} buffers={buffers} totalSamples={total} expectedFrames={expectedFrames} actualFrames={frames} firstTimes=[{sample}]");
+            if (frames != expectedFrames) { Console.WriteLine($"[selftest] FAIL packet={packetSamples}: frames {frames} != expected {expectedFrames}"); return false; }
+            for (var k = 0; k < times.Count; k++)
+            {
+                if (Math.Abs(times[k] - (k * step)) > 1e-12) { Console.WriteLine($"[selftest] FAIL packet={packetSamples} k={k}: {times[k]:R} != {(k * step):R}"); return false; }
+                if (k > 0 && times[k] <= times[k - 1]) { Console.WriteLine($"[selftest] FAIL packet={packetSamples} k={k}: not increasing"); return false; }
+            }
+        }
+        Console.WriteLine("[selftest] OK");
+        return true;
+    }
+
     /// <summary>
     /// Blocks until ffmpeg has opened its input. Safe here because an f32le input probes without
     /// data (the log shows "frames:0"), so ffmpeg reaches the ready marker on its own.
@@ -184,11 +256,23 @@ internal sealed class AudioEncoder : IDisposable
         if (disposed)
             return;
 
+        // Anchor the audio timeline to the first real buffer, on the SAME shared clock the video
+        // uses. Everything after this is derived from the frame ordinal, so ffmpeg's encoder and
+        // pipe latency can never leak into a timestamp.
+        if (Interlocked.CompareExchange(ref anchorSet, 1, 0) == 0)
+        {
+            anchorSeconds = stopwatch.Elapsed.TotalSeconds;
+            Console.WriteLine($"[sync] audio timeline anchored at {anchorSeconds:F3}s, {sampleRate} Hz");
+        }
+
         if (queue.Count >= queueLimit)
         {
             droppedBuffers++;
+            Interlocked.Add(ref droppedSamples, samples.Length / bytesPerSampleFrame);
             return;
         }
+
+        Interlocked.Add(ref queuedSamples, samples.Length / bytesPerSampleFrame);
 
         var now = stopwatch.Elapsed.TotalMilliseconds;
         queue.Enqueue(samples);
@@ -209,6 +293,7 @@ internal sealed class AudioEncoder : IDisposable
             signal.WaitOne(200);
             while (queue.TryDequeue(out var buffer))
             {
+                Interlocked.Add(ref writtenSamples, buffer.Length / bytesPerSampleFrame);
                 try
                 {
                     // No Flush: ~100 tiny pipe writes per second was measurably worse for ffmpeg
@@ -273,6 +358,10 @@ internal sealed class AudioEncoder : IDisposable
             : $"Audio: {bufferCount} buffers encoded, none dropped.");
     }
 }
+
+
+
+
 
 
 
