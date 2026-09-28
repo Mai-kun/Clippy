@@ -43,4 +43,72 @@ internal static class FfmpegLocator
             return resolved;
         }
     }
+
+    /// <summary>
+    /// The full path of a bundled ffprobe.exe, or null when there is none next to the binary.
+    /// </summary>
+    public static string? BundledProbePath => Path.Combine(AppContext.BaseDirectory, "ffprobe.exe");
+
+    /// <summary>
+    /// The ffprobe to shell out to: the bundled copy when present, else the bare name for PATH.
+    /// Same precedence rule as ffmpeg, so a portable folder carries both or neither.
+    /// </summary>
+    public static string ProbeExecutable
+    {
+        get
+        {
+            var bundled = BundledProbePath;
+            return File.Exists(bundled) ? bundled : "ffprobe";
+        }
+    }
+
+    /// <summary>
+    /// Whether ffprobe can actually be launched, checked once.
+    ///
+    /// "Is the file there" and "does it run" are different questions: a bare "ffprobe" that PATH
+    /// cannot resolve throws Win32Exception from Process.Start rather than returning null, and that
+    /// exception was taking the whole selftest down with it. A Windows CI agent has neither ffmpeg
+    /// nor ffprobe installed, so the self-test has to be able to say "skipped" instead.
+    /// </summary>
+    public static bool ProbeAvailable
+    {
+        get
+        {
+            if (probeAvailable is not null)
+                return probeAvailable.Value;
+
+            try
+            {
+                var probe = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = ProbeExecutable,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                };
+                probe.ArgumentList.Add("-version");
+
+                using var process = System.Diagnostics.Process.Start(probe);
+                if (process is null)
+                {
+                    probeAvailable = false;
+                }
+                else
+                {
+                    process.WaitForExit(10_000);
+                    probeAvailable = true;
+                }
+            }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+            {
+                Console.WriteLine($"ffprobe: not runnable ({ex.GetType().Name}: {ex.Message})");
+                probeAvailable = false;
+            }
+
+            return probeAvailable.Value;
+        }
+    }
+
+    private static bool? probeAvailable;
 }

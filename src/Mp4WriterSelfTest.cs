@@ -1,4 +1,4 @@
-﻿namespace Clippy;
+namespace Clippy;
 
 /// <summary>
 /// Synthetic check for the MP4 writer. Uses REAL SPS/PPS taken from a live capture, because invented
@@ -10,18 +10,60 @@ internal static class Mp4WriterSelfTest
     public static int Run()
     {
         var failures = 0;
-        failures += Check("mp4: box structure is self-consistent", BoxStructureIsValid);
-        failures += Check("mp4: PTS match the capture clock", PtsMatchCaptureClock);
-        failures += Check("mp4: mutation check (halved timestamps must fail)", PtsMutationIsCaught);
-        failures += Check("mp4: two-track box structure", TwoTrackBoxStructure);
-        failures += Check("mp4: mdat size accounting", MdatSizeAccounting);
-        failures += Check("mp4: both tracks survive in one file", BothTracksSurvive);
-        failures += Check("mp4: audio PTS match the capture clock", AudioPtsMatch);
-        failures += Check("mp4: audio mutation check (halved timestamps must fail)", AudioMutationIsCaught);
-    failures += Check("mp4: both tracks share one zero when video starts late", SharedZeroVideoLate);
-    failures += Check("mp4: both tracks share one zero when audio starts late", SharedZeroAudioLate);
-    failures += Check("mp4: mutation check (no shared zero must fail)", SharedZeroMutationIsCaught);
+        // A Windows CI agent ships without ffmpeg or ffprobe, and the deep checks below shell out to
+        // ffprobe to read real PTS back out of the file. Without them those checks are not applicable,
+        // and reporting them as failures would mean a green build is impossible on a clean runner.
+        // The pure checks (box structure, size accounting, aligner rules) still run everywhere.
+        var deep = FfmpegLocator.ProbeAvailable;
+        if (!deep)
+            Console.WriteLine("[SKIP] ffprobe not found in PATH or app directory; " +
+                              "skipping deep PTS verification");
+
+        failures += Check("mp4: box structure is self-consistent", BoxStructureIsValid, always: true);
+        failures += Check("mp4: PTS match the capture clock", PtsMatchCaptureClock, deep);
+        failures += Check("mp4: mutation check (halved timestamps must fail)", PtsMutationIsCaught, deep);
+        failures += Check("mp4: two-track box structure", TwoTrackBoxStructure, always: true);
+        failures += Check("mp4: mdat size accounting", MdatSizeAccounting, always: true);
+        failures += Check("mp4: both tracks survive in one file", BothTracksSurvive, deep);
+        failures += Check("mp4: audio PTS match the capture clock", AudioPtsMatch, deep);
+        failures += Check("mp4: audio mutation check (halved timestamps must fail)", AudioMutationIsCaught, deep);
+    failures += Check("mp4: both tracks share one zero when video starts late", SharedZeroVideoLate, always: true);
+    failures += Check("mp4: both tracks share one zero when audio starts late", SharedZeroAudioLate, always: true);
+    failures += Check("mp4: mutation check (no shared zero must fail)", SharedZeroMutationIsCaught, always: true);
         return failures;
+    }
+
+    /// <summary>
+    /// Runs ffprobe and returns its stdout, or null when ffprobe cannot be launched at all.
+    ///
+    /// The null return is what makes the SKIP path reachable: ProbeAvailable checks once up front,
+    /// but PATH can still be broken per-call, and an unhandled Win32Exception here would surface as
+    /// an opaque process failure instead of a test result.
+    /// </summary>
+    private static string? RunProbe(IEnumerable<string> arguments)
+    {
+        var startInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = FfmpegLocator.ProbeExecutable,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            CreateNoWindow = true,
+        };
+        foreach (var argument in arguments)
+            startInfo.ArgumentList.Add(argument);
+
+        try
+        {
+            using var process = System.Diagnostics.Process.Start(startInfo)!;
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            return output;
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            Console.WriteLine($"[SKIP] ffprobe could not be started ({ex.GetType().Name}: {ex.Message})");
+            return null;
+        }
     }
 
     /// <summary>
@@ -139,7 +181,19 @@ internal static class Mp4WriterSelfTest
         return null;
     }
 
-    private static int Check(string name, Func<string?> test)    {
+    /// <param name="always">
+    /// False for the checks that need ffprobe. They are skipped rather than failed when it is absent:
+    /// a missing tool means the property went unverified, which is a different statement from it being
+    /// wrong, and failing would make a correct build look broken on any machine without ffmpeg.
+    /// </param>
+    private static int Check(string name, Func<string?> test, bool always = false)
+    {
+        if (!always && !FfmpegLocator.ProbeAvailable)
+        {
+            Console.WriteLine($"[SKIP] {name}");
+            return 0;
+        }
+
         try
         {
             var error = test();
@@ -348,24 +402,14 @@ internal static class Mp4WriterSelfTest
 
     private static List<double> ReadPacketTimes(string path, string stream)
     {
-        var startInfo = new System.Diagnostics.ProcessStartInfo
+        var output = RunProbe(new[]
         {
-            FileName = "ffprobe",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            CreateNoWindow = true,
-        };
-        foreach (var argument in new[]
-        {
-            "-v", "error", "-select_streams", stream, "-show_entries", "packet=pts_time", "-of", "csv=p=0", path,
-        })
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
+            "-v", "error", "-select_streams", stream, "-show_entries", "packet=pts_time",
+            "-of", "csv=p=0", path,
+        });
+        if (output is null)
+            return [];
 
-        using var process = System.Diagnostics.Process.Start(startInfo)!;
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
         return output.Split(['\n', '\r'], StringSplitOptions.RemoveEmptyEntries)
             .Select(line => line.Trim().TrimEnd(','))
             .Where(line => double.TryParse(line, System.Globalization.CultureInfo.InvariantCulture, out _))
@@ -375,25 +419,16 @@ internal static class Mp4WriterSelfTest
 
     private static double ReadDuration(string path, string stream)
     {
-        var startInfo = new System.Diagnostics.ProcessStartInfo
+        var output = RunProbe(new[]
         {
-            FileName = "ffprobe",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            CreateNoWindow = true,
-        };
-        foreach (var argument in new[]
-        {
-            "-v", "error", "-select_streams", stream, "-show_entries", "stream=duration", "-of", "csv=p=0", path,
-        })
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
+            "-v", "error", "-select_streams", stream, "-show_entries", "stream=duration",
+            "-of", "csv=p=0", path,
+        });
+        if (output is null)
+            return -1;
 
-        using var process = System.Diagnostics.Process.Start(startInfo)!;
-        var output = process.StandardOutput.ReadToEnd().Trim().TrimEnd(',');
-        process.WaitForExit();
-        return double.TryParse(output, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : -1;
+        var text = output.Trim().TrimEnd(',');
+        return double.TryParse(text, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : -1;
     }
 
     private static string? BoxStructureIsValid()
@@ -446,24 +481,14 @@ internal static class Mp4WriterSelfTest
 
     private static List<double> ReadPacketTimes(string path)
     {
-        var startInfo = new System.Diagnostics.ProcessStartInfo
+        var output = RunProbe(new[]
         {
-            FileName = "ffprobe",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            CreateNoWindow = true,
-        };
-        foreach (var argument in new[]
-        {
-            "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", path,
-        })
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
+            "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+            "-of", "csv=p=0", path,
+        });
+        if (output is null)
+            return [];
 
-        using var process = System.Diagnostics.Process.Start(startInfo)!;
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
         return output.Split(['\n', '\r'], StringSplitOptions.RemoveEmptyEntries)
             .Select(line => line.Trim().TrimEnd(','))
             .Where(line => double.TryParse(line, System.Globalization.CultureInfo.InvariantCulture, out _))

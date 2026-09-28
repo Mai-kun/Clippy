@@ -34,6 +34,15 @@ jobs:
             -property installationPath `
             -format value
 
+      # The selftests shell out to ffprobe, and a clean windows-latest image has neither ffmpeg nor
+      # ffprobe on PATH. Without this the --test-mp4 step dies with a Win32Exception about a missing
+      # file, which reads like a Clippy bug and is not one.
+      - name: Setup FFmpeg and FFprobe
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+          architecture: x64
+
       - name: Publish (Native AOT)
         run: >
           dotnet publish src/Clippy.csproj
@@ -61,6 +70,21 @@ jobs:
         run: |
           Copy-Item README.md publish/README.md
           Copy-Item config.example.json publish/config.example.json
+
+      # Ship ffmpeg inside the archive. It is not committed to the repo, so the repository does not
+      # grow by ~80 MB, and the user gets a folder that works with no setup at all. FfmpegLocator
+      # prefers a bundled ffmpeg.exe over PATH, so dropping it next to Clippy.exe is enough.
+      - name: Bundle ffmpeg
+        shell: pwsh
+        run: |
+          $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source
+          Copy-Item $ffmpeg publish/ffmpeg.exe
+          # ffprobe ships alongside ffmpeg and the portable folder is only complete with it: the
+          # selftests and any future verification need it, and a user who has it can debug locally.
+          $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
+          if ($ffprobe) { Copy-Item $ffprobe.Source publish/ffprobe.exe }
+          Get-ChildItem publish/ffmpeg.exe, publish/ffprobe.exe -ErrorAction SilentlyContinue |
+            Select-Object Name, Length
 
       - name: Verify the selftests
         shell: pwsh
