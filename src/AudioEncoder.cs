@@ -261,8 +261,19 @@ internal sealed class AudioEncoder : IDisposable
         // pipe latency can never leak into a timestamp.
         if (Interlocked.CompareExchange(ref anchorSet, 1, 0) == 0)
         {
-            anchorSeconds = stopwatch.Elapsed.TotalSeconds;
-            Console.WriteLine($"[sync] audio timeline anchored at {anchorSeconds:F3}s, {sampleRate} Hz");
+            // Anchor on the packet's OWN capture time, not on when it reached C#.
+            //
+            // A loopback buffer contains audio rendered up to a full buffer ago, so anchoring on
+            // arrival stamps every frame later than its content really is -- a constant A/V offset
+            // (measured ~260 ms, against ~18 ms of true loopback latency). qpcPosition and
+            // Stopwatch.GetTimestamp() are both 10 MHz from system boot, so the stopwatch origin can
+            // be expressed in the QPC scale and the two subtracted directly.
+            var ticks = System.Diagnostics.Stopwatch.GetTimestamp();
+            var elapsed = stopwatch.Elapsed.TotalSeconds;
+            var stopwatchZeroQpc = ticks - (long)(elapsed * Stopwatch.Frequency);
+            anchorSeconds = (qpcPosition - stopwatchZeroQpc) / (double)Stopwatch.Frequency;
+            Console.WriteLine($"[sync] audio timeline anchored at {anchorSeconds:F3}s from the first " +
+                $"packet's qpcPosition (arrival was {elapsed:F3}s), {sampleRate} Hz");
         }
 
         if (queue.Count >= queueLimit)

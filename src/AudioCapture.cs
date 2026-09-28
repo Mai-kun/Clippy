@@ -79,6 +79,10 @@ internal sealed class AudioCapture : IDisposable
         capture = new WasapiRecorderBuilder()
             .WithDevice(render)
             .WithLoopbackCapture()
+            // NOTE: NAudio's WasapiRecorderBuilder exposes no way to change the buffer size (no
+            // BufferMilliseconds, and WithLoopbackCapture takes none), so the 100 ms default stays.
+            // It is not needed: the AudioEncoder now anchors on qpcPosition rather than on arrival,
+            // which removes the buffer age from the timeline instead of trying to shrink it.
             .Build();
         // Stored as a field so Dispose can unsubscribe the exact same delegate instance.
         handler = (buffer, flags, devicePosition, qpcPosition) => OnDataAvailable(buffer, qpcPosition);
