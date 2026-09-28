@@ -27,7 +27,24 @@ internal static class UpdateService
 {
     private const string CurrentVersion = "v1.0.3";
     private const string ApiUrl = "https://api.github.com/repos/Mai-kun/Clippy/releases/latest";
-    private const string AssetName = "Clippy-win-x64.zip";
+
+    /// <summary>Installer, used when the running copy was installed by the setup.</summary>
+    private const string AssetSetup = "Clippy-Setup.exe";
+
+    /// <summary>Zip, used by a copy the user just unpacked somewhere.</summary>
+    private const string AssetPortable = "Clippy-win-x64-portable.zip";
+
+    /// <summary>
+    /// Inno Setup drops unins000.exe in the application folder, so its presence is what tells the two
+    /// installation shapes apart. There is no other reliable marker: a portable folder and an
+    /// installed one contain the same Clippy.exe.
+    /// </summary>
+    public static bool IsInstalled =>
+        File.Exists(Path.Combine(AppContext.BaseDirectory, "unins000.exe"));
+
+    /// <summary>The asset that updates THIS copy, or the other one when a release ships only that.</summary>
+    private static string WantedAsset => IsInstalled ? AssetSetup : AssetPortable;
+    private static string FallbackAsset => IsInstalled ? AssetPortable : AssetSetup;
 
     public static string Version => CurrentVersion;
 
@@ -68,18 +85,40 @@ internal static class UpdateService
             if (!root.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
                 return UpdateInfo.UpToDate;
 
+            var wanted = WantedAsset;
+            string? url = null;
+
             foreach (var asset in assets.EnumerateArray())
             {
                 if (asset.TryGetProperty("name", out var name) &&
-                    name.GetString() == AssetName &&
-                    asset.TryGetProperty("browser_download_url", out var url))
+                    asset.TryGetProperty("browser_download_url", out var download) &&
+                    name.GetString() == wanted)
                 {
-                    return new UpdateInfo(true, tag, url.GetString() ?? "");
+                    url = download.GetString();
+                    break;
                 }
             }
 
-            Console.WriteLine($"Update: {tag} has no {AssetName}.");
-            return UpdateInfo.UpToDate;
+            if (url is null)
+            {
+                // A release published before this build can ship only the other shape, and a user who
+                // never installed anything should still be able to update. The setup would install to
+                // a different folder, so it is only offered when nothing better exists.
+                foreach (var asset in assets.EnumerateArray())
+                {
+                    if (asset.TryGetProperty("name", out var name) &&
+                        asset.TryGetProperty("browser_download_url", out var download) &&
+                        name.GetString() == FallbackAsset)
+                    {
+                        url = download.GetString();
+                        break;
+                    }
+                }
+            }
+
+            return url is null
+                ? UpdateInfo.UpToDate
+                : new UpdateInfo(true, tag, url);
         }
         catch (Exception ex)
         {
@@ -126,9 +165,21 @@ internal static class UpdateService
     public static async Task ApplyUpdateAsync(string downloadUrl, Action<string, string>? notify)
     {
         var temp = Path.GetTempPath();
+        var appDir = AppContext.BaseDirectory;
+
+        // An installed copy is updated by the installer, never by dropping an exe on top: the
+        // uninstaller, the shortcut and the registry entries would then describe a program that no
+        // longer exists, and the next real install would refuse to run. A portable folder has none of
+        // that, so there the copy is still the right answer.
+        if (IsInstalled)
+        {
+            await ApplyViaSetupAsync(downloadUrl, notify).ConfigureAwait(false);
+            Environment.Exit(0);
+            return;
+        }
+
         var zipPath = Path.Combine(temp, "clippy_update.zip");
         var extractDir = Path.Combine(temp, "clippy_extracted");
-        var appDir = AppContext.BaseDirectory;
 
         try
         {
@@ -175,6 +226,64 @@ internal static class UpdateService
         }
 
         Environment.Exit(0);
+    }
+
+    /// <summary>
+    /// Downloads the installer and hands the update to it, silently.
+    ///
+    /// /VERYSILENT /SUPPRESSMSGBOXES /NORESTART is the standard headless update invocation, and
+    /// CloseApplications=yes in the .iss makes Windows close the running recorder for us -- which it
+    /// cannot do until this process is gone, hence the Exit the caller performs.
+    /// </summary>
+    private static async Task ApplyViaSetupAsync(string downloadUrl, Action<string, string>? notify)
+    {
+        var setupPath = Path.Combine(Path.GetTempPath(), "Clippy-Setup.exe");
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+            notify?.Invoke("Clippy Update", "Downloading...");
+
+            using var response = await client
+                .GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead)
+                .ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            await using (var target = File.Create(setupPath))
+            {
+                await response.Content.CopyToAsync(target).ConfigureAwait(false);
+            }
+
+            notify?.Invoke("Clippy Update", "Installing...");
+
+            // UseShellExecute is required here: a freshly downloaded file is not executable until the
+            // shell has weighed it, and UseShellExecute=false fails on exactly that check.
+            Process.Start(new ProcessStartInfo(setupPath, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART")
+            {
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            // Leave the old version running. A failed update must never cost the user a working app.
+            Console.WriteLine($"Update: installer path failed ({ex.GetType().Name}: {ex.Message}).");
+            notify?.Invoke("Clippy Update", "Update failed. The current version still works.");
+            RemoveIfPresent(setupPath);
+            throw;
+        }
+    }
+
+    private static void RemoveIfPresent(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine($"Update: could not remove {path} ({ex.GetType().Name}).");
+        }
     }
 
     /// <summary>

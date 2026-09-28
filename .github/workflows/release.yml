@@ -109,6 +109,30 @@ jobs:
           Copy-Item $ffmpeg publish/ffmpeg.exe
           Get-Item publish/ffmpeg.exe | Select-Object Name, Length
 
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile the installer
+        shell: pwsh
+        run: |
+          # ISCC does not land on PATH in a fresh runner shell, so it is located the way Inno
+          # itself documents: under Program Files, by directory name.
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*","${env:ProgramFiles}\Inno Setup*" `
+                    -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $iscc) { throw 'ISCC.exe not found after installing Inno Setup' }
+
+          # The tag is the single source of truth for the version, so the installer and the
+          # updater can never disagree about what release this is.
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          if (-not $version) { $version = '0.0.0' }
+
+          & $iscc.FullName "/DPublishVersion=$version" "installer\clippy.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
+
+          Get-ChildItem artifacts -Filter 'Clippy-Setup.exe' |
+            Select-Object Name, @{n='MB'; e={ [math]::Round($_.Length/1MB, 2) } }
+
       - name: Package
         shell: pwsh
         run: |
@@ -116,9 +140,9 @@ jobs:
           # exe, which deflate cannot improve. It stopped being right once ffmpeg (~200 MB of
           # libraries and tables) went in: a stored archive was 443 MB, and deflating the same
           # payload costs a second or two of packaging and takes it to roughly 40 MB.
-          Compress-Archive -Path publish/* -DestinationPath Clippy-win-x64.zip -CompressionLevel Optimal
+          Compress-Archive -Path publish/* -DestinationPath Clippy-win-x64-portable.zip -CompressionLevel Optimal
 
-          $zip = Get-Item Clippy-win-x64.zip
+          $zip = Get-Item Clippy-win-x64-portable.zip
           "archive: {0:N1} MB" -f ($zip.Length / 1MB)
           "contents:"
           Get-ChildItem publish | Select-Object Name, Length
@@ -126,14 +150,27 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: Clippy-win-x64.zip
+          # Both shapes ship on every release. The setup is what most people want; the zip is for
+          # anyone who cannot or will not install, and it is the only one a portable copy can update
+          # itself from -- UpdateService picks by whether unins000.exe sits next to the exe.
+          files: |
+            Clippy-Setup.exe
+            Clippy-win-x64-portable.zip
           # ${{ github.ref_name }} is the tag, so v1.2.3 names the release v1.2.3.
           name: Clippy ${{ github.ref_name }}
           body: |
-            Скачайте `Clippy-win-x64.zip`, распакуйте и запустите `Clippy.exe`.
+            Два варианта на выбор.
 
-            Положите рядом `ffmpeg.exe`, если его нет в `PATH` — без него запись не запустится.
+            **`Clippy-Setup.exe`** — установщик. Ставится в `%LOCALAPPDATA%\Programs\Clippy` без
+            прав администратора, создаёт ярлык в меню «Пуск», умеет запускаться при старте Windows
+            и обновляется сам.
+
+            **`Clippy-win-x64-portable.zip`** — распакуйте в любую папку и запустите `Clippy.exe`.
+            Ничего не устанавливается.
+
+            `ffmpeg.exe` уже внутри обоих вариантов, отдельно ничего ставить не нужно.
 
             Горячие клавиши: **F9** — 30 секунд, **F10** — 3 минуты.
+            Клипы в `clips/`, отладочные логи в `logs/`.
           draft: false
           generate_release_notes: true
