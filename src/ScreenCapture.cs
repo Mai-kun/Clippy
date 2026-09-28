@@ -57,6 +57,46 @@ internal sealed class ScreenCapture : IDisposable
         // though the drain threads keep pushing while this runs.
         var to = stopwatch.Elapsed.TotalSeconds;
         var from = to - durationSeconds;
+
+        // STALENESS. If the pipeline died -- ffmpeg exited, NVENC reset, the frame pool stalled --
+        // the ring simply stops filling and still looks healthy. Without this check F9 happily cuts a
+        // clip out of frozen frames and the user gets a video that plays but shows nothing new.
+        if (videoRing is { Count: > 0 })
+        {
+            var staleFor = to - videoRing.NewestSeconds;
+            if (staleFor > MaxCaptureStalenessSeconds)
+            {
+                Console.WriteLine($"Export: capture pipeline FROZEN -- the newest frame is " +
+                    $"{staleFor:F1}s old (limit {MaxCaptureStalenessSeconds:F0}s). " +
+                    "Refusing to export stale frames; the encoder or the capture source has stopped.");
+                return null;
+            }
+        }
+
+        // FREE SPACE. A 3-minute clip is a few hundred MB, and a half-written mp4 is worse than
+        // no clip, so check before building anything.
+        try
+        {
+            var target = Path.GetFullPath(outputDirectory);
+            var root = Path.GetPathRoot(target);
+            if (root is not null)
+            {
+                var free = new DriveInfo(root).AvailableFreeSpace;
+                if (free < MinFreeSpaceBytes)
+                {
+                    Console.WriteLine($"Export: not enough free space on {root} -- " +
+                        $"{free / 1048576:F0} MB available, " +
+                        $"{MinFreeSpaceBytes / 1048576:F0} MB required. Clip not written.");
+                    return null;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // If the free-space check itself cannot run, do not block a working export over it.
+            Console.WriteLine($"Export: free-space check skipped ({ex.GetType().Name}: {ex.Message}).");
+        }
+
         var videoPackets = videoRing.Slice(from, to);
         var audioPackets = audioRing.Slice(from, to);
 
@@ -175,6 +215,13 @@ internal sealed class ScreenCapture : IDisposable
 
     // Ring capacity: longer than any clip we export, so an export never hits the trim.
     private const double RingSeconds = 190;
+
+    // Phase 7 safety limits. A capture that has not produced a frame for this long is broken, and
+    // exporting its ring would hand the user a plausible-looking but stale clip.
+    private const double MaxCaptureStalenessSeconds = 5.0;
+
+    // A 3-minute clip runs to a few hundred MB, and a half-written mp4 is worse than no clip.
+    private const long MinFreeSpaceBytes = 300L * 1024 * 1024;
 
     // Phase 6 hotkeys and the optional timed mid-recording export (the same call, different trigger).
     private bool hotkeysEnabled;
