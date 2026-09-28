@@ -115,6 +115,10 @@ jobs:
       - name: Compile the installer
         shell: pwsh
         run: |
+          # A stale setup from an earlier run would be uploaded as if it were this release's, so the
+          # output directory starts empty.
+          Remove-Item artifacts -Recurse -Force -ErrorAction SilentlyContinue
+
           # ISCC does not land on PATH in a fresh runner shell, so it is located the way Inno
           # itself documents: under Program Files, by directory name.
           $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*","${env:ProgramFiles}\Inno Setup*" `
@@ -159,8 +163,13 @@ jobs:
           # itself from -- UpdateService picks by whether unins000.exe sits next to the exe. The zip
           # keeps its long-standing name on purpose: renaming it would strand existing copies.
           files: |
-            Clippy-Setup.exe
+            artifacts/Clippy-Setup.exe
             Clippy-win-x64.zip
+          # Without this, a mistyped or moved asset is silently skipped and the release ships half
+          # the files it claims to. That is exactly what happened: the setup was written to
+          # artifacts\ while this glob looked in the repository root, and the first v1.0.4 release
+          # published a zip and no installer without failing a single step.
+          fail_on_unmatched_files: true
           # ${{ github.ref_name }} is the tag, so v1.2.3 names the release v1.2.3.
           name: Clippy ${{ github.ref_name }}
           body: |
