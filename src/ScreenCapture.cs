@@ -25,6 +25,7 @@ internal sealed class ScreenCapture : IDisposable
     private readonly Direct3D11CaptureFramePool framePool;
     private readonly GraphicsCaptureSession session;
     private readonly string outputDirectory;
+    private readonly ClippyConfig config;
     private readonly ManualResetEventSlim stopped = new(false);
     private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
@@ -285,6 +286,15 @@ internal sealed class ScreenCapture : IDisposable
         var path = Path.Combine(outputDirectory, $"clip-{DateTime.Now:HHmmssfff}.mp4");
         File.WriteAllBytes(path, writer.Build());
         Console.WriteLine($"Export: wrote {path} ({writer.SampleCount} samples)");
+
+        // Only after the bytes are on disk: a beep before this point would tell the player the clip
+        // is safe when it is not.
+        if (config.PlaySoundNotification)
+        {
+            ExportNotification.PlayExportSaved();
+            Console.WriteLine("Export: played the confirmation sound.");
+        }
+
         return path;
     }
 
@@ -332,8 +342,9 @@ internal sealed class ScreenCapture : IDisposable
     private int frameCount;
     private bool disposed;
 
-    private ScreenCapture(string outputDirectory)
+    private ScreenCapture(string outputDirectory, ClippyConfig? config = null)
     {
+        this.config = config ?? ClippyConfig.Load();
         this.outputDirectory = outputDirectory;
         Directory.CreateDirectory(outputDirectory);
 
@@ -367,7 +378,7 @@ internal sealed class ScreenCapture : IDisposable
     }
 
     /// <summary>Records a raw video stream: every captured frame is piped to ffmpeg.</summary>
-    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null)
+    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null, ClippyConfig? config = null)
     {
         // Without audio there is no mux, so the encoder writes a raw Annex B stream. Naming that file
         // .mp4 would be actively misleading: the bytes are correct but the extension lies.
@@ -375,7 +386,7 @@ internal sealed class ScreenCapture : IDisposable
             ? outputPath
             : Path.ChangeExtension(outputPath, ".h264");
 
-        using var capture = new ScreenCapture(Path.GetDirectoryName(videoPath)!)
+        using var capture = new ScreenCapture(Path.GetDirectoryName(videoPath)!, config)
         {
             videoPath = videoPath,
             videoEncoder = encoderName,
@@ -428,7 +439,7 @@ internal sealed class ScreenCapture : IDisposable
             HotkeyService? hotkeys = null;
             if (hotkeysEnabled)
             {
-                hotkeys = new HotkeyService(seconds => ExportClip(seconds));
+                hotkeys = new HotkeyService(seconds => ExportClip(seconds), config);
                 hotkeys.Start();
                 Console.WriteLine("Hotkeys: F9 saves 30 s, F10 saves 3 min.");
             }

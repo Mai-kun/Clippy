@@ -1,5 +1,6 @@
 ﻿using System.Globalization;
 using System.Runtime.CompilerServices;
+using Clippy;
 
 if (args.Contains("--smoke"))
 {
@@ -40,10 +41,13 @@ if (args is ["--capture", var durationText] &&
 
 if (args.FirstOrDefault() == "--record")
 {
+    // Loaded once here and passed down, so the output folder, the hotkey bindings and the sound
+    // setting all come from the same file for the whole run.
+    var config = ClippyConfig.Load();
     var videoSeconds = args.Length > 1 && double.TryParse(args[1], CultureInfo.InvariantCulture, out var parsed) && parsed > 0
         ? parsed
         : 60;
-    var videoPath = Path.Combine(Environment.CurrentDirectory, "output", $"clip-{DateTime.Now:yyyyMMdd-HHmmss}.mp4");
+    var videoPath = Path.Combine(Environment.CurrentDirectory, config.OutputFolder, $"clip-{DateTime.Now:yyyyMMdd-HHmmss}.mp4");
     var videoEncoder = args.FirstOrDefault(a => a.StartsWith("--encoder=", StringComparison.Ordinal))?["--encoder=".Length..]
         ?? "h264_nvenc";
     // passthrough is the default: vfr makes ffmpeg resample onto a 1/25 grid and drop frames
@@ -71,7 +75,7 @@ if (args.FirstOrDefault() == "--record")
     }
     return Clippy.ScreenCapture.RunVideo(
         TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode, withAudio || audioCaptureOnly, audioCaptureOnly,
-        args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration);
+        args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration, config);
 }
 
 if (args.FirstOrDefault() == "--test-audio-timeline")

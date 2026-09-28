@@ -16,12 +16,11 @@ public sealed class HotkeyService : IDisposable
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_KEYDOWN = 0x0100;
     private const int WM_SYSKEYDOWN = 0x0104;
-    private const int VK_F9 = 0x78;
-    private const int VK_F10 = 0x79;
 
-    /// <summary>F9: 30 s. F10: 3 min. The longest is under the ring's 190 s capacity.</summary>
-    private const double F9Seconds = 30;
-    private const double F10Seconds = 180;
+    // Key codes and clip lengths come from config.json, not from constants, so the F9/F10 bindings
+    // and the 30 s / 3 min lengths can be changed without rebuilding. A key the user did not map
+    // is simply absent from the map and is ignored.
+    private readonly Dictionary<int, double> bindings;
 
     private readonly Action<double> export;
     private readonly AutoResetEvent work = new(false);
@@ -54,7 +53,28 @@ public sealed class HotkeyService : IDisposable
     [DllImport("user32.dll")]
     private static extern IntPtr DispatchMessage(ref Msg msg);
 
-    public HotkeyService(Action<double> export) => this.export = export;
+    public HotkeyService(Action<double> export, ClippyConfig config)
+    {
+        this.export = export;
+        bindings = [];
+
+        if (ClippyConfig.TryParseHotkey(config.ShortClipHotkey, out var shortVk))
+            bindings[shortVk] = config.ShortClipSeconds;
+        if (ClippyConfig.TryParseHotkey(config.LongClipHotkey, out var longVk))
+            bindings[longVk] = config.LongClipSeconds;
+
+        // A single key mapped to two lengths would be ambiguous, and the later mapping would simply
+        // win, so the second one is dropped with a warning rather than silently shadowing the first.
+        if (bindings.Count == 1 && config.ShortClipHotkey == config.LongClipHotkey)
+        {
+            Console.WriteLine($"Hotkeys: {config.ShortClipHotkey} is bound to both clip lengths; " +
+                "only the short clip will be saved.");
+        }
+
+        Console.WriteLine("Hotkeys: " + string.Join(", ", bindings.Select(b => $"{KeyName(b.Key)} = {b.Value:F0}s")));
+    }
+
+    private static string KeyName(int vk) => $"F{vk - 0x70 + 1}";
 
     public void Start()
     {
@@ -129,12 +149,7 @@ public sealed class HotkeyService : IDisposable
         if (code >= 0 && (wParam.ToInt32() == WM_KEYDOWN || wParam.ToInt32() == WM_SYSKEYDOWN))
         {
             var vk = Marshal.ReadInt32(lParam);
-            double? seconds = vk switch
-            {
-                VK_F9 => F9Seconds,
-                VK_F10 => F10Seconds,
-                _ => null,
-            };
+            double? seconds = bindings.TryGetValue(vk, out var configured) ? configured : null;
 
             if (seconds is { } s)
             {
