@@ -350,6 +350,11 @@ internal sealed class ScreenCapture : IDisposable
             item.Size);
         session = framePool.CreateCaptureSession(item);
 
+        // Seeded from the monitor so the very first frame is not mistaken for a resolution change
+        // and does not trigger a pointless encoder restart before recording has begun.
+        videoWidth = item.Size.Width;
+        videoHeight = item.Size.Height;
+
         framePool.FrameArrived += OnFrameArrived;
         item.Closed += OnItemClosed;
     }
@@ -572,14 +577,21 @@ internal sealed class ScreenCapture : IDisposable
             if (frame is null)
                 return;
 
-            if (frame.ContentSize != item.Size)
+            if (frame.ContentSize.Width != videoWidth || frame.ContentSize.Height != videoHeight)
             {
                 sender.Recreate(
                     direct3DDevice,
                     DirectXPixelFormat.B8G8R8A8UIntNormalized,
                     FramePoolBufferCount,
                     frame.ContentSize);
-                Console.WriteLine($"Capture size changed to {frame.ContentSize.Width}x{frame.ContentSize.Height}.");
+
+                // An avc1 track has one resolution for its whole life, so frames of two different
+                // sizes can never share one MP4. The old ring is dropped rather than trimmed, and
+                // the encoder is restarted with the new -video_size, or ffmpeg would keep writing
+                // the old geometry and every frame after this one would be mis-scaled.
+                RestartVideoPipeline(frame.ContentSize.Width, frame.ContentSize.Height);
+                Console.WriteLine($"[wgc] Resolution changed to {frame.ContentSize.Width}x" +
+                    $"{frame.ContentSize.Height}. Video ring reset, encoder restarted.");
                 return;
             }
 
@@ -749,6 +761,45 @@ internal sealed class ScreenCapture : IDisposable
 
         Console.WriteLine($"Stopping capture: {reason}.");
         stopped.Set();
+    }
+
+    /// <summary>
+    /// Phase 7 scenario A: the display changed resolution, so the video track has to start over.
+    ///
+    /// Only the video pipeline is rebuilt. The audio capture and its ring are untouched, because
+    /// audio is resolution-independent -- tearing those down would drop sound that is still valid
+    /// and would re-run the WASAPI start-up, which is exactly where the A/V offset comes from.
+    ///
+    /// Called with the capture lock already held, like the rest of OnFrameArrived.
+    /// </summary>
+    private void RestartVideoPipeline(int newWidth, int newHeight)
+    {
+        var hadEncoder = encoder is not null;
+        var ring = videoRing;
+
+        if (hadEncoder && ring is not null)
+        {
+            // The old encoder is stopped and its process reaped BEFORE the ring is cleared: the
+            // drain thread reads from that ring, so clearing it under a live reader would race.
+            encoder.Dispose();
+            encoder = null;
+            ring.Clear();
+        }
+
+        videoWidth = newWidth;
+        videoHeight = newHeight;
+
+        if (!hadEncoder || videoPath is null || ring is null)
+            return;
+
+        encoder = FfmpegEncoder.Start(
+            videoOnlyPath ?? videoPath,
+            newWidth,
+            newHeight,
+            videoEncoder ?? "h264_nvenc",
+            stopwatch,
+            fpsMode);
+        encoder.StartDrain(ring);
     }
 
     /// <summary>Stages a GPU texture into system RAM as tightly packed BGRA rows.</summary>
