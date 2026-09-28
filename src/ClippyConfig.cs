@@ -12,7 +12,14 @@ namespace Clippy;
 /// </summary>
 public sealed class ClippyConfig
 {
-    public string OutputFolder { get; set; } = "output";
+    /// <summary>
+    /// Where finished clips are written, relative to the executable. "clips" rather than "output"
+    /// because the folder now holds only the product; the logs went to their own.
+    /// </summary>
+    public string OutputFolder { get; set; } = "clips";
+
+    /// <summary>Where debug artifacts go: ffmpeg logs, timing CSVs, crash breadcrumbs.</summary>
+    public string LogsFolder { get; set; } = "logs";
     public double ShortClipSeconds { get; set; } = 30;
     public double LongClipSeconds { get; set; } = 180;
     public string ShortClipHotkey { get; set; } = "F9";
@@ -96,7 +103,9 @@ public sealed class ClippyConfig
             if (!TryParseHotkey(config.LongClipHotkey, out _))
                 config.LongClipHotkey = "F10";
             if (string.IsNullOrWhiteSpace(config.OutputFolder))
-                config.OutputFolder = "output";
+                config.OutputFolder = "clips";
+            if (string.IsNullOrWhiteSpace(config.LogsFolder))
+                config.LogsFolder = "logs";
             if (config.VideoBitrateMbps is < 2 or > 50)
                 config.VideoBitrateMbps = 6;
 

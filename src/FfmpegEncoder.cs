@@ -15,6 +15,7 @@ internal sealed class FfmpegEncoder : IDisposable
     private readonly Process process;
     private readonly Stream stdin;
     private readonly string outputPath;
+    private readonly string? logDirectory;
     private readonly Stopwatch stopwatch;
     private readonly StreamWriter timingLog;
     private readonly StreamWriter debugLog;
@@ -27,6 +28,7 @@ internal sealed class FfmpegEncoder : IDisposable
         Process process,
         Stream stdin,
         string outputPath,
+        string? logDirectory,
         Stopwatch stopwatch,
         StreamWriter timingLog,
         StreamWriter debugLog,
@@ -35,6 +37,8 @@ internal sealed class FfmpegEncoder : IDisposable
         this.process = process;
         this.stdin = stdin;
         this.outputPath = outputPath;
+        // Kept so teardown reopens the very log Start opened; the name is derived from it.
+        this.logDirectory = logDirectory;
         this.stopwatch = stopwatch;
         this.timingLog = timingLog;
         this.debugLog = debugLog;
@@ -45,9 +49,12 @@ internal sealed class FfmpegEncoder : IDisposable
 
     public string OutputPath => outputPath;
 
-    public static string TimingLogPath(string outputPath) => Path.ChangeExtension(outputPath, ".timing.csv");
+    /// <summary>Log sidecars follow the media's name so a clip and its evidence stay a visible pair.</summary>
+    public static string TimingLogPath(string outputPath, string? logDirectory = null) =>
+        LogPaths.Resolve(logDirectory, outputPath, ".video-timing.csv");
 
-    public static string DebugLogPath(string outputPath) => Path.ChangeExtension(outputPath, ".ffmpeg-debug.log");
+    public static string DebugLogPath(string outputPath, string? logDirectory = null) =>
+        LogPaths.Resolve(logDirectory, outputPath, ".video-ffmpeg-debug.log");
 
     /// <summary>
     /// Rate-control arguments for the chosen encoder.
@@ -94,7 +101,8 @@ internal sealed class FfmpegEncoder : IDisposable
         string encoder,
         int bitrateMbps,
         Stopwatch stopwatch,
-        string fpsMode = "vfr")
+        string fpsMode = "vfr",
+        string? logDirectory = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         if (File.Exists(outputPath))
@@ -103,7 +111,7 @@ internal sealed class FfmpegEncoder : IDisposable
         // Per-frame ground truth for PTS verification: swCaptureMs is the Stopwatch reading when the
         // frame arrived, swWriteDoneMs is when the last byte hit ffmpeg's stdin, systemTimeMs is the
         // WGC SystemRelativeTime (Windows' own capture clock), so pipeline delay is measurable.
-        var timingPath = TimingLogPath(outputPath);
+        var timingPath = TimingLogPath(outputPath, logDirectory);
         var timingLog = new StreamWriter(timingPath, append: false) { AutoFlush = true };
         timingLog.WriteLine("frame,swCaptureMs,swWriteDoneMs,systemTimeMs,payloadBytes");
 
@@ -170,10 +178,12 @@ internal sealed class FfmpegEncoder : IDisposable
         var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Failed to start ffmpeg. Is it installed and on PATH?");
 
-        // ffmpeg's debug log is the evidence for where frames go; keep it next to the video.
+        // ffmpeg's debug log is the evidence for where frames go; it goes to the log directory and
+        // keeps the media's name so the two are still obviously a pair. It must be created through
+        // the same helper Dispose reads it back with, or teardown looks for a file nobody wrote.
         // The handler must be attached before BeginErrorReadLine, and the async reader owns stderr
         // from then on, so Dispose must not call ReadToEnd.
-        var debugLog = new StreamWriter(Path.ChangeExtension(outputPath, ".ffmpeg-debug.log"), append: false)
+        var debugLog = new StreamWriter(DebugLogPath(outputPath, logDirectory), append: false)
         {
             AutoFlush = true,
         };
@@ -189,7 +199,7 @@ internal sealed class FfmpegEncoder : IDisposable
         process.BeginErrorReadLine();
 
         var stdin = process.StandardInput.BaseStream;
-        return new FfmpegEncoder(process, stdin, outputPath, stopwatch, timingLog, debugLog, gate);
+        return new FfmpegEncoder(process, stdin, outputPath, logDirectory, stopwatch, timingLog, debugLog, gate);
     }
 
     /// <summary>
@@ -206,15 +216,16 @@ internal sealed class FfmpegEncoder : IDisposable
         string encoder,
         int bitrateMbps,
         Stopwatch stopwatch,
-        string fpsMode = "vfr")
+        string fpsMode = "vfr",
+        string? logDirectory = null)
     {
         const string software = "libx264";
 
         // Already a software encoder: there is nothing to fall back to.
         if (encoder.StartsWith("libx", StringComparison.OrdinalIgnoreCase))
-            return Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode);
+            return Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode, logDirectory);
 
-        var attempt = Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode);
+        var attempt = Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode, logDirectory);
         if (attempt.Probe(TimeSpan.FromMilliseconds(700)))
         {
             Console.WriteLine($"Video: encoder {encoder} started.");
@@ -225,7 +236,7 @@ internal sealed class FfmpegEncoder : IDisposable
             $"(ffmpeg exited immediately). Falling back to {software}.");
         attempt.Dispose();
 
-        return Start(outputPath, width, height, software, bitrateMbps, stopwatch, fpsMode);
+        return Start(outputPath, width, height, software, bitrateMbps, stopwatch, fpsMode, logDirectory);
     }
 
     /// <summary>
@@ -436,7 +447,7 @@ internal sealed class FfmpegEncoder : IDisposable
         process.WaitForExit();
 
         // Release the file handles before reading: a live StreamWriter locks its file exclusively.
-        var debugPath = DebugLogPath(outputPath);
+        var debugPath = DebugLogPath(outputPath, logDirectory);
         // The stderr reader thread writes debugLog under lock(debugLog); Dispose must take the same
         // lock or it can dispose the writer mid-write.
         lock (debugLog)
@@ -444,7 +455,20 @@ internal sealed class FfmpegEncoder : IDisposable
             timingLog.Dispose();
             debugLog.Dispose();
         }
-        var stderr = string.Join(Environment.NewLine, File.ReadAllLines(debugPath));
+        // Reading it back must not be able to fail the teardown: a missing or unreadable log is a
+        // nuisance, whereas throwing here would mask the exit code that actually explains why ffmpeg
+        // stopped. The message below then simply has nothing to quote.
+        string stderr = "";
+        try
+        {
+            stderr = File.Exists(debugPath)
+                ? string.Join(Environment.NewLine, File.ReadAllLines(debugPath))
+                : "";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine($"ffmpeg log {debugPath} could not be read: {ex.GetType().Name}.");
+        }
 
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"ffmpeg exited with {process.ExitCode}: {stderr}");

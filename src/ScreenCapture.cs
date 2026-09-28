@@ -25,6 +25,9 @@ internal sealed class ScreenCapture : IDisposable
     private readonly Direct3D11CaptureFramePool framePool;
     private readonly GraphicsCaptureSession session;
     private readonly string outputDirectory;
+
+    /// <summary>Debug artifacts live apart from the clips, and are rotated on startup.</summary>
+    private readonly string logsDirectory;
     private readonly ClippyConfig config;
 
     /// <summary>The settings this recorder was started with, for the tray menu to reuse.</summary>
@@ -49,6 +52,9 @@ internal sealed class ScreenCapture : IDisposable
     /// <summary>Set by RunVideo when --tray is active, so ExportClip can raise a system notification
     /// without ScreenCapture taking a dependency on the tray's lifetime.</summary>
     public Action<string, string>? notify;
+
+    /// <summary>The tray, when one was created, so Capture can wire up the live hotkey rebind.</summary>
+    public TrayIcon? tray;
     private string? videoEncoder;
     private string fpsMode = "passthrough";
     private bool withAudio;
@@ -385,6 +391,12 @@ internal sealed class ScreenCapture : IDisposable
         this.outputDirectory = outputDirectory;
         Directory.CreateDirectory(outputDirectory);
 
+        // Beside the clips, not inside them, and rotated before anything writes: a user who leaves
+        // Clippy running for months should not have to know what a .timing.csv is.
+        logsDirectory = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, this.config.LogsFolder));
+        Directory.CreateDirectory(logsDirectory);
+        LogPaths.Rotate(logsDirectory);
+
         if (!GraphicsCaptureSession.IsSupported())
             throw new PlatformNotSupportedException("Windows.Graphics.Capture is unavailable on this system.");
 
@@ -422,7 +434,7 @@ internal sealed class ScreenCapture : IDisposable
 
     public static int Run(TimeSpan? duration)
     {
-        var outputDirectory = Path.Combine(Environment.CurrentDirectory, "output");
+        var outputDirectory = Path.Combine(Environment.CurrentDirectory, "clips");
         using var capture = new ScreenCapture(outputDirectory);
         return capture.Capture(duration);
     }
@@ -456,6 +468,7 @@ internal sealed class ScreenCapture : IDisposable
         if (trayIcon is not null)
         {
             capture.notify = trayIcon.ShowNotification;
+            capture.tray = trayIcon;
 
             // Fire and forget, deliberately. This is a network call on the way to recording, and a
             // user whose network hangs must still get their recorder running now, not in ten seconds.
@@ -473,7 +486,7 @@ internal sealed class ScreenCapture : IDisposable
 
         // One trace for every thread of this recording, all stamped from the same Stopwatch.
         EventLog.Clock = stopwatch;
-        EventLog.Start(Path.Combine(outputDirectory, $"events-{DateTime.Now:yyyyMMdd-HHmmssfff}.csv"));
+        EventLog.Start(Path.Combine(logsDirectory, $"events-{DateTime.Now:yyyyMMdd-HHmmssfff}.csv"));
 
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
         {
@@ -512,6 +525,10 @@ internal sealed class ScreenCapture : IDisposable
                 hotkeys = new HotkeyService(seconds => ExportClip(seconds), config);
                 hotkeys.Start();
                 Console.WriteLine("Hotkeys: F9 saves 30 s, F10 saves 3 min.");
+
+                // Lets the tray menu rebind without a restart, the one setting that can.
+                if (tray is not null)
+                    tray.rebindHotkeys = hotkeys.Rebind;
             }
 
             stopped.Wait();
@@ -740,7 +757,7 @@ internal sealed class ScreenCapture : IDisposable
                         {
                             audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
                             audio = new AudioCapture(stopwatch, videoStartSeconds);
-                            audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing, masterZeroSeconds);
+                            audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing, masterZeroSeconds, logDirectory: logsDirectory);
                             audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
                             // An f32le input probes without data, so audio reaches ready on its own.
                             audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
@@ -754,7 +771,8 @@ internal sealed class ScreenCapture : IDisposable
                             videoEncoder ?? config.VideoEncoder,
                             config.VideoBitrateMbps,
                             stopwatch,
-                            fpsMode);
+                            fpsMode,
+                            logsDirectory);
                         encoder.StartDrain(videoRing);
                         Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring (max {RingSeconds:F0}s)");
                     }
@@ -767,7 +785,8 @@ internal sealed class ScreenCapture : IDisposable
                             videoEncoder ?? config.VideoEncoder,
                             config.VideoBitrateMbps,
                             stopwatch,
-                            fpsMode);
+                            fpsMode,
+                            logsDirectory);
 
                         // Same as the audio branch: without the drain there is no ring, no SPS/PPS and
                         // therefore no export at all. Hotkeys work in this mode too, producing the
@@ -825,7 +844,7 @@ internal sealed class ScreenCapture : IDisposable
                 return;
 
             using var texture = CaptureInterop.GetTexture(frame.Surface);
-            var fileName = Path.Combine(outputDirectory, $"frame-{currentFrame:D6}-{DateTime.Now:yyyyMMdd-HHmmssfff}.png");
+            var fileName = Path.Combine(logsDirectory, $"frame-{currentFrame:D6}-{DateTime.Now:yyyyMMdd-HHmmssfff}.png");
             SavePng(texture, fileName);
             Console.WriteLine($"Saved {Path.GetFileName(fileName)}.");
         }
@@ -921,7 +940,8 @@ internal sealed class ScreenCapture : IDisposable
             videoEncoder ?? config.VideoEncoder,
             config.VideoBitrateMbps,
             stopwatch,
-            fpsMode);
+            fpsMode,
+            logsDirectory);
         encoder.StartDrain(ring);
     }
 

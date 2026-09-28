@@ -20,7 +20,10 @@ public sealed class HotkeyService : IDisposable
     // Key codes and clip lengths come from config.json, not from constants, so the F9/F10 bindings
     // and the 30 s / 3 min lengths can be changed without rebuilding. A key the user did not map
     // is simply absent from the map and is ignored.
-    private readonly Dictionary<int, double> bindings;
+    // Replaced wholesale, never mutated in place, so the hotkey callback can read it with a single
+    // volatile load on every keypress while a settings change swaps in a new map. Mutating a live
+    // Dictionary from the tray thread while the hook iterates it is a data race waiting to happen.
+    private Dictionary<int, double> bindings;
 
     private readonly Action<double> export;
     private readonly AutoResetEvent work = new(false);
@@ -68,25 +71,45 @@ public sealed class HotkeyService : IDisposable
     public HotkeyService(Action<double> export, ClippyConfig config)
     {
         this.export = export;
-        bindings = [];
-
-        if (ClippyConfig.TryParseHotkey(config.ShortClipHotkey, out var shortVk))
-            bindings[shortVk] = config.ShortClipSeconds;
-        if (ClippyConfig.TryParseHotkey(config.LongClipHotkey, out var longVk))
-            bindings[longVk] = config.LongClipSeconds;
-
-        // A single key mapped to two lengths would be ambiguous, and the later mapping would simply
-        // win, so the second one is dropped with a warning rather than silently shadowing the first.
-        if (bindings.Count == 1 && config.ShortClipHotkey == config.LongClipHotkey)
-        {
-            Console.WriteLine($"Hotkeys: {config.ShortClipHotkey} is bound to both clip lengths; " +
-                "only the short clip will be saved.");
-        }
+        bindings = BuildBindings(config);
 
         Console.WriteLine("Hotkeys: " + string.Join(", ", bindings.Select(b => $"{KeyName(b.Key)} = {b.Value:F0}s")));
     }
 
     private static string KeyName(int vk) => $"F{vk - 0x70 + 1}";
+
+    /// <summary>
+    /// Re-reads the hotkey bindings from the config and swaps them in.
+    ///
+    /// Live rather than next-session because the hook consults this map on every keypress: there is
+    /// nothing to re-register, so a new binding works on the very next key and the old one stops
+    /// immediately. That is the one setting that can change without a restart.
+    /// </summary>
+    public void Rebind(ClippyConfig config)
+    {
+        Volatile.Write(ref bindings, BuildBindings(config));
+        Console.WriteLine("Hotkeys: " + string.Join(", ",
+            Volatile.Read(ref bindings).Select(b => $"{KeyName(b.Key)} = {b.Value:F0}s")));
+    }
+
+    private static Dictionary<int, double> BuildBindings(ClippyConfig config)
+    {
+        var map = new Dictionary<int, double>();
+        if (ClippyConfig.TryParseHotkey(config.ShortClipHotkey, out var shortVk))
+            map[shortVk] = config.ShortClipSeconds;
+        if (ClippyConfig.TryParseHotkey(config.LongClipHotkey, out var longVk))
+            map[longVk] = config.LongClipSeconds;
+
+        // A single key mapped to two lengths would be ambiguous, and the later mapping would simply
+        // win, so the second one is dropped with a warning rather than silently shadowing the first.
+        if (map.Count == 1 && config.ShortClipHotkey == config.LongClipHotkey)
+        {
+            Console.WriteLine($"Hotkeys: {config.ShortClipHotkey} is bound to both clip lengths; " +
+                "only the short clip will be saved.");
+        }
+
+        return map;
+    }
 
     public void Start()
     {
@@ -168,7 +191,9 @@ public sealed class HotkeyService : IDisposable
             if (code >= 0 && (wParam.ToInt32() == WM_KEYDOWN || wParam.ToInt32() == WM_SYSKEYDOWN))
             {
                 var vk = Marshal.ReadInt32(lParam);
-                double? seconds = bindings.TryGetValue(vk, out var configured) ? configured : null;
+                // One load, then a read: the map reference is swapped by Rebind, never mutated.
+                var map = Volatile.Read(ref bindings);
+                double? seconds = map.TryGetValue(vk, out var configured) ? configured : null;
 
                 if (seconds is { } s)
                 {

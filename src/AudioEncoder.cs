@@ -53,7 +53,7 @@ internal sealed class AudioEncoder : IDisposable
         this.queueLimit = queueLimit;
     }
 
-    public static AudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, RingBuffer ring, double masterZeroSeconds, int queueLimit = 512)
+    public static AudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, RingBuffer ring, double masterZeroSeconds, int queueLimit = 512, string? logDirectory = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         if (File.Exists(path))
@@ -96,7 +96,10 @@ internal sealed class AudioEncoder : IDisposable
         var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Failed to start ffmpeg. Is it installed and on PATH?");
 
-        var debugLogPath = Path.ChangeExtension(path, ".ffmpeg-debug.log");
+        // Distinct names on purpose. Both encoders are handed the same media path, so the video and
+        // audio logs used to be the same file: the second StreamWriter opened with append:false
+        // truncated what the first had just written, and the audio ffmpeg log was lost every run.
+        var debugLogPath = LogPaths.Resolve(logDirectory, path, ".audio-ffmpeg-debug.log");
         var debugLog = new StreamWriter(debugLogPath, append: false) { AutoFlush = true };
         var gate = new FfmpegStartupGate();
         process.ErrorDataReceived += (_, e) =>
@@ -109,7 +112,7 @@ internal sealed class AudioEncoder : IDisposable
         };
         process.BeginErrorReadLine();
 
-        var timingLog = new StreamWriter(Path.ChangeExtension(path, ".timing.csv"), append: false) { AutoFlush = true };
+        var timingLog = new StreamWriter(LogPaths.Resolve(logDirectory, path, ".audio-timing.csv"), append: false) { AutoFlush = true };
         var encoder = new AudioEncoder(
             process,
             process.StandardInput.BaseStream,

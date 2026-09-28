@@ -41,6 +41,8 @@ public sealed partial class TrayIcon : IDisposable
 
     private const uint MF_STRING = 0x00000000;
     private const uint MF_SEPARATOR = 0x00000800;
+    private const uint MF_POPUP = 0x00000010;
+    private const uint MF_CHECKED = 0x00000008;
     private const uint TPM_RIGHTBUTTON = 0x0002;
     private const uint TPM_RETURNCMD = 0x0100;
 
@@ -53,6 +55,25 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_TOGGLE_CONSOLE = 1003;
     private const uint IDC_CHECK_UPDATES = 1005;
     private const uint IDC_EXIT = 1004;
+
+    // One id per selectable value across the settings submenus. They are grouped by hundreds so a
+    // mis-numbered id lands in an obvious neighbourhood rather than silently colliding with an
+    // unrelated action.
+    private const uint IDC_SHORT_15 = 1101;
+    private const uint IDC_SHORT_30 = 1102;
+    private const uint IDC_SHORT_60 = 1103;
+    private const uint IDC_LONG_60 = 1201;
+    private const uint IDC_LONG_120 = 1202;
+    private const uint IDC_LONG_180 = 1203;
+    private const uint IDC_LONG_300 = 1204;
+    private const uint IDC_RATE_4 = 1301;
+    private const uint IDC_RATE_6 = 1302;
+    private const uint IDC_RATE_8 = 1303;
+    private const uint IDC_RATE_12 = 1304;
+    private const uint IDC_ENCODER_NVENC = 1401;
+    private const uint IDC_ENCODER_X264 = 1402;
+    private const uint IDC_KEYS_F9 = 1501;
+    private const uint IDC_KEYS_F11 = 1502;
 
     private const int IDI_APPLICATION = 32512;
 
@@ -426,6 +447,8 @@ public sealed partial class TrayIcon : IDisposable
             AppendMenu(menu, MF_STRING, IDC_OPEN_FOLDER, "Open Clips Folder");
             AppendMenu(menu, MF_STRING, IDC_OPEN_CONFIG, "Open Config");
             AppendMenu(menu, MF_SEPARATOR, 0, "");
+            AppendSettingsMenus(menu);
+            AppendMenu(menu, MF_SEPARATOR, 0, "");
             AppendMenu(menu, MF_STRING, IDC_TOGGLE_CONSOLE, "Show / Hide Log");
             AppendMenu(menu, MF_STRING, IDC_CHECK_UPDATES, "Check for Updates");
             AppendMenu(menu, MF_STRING, IDC_EXIT, "Exit");
@@ -450,6 +473,53 @@ public sealed partial class TrayIcon : IDisposable
                     break;
                 case IDC_CHECK_UPDATES:
                     CheckForUpdates();
+                    break;
+                case IDC_SHORT_15:
+                    ApplySetting("Short clip", "15s", c => c.ShortClipSeconds = 15, live: true);
+                    break;
+                case IDC_SHORT_30:
+                    ApplySetting("Short clip", "30s", c => c.ShortClipSeconds = 30, live: true);
+                    break;
+                case IDC_SHORT_60:
+                    ApplySetting("Short clip", "60s", c => c.ShortClipSeconds = 60, live: true);
+                    break;
+                case IDC_LONG_60:
+                    ApplySetting("Long clip", "1m", c => c.LongClipSeconds = 60, live: true);
+                    break;
+                case IDC_LONG_120:
+                    ApplySetting("Long clip", "2m", c => c.LongClipSeconds = 120, live: true);
+                    break;
+                case IDC_LONG_180:
+                    ApplySetting("Long clip", "3m", c => c.LongClipSeconds = 180, live: true);
+                    break;
+                case IDC_LONG_300:
+                    ApplySetting("Long clip", "5m", c => c.LongClipSeconds = 300, live: true);
+                    break;
+                case IDC_RATE_4:
+                    ApplySetting("Bitrate", "4 Mbps", c => c.VideoBitrateMbps = 4, live: false);
+                    break;
+                case IDC_RATE_6:
+                    ApplySetting("Bitrate", "6 Mbps", c => c.VideoBitrateMbps = 6, live: false);
+                    break;
+                case IDC_RATE_8:
+                    ApplySetting("Bitrate", "8 Mbps", c => c.VideoBitrateMbps = 8, live: false);
+                    break;
+                case IDC_RATE_12:
+                    ApplySetting("Bitrate", "12 Mbps", c => c.VideoBitrateMbps = 12, live: false);
+                    break;
+                case IDC_ENCODER_NVENC:
+                    ApplySetting("Encoder", "h264_nvenc", c => c.VideoEncoder = "h264_nvenc", live: false);
+                    break;
+                case IDC_ENCODER_X264:
+                    ApplySetting("Encoder", "libx264", c => c.VideoEncoder = "libx264", live: false);
+                    break;
+                case IDC_KEYS_F9:
+                    ApplySetting("Hotkeys", "F9 / F10",
+                        c => { c.ShortClipHotkey = "F9"; c.LongClipHotkey = "F10"; }, live: true);
+                    break;
+                case IDC_KEYS_F11:
+                    ApplySetting("Hotkeys", "F11 / F12",
+                        c => { c.ShortClipHotkey = "F11"; c.LongClipHotkey = "F12"; }, live: true);
                     break;
                 case IDC_EXIT:
                     onExit();
@@ -503,6 +573,95 @@ public sealed partial class TrayIcon : IDisposable
 
         ShowNotification("Clippy Update", $"Installing {info.Tag}...");
         await UpdateService.ApplyUpdateAsync(info.DownloadUrl, ShowNotification).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The five settings submenus, each with a check mark on the value the config currently holds.
+    ///
+    /// Built fresh on every right-click, which is what makes them live: change the config and the
+    /// next menu shows the new state with no cache to invalidate. MF_POPUP takes a real HMENU as its
+    /// "string", which is why each submenu is created, filled and then handed over; DestroyMenu on
+    /// the parent takes the children with it, so nothing leaks.
+    /// </summary>
+    private void AppendSettingsMenus(nint menu)
+    {
+        var shortClip = Submenu(menu, "Short Clip Duration",
+            (IDC_SHORT_15, "15 seconds", config.ShortClipSeconds == 15),
+            (IDC_SHORT_30, "30 seconds", config.ShortClipSeconds == 30),
+            (IDC_SHORT_60, "60 seconds", config.ShortClipSeconds == 60));
+
+        var longClip = Submenu(menu, "Long Clip Duration",
+            (IDC_LONG_60, "1 minute", config.LongClipSeconds == 60),
+            (IDC_LONG_120, "2 minutes", config.LongClipSeconds == 120),
+            (IDC_LONG_180, "3 minutes", config.LongClipSeconds == 180),
+            (IDC_LONG_300, "5 minutes", config.LongClipSeconds == 300));
+
+        var bitrate = Submenu(menu, "Video Bitrate / RAM",
+            (IDC_RATE_4, "4 Mbps  (~150 MB RAM)", config.VideoBitrateMbps == 4),
+            (IDC_RATE_6, "6 Mbps  (~220 MB RAM)", config.VideoBitrateMbps == 6),
+            (IDC_RATE_8, "8 Mbps  (~300 MB RAM)", config.VideoBitrateMbps == 8),
+            (IDC_RATE_12, "12 Mbps (~450 MB RAM)", config.VideoBitrateMbps == 12));
+
+        var encoder = Submenu(menu, "Video Encoder",
+            (IDC_ENCODER_NVENC, "NVIDIA NVENC (h264_nvenc)", config.VideoEncoder == "h264_nvenc"),
+            (IDC_ENCODER_X264, "CPU x264 (libx264)", config.VideoEncoder == "libx264"));
+
+        var keys = Submenu(menu, "Hotkeys",
+            (IDC_KEYS_F9, "F9 / F10", config.ShortClipHotkey == "F9"),
+            (IDC_KEYS_F11, "F11 / F12", config.ShortClipHotkey == "F11"));
+
+        // Keep the handles alive until after the parent menu is shown; the OS reads them during
+        // TrackPopupMenuEx, not during AppendMenu.
+        _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = keys;
+    }
+
+    private nint Submenu(nint parent, string title, params (uint Id, string Text, bool Checked)[] items)
+    {
+        var sub = CreatePopupMenu();
+        foreach (var (id, text, checked_) in items)
+            AppendMenu(sub, MF_STRING | (checked_ ? MF_CHECKED : 0), id, text);
+
+        AppendMenu(parent, MF_POPUP, (nuint)sub, title);
+        return sub;
+    }
+
+    /// <summary>
+    /// Applies a settings choice: write it to the config file, keep the in-memory copy in step so
+    /// the check mark moves on the next right-click, and say what happened.
+    ///
+    /// Hotkeys are rebound live because the hook reads its map on every keypress. Encoder and
+    /// bitrate cannot be: ffmpeg was started with those arguments and a running instance cannot
+    /// change them, so they take effect on the next session. Pretending otherwise would leave a
+    /// check mark next to a setting that is not in force.
+    /// </summary>
+    private void ApplySetting(string name, string value, Action<ClippyConfig> mutate, bool live)
+    {
+        mutate(config);
+        config.Save();
+        Console.WriteLine($"Settings: {name} = {value}{(live ? "" : " (applies next session)")}");
+        ShowNotification("Clippy", $"Settings updated: {name} = {value}");
+
+        if (live)
+            RebindHotkeys();
+        else
+            ShowNotification("Clippy", "Settings saved. Encoder settings will apply on next session.");
+    }
+
+    /// <summary>
+    /// Set by RunVideo so a hotkey chosen in this menu can take effect without a restart. The tray
+    /// has no business knowing how the hook is implemented, and ScreenCapture owns its lifetime.
+    /// </summary>
+    public Action<ClippyConfig>? rebindHotkeys;
+
+    private void RebindHotkeys()
+    {
+        if (rebindHotkeys is null)
+        {
+            Console.WriteLine("Settings: no hotkey service to rebind; takes effect next session.");
+            return;
+        }
+
+        rebindHotkeys(config);
     }
 
     private void OpenOutputFolder()
