@@ -412,7 +412,7 @@ internal sealed class ScreenCapture : IDisposable
     }
 
     /// <summary>Records a raw video stream: every captured frame is piped to ffmpeg.</summary>
-    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null, ClippyConfig? config = null, bool tray = false)
+    public static int RunVideo(TimeSpan? duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null, ClippyConfig? config = null, bool tray = false)
     {
         // Without audio there is no mux, so the encoder writes a raw Annex B stream. Naming that file
         // .mp4 would be actively misleading: the bytes are correct but the extension lies.

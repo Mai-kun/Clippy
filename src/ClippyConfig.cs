@@ -49,6 +49,11 @@ public sealed class ClippyConfig
     {
         WriteIndented = true,
         TypeInfoResolver = ClippyConfigContext.Default,
+        // config.example.json ships commented, because a config file you cannot explain is a config
+        // file nobody edits. Both options are needed for that: a // line is a comment, and the
+        // trailing comma after the last entry is a comma the reader would otherwise reject.
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
     };
 
     /// <summary>
@@ -141,6 +146,13 @@ public sealed class ClippyConfig
 /// Source-generated JSON metadata. NativeAOT compiles reflection-based serialization out, and the
 /// default resolver then throws at runtime, so this context is what makes the config file work.
 /// </summary>
-[JsonSourceGenerationOptions(WriteIndented = true)]
+[JsonSourceGenerationOptions(
+    WriteIndented = true,
+    // These belong to the CONTEXT, not to SerializerOptions: Deserialize is handed
+    // ClippyConfigContext.Default.ClippyConfig, whose options come from this attribute alone.
+    // Setting them on a separate JsonSerializerOptions would look right and do nothing, and the
+    // commented config.example.json would then fail to load with a confusing parse error.
+    ReadCommentHandling = JsonCommentHandling.Skip,
+    AllowTrailingCommas = true)]
 [JsonSerializable(typeof(ClippyConfig))]
 public sealed partial class ClippyConfigContext : JsonSerializerContext;

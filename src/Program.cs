@@ -2,6 +2,35 @@
 using System.Runtime.CompilerServices;
 using Clippy;
 
+// No arguments is the normal case and must not be a usage screen: the user double-clicked the exe
+// because they want it recording, not because they want to read a help text. Everything the run
+// needs comes from config.json, so the default path is the same one --record builds by hand.
+if (args.Length == 0)
+{
+    var defaults = ClippyConfig.Load();
+    return Clippy.ScreenCapture.RunVideo(
+        // No timeout: this mode runs until the user quits it from the tray, which is what an instant
+        // replay is for. A duration would silently stop the recorder at an arbitrary moment.
+        duration: null,
+        Path.Combine(AppContext.BaseDirectory, defaults.OutputFolder, $"clip-{DateTime.Now:yyyyMMdd-HHmmss}.mp4"),
+        defaults.VideoEncoder,
+        "passthrough",
+        withAudio: true,
+        audioCaptureOnly: false,
+        hotkeys: true,
+        exportAt: null,
+        exportDuration: null,
+        config: defaults,
+        // The tray owns the process lifetime. Without an icon there would be no way back to this
+        // window and no way to quit except killing it from Task Manager.
+        tray: true);
+}
+
+if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
+{
+    return PrintUsage();
+}
+
 if (args.Contains("--smoke"))
 {
     return Clippy.SmokeTest.Run();
@@ -98,8 +127,44 @@ if (args.FirstOrDefault() == "--capture")
     return 1;
 }
 
-Console.WriteLine("Hello");
-Console.WriteLine($"NativeAOT: {!RuntimeFeature.IsDynamicCodeSupported}");
-Console.WriteLine("Capture: --capture [duration-seconds]");
-Console.WriteLine("Record:  --record [seconds] [--audio] [--encoder=h264_nvenc|h264_qsv|h264_amf] [--fps-mode=passthrough|vfr|cfr]");
-return 0;
+return PrintUsage();
+
+/// <summary>
+/// The flag reference, reachable only on purpose. Plain "Hello" plus two lines used to be the
+/// no-argument output, which is a worse answer than none: it looks like a crash and teaches the
+/// user nothing about what to type next.
+/// </summary>
+static int PrintUsage()
+{
+    Console.WriteLine("Clippy -- instant replay recorder for Windows");
+    Console.WriteLine();
+    Console.WriteLine("  Clippy.exe                 start recording; no arguments needed.");
+    Console.WriteLine("                              Screen + system audio, hotkeys, tray icon. Runs until");
+    Console.WriteLine("                              you quit it from the tray. Reads config.json.");
+    Console.WriteLine();
+    Console.WriteLine("  --help, -h, --usage        this text");
+    Console.WriteLine();
+    Console.WriteLine("Modes:");
+    Console.WriteLine("  --record [seconds]         record to a file for a fixed time (default 60s)");
+    Console.WriteLine("  --capture [seconds]        capture without encoding, for diagnosing capture");
+    Console.WriteLine();
+    Console.WriteLine("Modifiers for --record:");
+    Console.WriteLine("  --audio                    include system audio");
+    Console.WriteLine("  --hotkeys                  enable F9 / F10 clip export while recording");
+    Console.WriteLine("  --tray                     run in the tray (also --minimized)");
+    Console.WriteLine("  --encoder=NAME             h264_nvenc | h264_qsv | h264_amf; falls back to libx264");
+    Console.WriteLine("  --fps-mode=MODE            passthrough | vfr | cfr");
+    Console.WriteLine("  --export-at=SECONDS        export a clip while still recording");
+    Console.WriteLine("  --export-dur=SECONDS       its length in seconds");
+    Console.WriteLine();
+    Console.WriteLine("Diagnostics:");
+    Console.WriteLine("  --smoke                    end-to-end smoke test");
+    Console.WriteLine("  --audio-probe              list audio devices and capture from one");
+    Console.WriteLine("  --test-parsers             H.264 / AAC parser self-test");
+    Console.WriteLine("  --test-ring                ring buffer self-test");
+    Console.WriteLine("  --test-mp4                 MP4 writer self-test");
+    Console.WriteLine("  --test-audio-timeline      A/V timeline self-test");
+    Console.WriteLine();
+    Console.WriteLine($"Config: {ClippyConfig.Path}");
+    return 0;
+}

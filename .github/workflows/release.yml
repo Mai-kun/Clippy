@@ -1,0 +1,98 @@
+name: Release
+
+# A tag is the only trigger. Building on every push would spend ~2 minutes of AOT compile on
+# commits that never ship, and Native AOT is the slowest step in the whole pipeline.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # Native AOT needs a C++ linker, which the hosted windows-latest image does not have.
+      # Without this the publish fails at the very last step with an LNK1181 about link.exe.
+      - name: Enable AOT prerequisites
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath `
+            -format value
+
+      - name: Publish (Native AOT)
+        run: >
+          dotnet publish src/Clippy.csproj
+          -c Release
+          -r win-x64
+          -p:PublishAot=true
+          -o publish
+
+      # 26 MB of symbols that no end user can do anything with. Uploading them to a separate
+      # asset would let a crash reporter symbolicate later, which is worth doing when there is
+      # actually a crash reporter; today it is just a slow download.
+      - name: Drop debug symbols
+        shell: pwsh
+        run: |
+          $pdb = 'publish/Clippy.pdb'
+          if (Test-Path $pdb) {
+            Remove-Item $pdb
+            "removed $pdb"
+          } else {
+            "no Clippy.pdb produced"
+          }
+
+      - name: Stage user files
+        shell: pwsh
+        run: |
+          Copy-Item README.md publish/README.md
+          Copy-Item config.example.json publish/config.example.json
+
+      - name: Verify the selftests
+        shell: pwsh
+        run: |
+          # A green build that cannot write an MP4 is not a release. These run against the
+          # published native binary, not a dotnet-hosted one, so AOT trimming shows up here.
+          $exe = 'publish/Clippy.exe'
+          foreach ($t in '--test-parsers', '--test-ring', '--test-mp4', '--test-audio-timeline') {
+            & $exe $t
+            if ($LASTEXITCODE -ne 0) { throw "$t failed with exit $LASTEXITCODE" }
+            "ok  $t"
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          # Stored, not Deflated: the payload is a native exe that does not compress, so deflate
+          # only burns CPU to gain nothing.
+          Compress-Archive -Path publish/* -DestinationPath Clippy-win-x64.zip -CompressionLevel NoCompression
+          Get-Item Clippy-win-x64.zip | Select-Object Name, Length
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Clippy-win-x64.zip
+          # ${{ github.ref_name }} is the tag, so v1.2.3 names the release v1.2.3.
+          name: Clippy ${{ github.ref_name }}
+          body: |
+            Скачайте `Clippy-win-x64.zip`, распакуйте и запустите `Clippy.exe`.
+
+            Положите рядом `ffmpeg.exe`, если его нет в `PATH` — без него запись не запустится.
+
+            Горячие клавиши: **F9** — 30 секунд, **F10** — 3 минуты.
+          draft: false
+          generate_release_notes: true
