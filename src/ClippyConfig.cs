@@ -26,6 +26,13 @@ public sealed class ClippyConfig
     /// </summary>
     public bool StartMinimizedToTray { get; set; }
 
+    /// <summary>
+    /// ffmpeg's video encoder. "h264_nvenc" needs an NVIDIA GPU; on a machine without one the encoder
+    /// is rejected at startup and FfmpegEncoder falls back to libx264 automatically, so this value is
+    /// a preference rather than a requirement.
+    /// </summary>
+    public string VideoEncoder { get; set; } = "h264_nvenc";
+
     /// <summary>Where config.json is looked up: beside the binary, not the current directory.</summary>
     public static string Path => System.IO.Path.Combine(AppContext.BaseDirectory, "config.json");
 

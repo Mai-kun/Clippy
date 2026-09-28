@@ -48,8 +48,10 @@ if (args.FirstOrDefault() == "--record")
         ? parsed
         : 60;
     var videoPath = Path.Combine(Environment.CurrentDirectory, config.OutputFolder, $"clip-{DateTime.Now:yyyyMMdd-HHmmss}.mp4");
+    // The config file is the default; an explicit --encoder= on the command line overrides it for
+    // one run, which is how you test a different GPU without editing anything.
     var videoEncoder = args.FirstOrDefault(a => a.StartsWith("--encoder=", StringComparison.Ordinal))?["--encoder=".Length..]
-        ?? "h264_nvenc";
+        ?? config.VideoEncoder;
     // passthrough is the default: vfr makes ffmpeg resample onto a 1/25 grid and drop frames
     // (measured: 658 captured -> 346 encoded). Pass --fps-mode=vfr to reproduce that for debugging.
     var fpsMode = args.FirstOrDefault(a => a.StartsWith("--fps-mode=", StringComparison.Ordinal))?["--fps-mode=".Length..]

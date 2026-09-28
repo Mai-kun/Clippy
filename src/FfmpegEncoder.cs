@@ -49,6 +49,39 @@ internal sealed class FfmpegEncoder : IDisposable
 
     public static string DebugLogPath(string outputPath) => Path.ChangeExtension(outputPath, ".ffmpeg-debug.log");
 
+    /// <summary>
+    /// Rate-control arguments for the chosen encoder.
+    ///
+    /// The two families need genuinely different options. NVENC wants a preset name and a VBR
+    /// triple; libx264 wants its own preset and CRF, and passing NVENC's "-preset p1" to it is a hard
+    /// error. Keeping them apart here is what makes the software fallback possible at all.
+    /// </summary>
+    private static IEnumerable<string> CodecArguments(string encoder)
+    {
+        var isSoftware = encoder.StartsWith("libx", StringComparison.OrdinalIgnoreCase);
+
+        if (isSoftware)
+        {
+            return new[]
+            {
+                "-c:v", encoder,
+                // ultrafast, not a quality setting for its own sake: this is a real-time recorder and
+                // a slow preset drops frames on the pipe. crf 20 is visually clean for gameplay.
+                "-preset", "ultrafast", "-crf", "20",
+            };
+        }
+
+        return new[]
+        {
+            "-c:v", encoder, "-preset", "p1", "-b:v", "8M",
+            "-maxrate", "12M", "-bufsize", "16M",
+            // REQUIRED for the hardware encoders and unknown to libx264, so it lives here rather
+            // than in the shared argument list. Without it h264_nvenc silently ignores
+            // -force_key_frames and produces 2 I-frames where 15 are asked for.
+            "-forced-idr", "1",
+        };
+    }
+
     public static FfmpegEncoder Start(
         string outputPath,
         int width,
@@ -99,8 +132,10 @@ internal sealed class FfmpegEncoder : IDisposable
             "-thread_queue_size", "1024",
             "-i", "-",
             "-an", "-fps_mode", fpsMode,
-            "-c:v", encoder, "-preset", "p1", "-b:v", "8M",
-            "-maxrate", "12M", "-bufsize", "16M",
+        }
+        .Concat(CodecArguments(encoder))
+        .Concat(new[]
+        {
             // -g is a FRAME count, and WGC delivers a variable frame rate (measured 11-55 fps), so a
             // keyframe every N frames would land at an unpredictable interval in seconds. Phase 4.2
             // needs clip cutting accurate in real time, so the I-frame interval is forced in seconds.
@@ -110,8 +145,9 @@ internal sealed class FfmpegEncoder : IDisposable
             //   h264_nvenc + -force_key_frames            ->  2 I-frames  (broken)
             //   h264_nvenc + -force_key_frames -forced-idr 1 -> 15 I-frames  (correct)
             //   libx264    + -force_key_frames            -> 15 I-frames  (correct, so it is NVENC-specific)
+            //
+            // -forced-idr is unknown to libx264, so it is only passed to the hardware encoders.
             "-force_key_frames", "expr:gte(t,n_forced*1)",
-            "-forced-idr", "1",
             "-pix_fmt", "yuv420p",
             // Raw Annex B elementary stream, not an MP4 container. Phase 4: an elementary stream has
             // no container timestamps at all, which is exactly the problem mp4 caused in B/C (it
@@ -120,7 +156,7 @@ internal sealed class FfmpegEncoder : IDisposable
             // An elementary stream carries no timestamps at all, which is exactly why every packet
             // gets its CaptureClockSeconds stamped here, on arrival, outside ffmpeg.
             "-f", "h264", "pipe:1",
-        })
+        }))
         {
             startInfo.ArgumentList.Add(argument);
         }
@@ -148,6 +184,55 @@ internal sealed class FfmpegEncoder : IDisposable
 
         var stdin = process.StandardInput.BaseStream;
         return new FfmpegEncoder(process, stdin, outputPath, stopwatch, timingLog, debugLog, gate);
+    }
+
+    /// <summary>
+    /// Starts ffmpeg, falling back to a software encoder if the requested one is rejected.
+    ///
+    /// h264_nvenc needs an NVIDIA GPU and is rejected at ffmpeg's initialisation, before it reads a
+    /// single frame, so the process exits within milliseconds. That makes a short probe window a
+    /// reliable signal and lets Clippy work on an AMD or Intel machine instead of failing to record.
+    /// </summary>
+    public static FfmpegEncoder StartWithFallback(
+        string outputPath,
+        int width,
+        int height,
+        string encoder,
+        Stopwatch stopwatch,
+        string fpsMode = "vfr")
+    {
+        const string software = "libx264";
+
+        // Already a software encoder: there is nothing to fall back to.
+        if (encoder.StartsWith("libx", StringComparison.OrdinalIgnoreCase))
+            return Start(outputPath, width, height, encoder, stopwatch, fpsMode);
+
+        var attempt = Start(outputPath, width, height, encoder, stopwatch, fpsMode);
+        if (attempt.Probe(TimeSpan.FromMilliseconds(700)))
+        {
+            Console.WriteLine($"Video: encoder {encoder} started.");
+            return attempt;
+        }
+
+        Console.WriteLine($"Video: encoder {encoder} is not available on this machine " +
+            $"(ffmpeg exited immediately). Falling back to {software}.");
+        attempt.Dispose();
+
+        return Start(outputPath, width, height, software, stopwatch, fpsMode);
+    }
+
+    /// <summary>
+    /// True if ffmpeg is still alive after the window, i.e. it accepted its arguments and is waiting
+    /// for the first frame.
+    /// </summary>
+    private bool Probe(TimeSpan window)
+    {
+        Thread.Sleep(window);
+        if (!process.HasExited)
+            return true;
+
+        Console.WriteLine($"Video: ffmpeg exited with code {process.ExitCode} while probing the encoder.");
+        return false;
     }
 
     private Thread? drain;

@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
@@ -668,11 +668,11 @@ internal sealed class ScreenCapture : IDisposable
                             Console.WriteLine($"Audio: system loopback [{audio.Format}]");
                         }
 
-                        encoder = FfmpegEncoder.Start(
+                        encoder = FfmpegEncoder.StartWithFallback(
                             videoOnlyPath,
                             videoWidth,
                             videoHeight,
-                            videoEncoder ?? "h264_nvenc",
+                            videoEncoder ?? config.VideoEncoder,
                             stopwatch,
                             fpsMode);
                         encoder.StartDrain(videoRing);
@@ -680,11 +680,11 @@ internal sealed class ScreenCapture : IDisposable
                     }
                     else
                     {
-                        encoder = FfmpegEncoder.Start(
+                        encoder = FfmpegEncoder.StartWithFallback(
                             videoPath,
                             videoWidth,
                             videoHeight,
-                            videoEncoder ?? "h264_nvenc",
+                            videoEncoder ?? config.VideoEncoder,
                             stopwatch,
                             fpsMode);
 
@@ -820,11 +820,11 @@ internal sealed class ScreenCapture : IDisposable
         if (!hadEncoder || videoPath is null || ring is null)
             return;
 
-        encoder = FfmpegEncoder.Start(
+        encoder = FfmpegEncoder.StartWithFallback(
             videoOnlyPath ?? videoPath,
             newWidth,
             newHeight,
-            videoEncoder ?? "h264_nvenc",
+            videoEncoder ?? config.VideoEncoder,
             stopwatch,
             fpsMode);
         encoder.StartDrain(ring);
