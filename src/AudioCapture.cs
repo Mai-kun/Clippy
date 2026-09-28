@@ -19,7 +19,11 @@ internal sealed class AudioCapture : IDisposable
     private static readonly Guid IeeeFloatSubtype = new("00000003-0000-0010-8000-00aa00389b71");
 
     private readonly Stopwatch stopwatch;
-    private readonly WasapiRecorder capture;
+    // Not readonly: Phase 7 scenario B. When the output device disappears, WASAPI fails the capture
+    // with AUDCLNT_E_DEVICE_INVALIDATED and the recorder cannot be restarted -- a new one has to be
+    // built on whatever device is the default render endpoint now.
+    private WasapiRecorder capture;
+    private readonly object captureSync = new();
     // Wallclock reading (same Stopwatch as the video) of the first video frame written. Audio that
     // starts later must be shifted back onto the video's origin, otherwise the muxer rebases each
     // stream to its own zero and the real A/V offset is lost. Measured per run, never hardcoded.
@@ -55,14 +59,17 @@ internal sealed class AudioCapture : IDisposable
     private double anchorQpcSeconds;
     private long samplesSoFar;
     private int gapAnchorSet;
-    private int BytesPerFrame => capture.WaveFormat.BlockAlign;
+    private int BytesPerFrame => BlockAlign;
 
     // Diagnostic counters for the audio timeline. BytesPerFrame is the endpoint's real frame size
     // (channels * bits/8), recomputed per callback because the endpoint format is not known until
     // the first packet arrives.
 
     /// <summary>Bytes per PCM sample frame, from the endpoint's real format.</summary>
-    public int BlockAlign => capture.WaveFormat.BlockAlign;
+    public int BlockAlign
+    {
+        get { lock (captureSync) { return capture.WaveFormat.BlockAlign; } }
+    }
     private int packetsSeen;
     private double silencePrependedMs;
     private volatile bool disposed;
@@ -73,10 +80,18 @@ internal sealed class AudioCapture : IDisposable
         this.videoStartSeconds = videoStartSeconds;
         this.timingLog = null;
 
+        handler = (buffer, flags, devicePosition, qpcPosition) => OnDataAvailable(buffer, qpcPosition);
+        capture = CreateRecorder(handler);
+        capture.RecordingStopped += OnRecordingStopped;
+    }
+
+    /// <summary>Builds a loopback recorder on the CURRENT default render endpoint.</summary>
+    private static WasapiRecorder CreateRecorder(CaptureDataAvailableHandler handler)
+    {
         var render = new MMDeviceEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
         // WasapiRecorderBuilder is the supported path in NAudio 3.1; the older
         // WasapiLoopbackCapture type delivered zero buffers when its WaveFormat was overridden.
-        capture = new WasapiRecorderBuilder()
+        var recorder = new WasapiRecorderBuilder()
             .WithDevice(render)
             .WithLoopbackCapture()
             // NOTE: NAudio's WasapiRecorderBuilder exposes no way to change the buffer size (no
@@ -84,9 +99,8 @@ internal sealed class AudioCapture : IDisposable
             // It is not needed: the AudioEncoder now anchors on qpcPosition rather than on arrival,
             // which removes the buffer age from the timeline instead of trying to shrink it.
             .Build();
-        // Stored as a field so Dispose can unsubscribe the exact same delegate instance.
-        handler = (buffer, flags, devicePosition, qpcPosition) => OnDataAvailable(buffer, qpcPosition);
-        capture.DataAvailable += handler;
+        recorder.DataAvailable += handler;
+        return recorder;
     }
 
     /// <summary>ffmpeg input arguments for the endpoint's real PCM layout, e.g. "-f f32le -ar 48000 -ac 2".</summary>
@@ -133,7 +147,17 @@ internal sealed class AudioCapture : IDisposable
         };
     }
 
-    public string Format => $"{capture.WaveFormat.Encoding} {capture.WaveFormat.SampleRate} Hz, {capture.WaveFormat.Channels} ch, {capture.WaveFormat.BitsPerSample} bit";
+    public string Format
+    {
+        get
+        {
+            lock (captureSync)
+            {
+                var format = capture.WaveFormat;
+                return $"{format.Encoding} {format.SampleRate} Hz, {format.Channels} ch, {format.BitsPerSample} bit";
+            }
+        }
+    }
 
     /// <summary>The endpoint's real sample rate, used to place each AAC frame on the audio timeline.</summary>
     public int SampleRate => capture.WaveFormat.SampleRate;
@@ -193,6 +217,12 @@ internal sealed class AudioCapture : IDisposable
             var gapSeconds = stopwatch.Elapsed.TotalSeconds - videoStartSeconds;
             Console.WriteLine($"[sync] first WASAPI callback at {stopwatch.Elapsed.TotalSeconds:F3}s " +
                 $"(video origin {videoStartSeconds:F3}s, gap {gapSeconds:F3}s; not prepended)");
+            Console.WriteLine($"[start] first AUDIO packet: qpcPosition={qpcPosition} " +
+                $"qpc={(qpcPosition / 1e7):F6} " +
+                $"arrivalStopwatch={stopwatch.Elapsed.TotalSeconds:F3} " +
+                $"arrivalQpc={(System.Diagnostics.Stopwatch.GetTimestamp() / 1e7):F6} " +
+                $"bufferBytes={buffer.Length} " +
+                $"lagBehindArrivalMs={((System.Diagnostics.Stopwatch.GetTimestamp() - qpcPosition) / 10_000.0):F1}");
         }
 
         // GAP FILLING. Loopback delivers NO packets at all while the system is silent, so a pause
@@ -251,23 +281,88 @@ internal sealed class AudioCapture : IDisposable
         Console.WriteLine($"Audio: prepended {seconds * 1000:F1} ms of silence to align with the video origin.");
     }
 
+    /// <summary>
+    /// Phase 7 scenario B: the output device was unplugged or the default changed, and WASAPI ended
+    /// the stream with AUDCLNT_E_DEVICE_INVALIDATED (0x88890004).
+    ///
+    /// Unplugging headphones must not kill the capture or the process, so a new recorder is built on
+    /// whatever is the default render endpoint now and the sink carries on. The gap is left to the
+    /// existing gap-filling path in OnDataAvailable: it is detected from qpcPosition, which keeps
+    /// the timeline honest, and re-anchoring here would discard the sample count so far.
+    /// </summary>
+    private void OnRecordingStopped(object? sender, StoppedEventArgs e)
+    {
+        lock (captureSync)
+        {
+            if (disposed)
+                return;
+
+            var failure = e.Exception;
+            Console.WriteLine($"[wasapi] capture stopped: {failure?.GetType().Name ?? "no error"} " +
+                $"({failure?.Message ?? "clean stop"})");
+
+            if (failure is not null)
+            {
+                var hresult = failure.HResult & 0xFFFFFFFF;
+                var invalidated = hresult == 0x88890004 || hresult == 0x88890008;
+                Console.WriteLine(invalidated
+                    ? "[wasapi] device invalidated -- reconnecting to the default render endpoint"
+                    : "[wasapi] unexpected failure -- not reconnecting, capture stays dead");
+
+                if (!invalidated)
+                    return;
+            }
+
+            try
+            {
+                capture.DataAvailable -= handler;
+                capture.RecordingStopped -= OnRecordingStopped;
+                try
+                {
+                    capture.Dispose();
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException)
+                {
+                    // Already torn down by the OS; nothing left to release.
+                }
+
+                var replacement = CreateRecorder(handler);
+                replacement.RecordingStopped += OnRecordingStopped;
+                capture = replacement;
+                capture.StartRecording();
+                Console.WriteLine($"[wasapi] reconnected, format now [{Format}]");
+            }
+            catch (Exception ex)
+            {
+                // No render endpoint at all (all outputs disabled). Leave the capture dead but keep
+                // the process alive: video recording continues, and the video ring still exports.
+                Console.WriteLine($"[wasapi] reconnect failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
+
     public void Dispose()
     {
-        if (disposed)
-            return;
-        disposed = true;
-
-        capture.DataAvailable -= handler;
-        try
+        lock (captureSync)
         {
-            capture.StopRecording();
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException)
-        {
-            // Recording already stopped, or the endpoint disappeared; nothing left to flush.
+            if (disposed)
+                return;
+            disposed = true;
+
+            capture.DataAvailable -= handler;
+            capture.RecordingStopped -= OnRecordingStopped;
+            try
+            {
+                capture.StopRecording();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException)
+            {
+                // Recording already stopped, or the endpoint disappeared; nothing left to flush.
+            }
+
+            capture.Dispose();
         }
 
-        capture.Dispose();
         Console.WriteLine(
             $"Audio: {bufferCount} buffers, {totalBytes} bytes, started at {Interlocked.Read(ref firstBufferHundredNanos) / 10_000.0:F3}s on the capture clock.");
     }
