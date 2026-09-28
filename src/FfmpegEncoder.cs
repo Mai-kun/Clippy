@@ -219,9 +219,21 @@ internal sealed class FfmpegEncoder : IDisposable
     {
         var type = data[0] & 0x1F;
         if (type == 7)
-            sps ??= data;
+        {
+            if (sps is null)
+            {
+                sps = data;
+                Console.WriteLine($"[params] first SPS seen at {readClockSeconds:R} ({length} bytes)");
+            }
+        }
         else if (type == 8)
-            pps ??= data;
+        {
+            if (pps is null)
+            {
+                pps = data;
+                Console.WriteLine($"[params] first PPS seen at {readClockSeconds:R} ({length} bytes)");
+            }
+        }
 
         // Only a VCL NAL is a picture, so only a VCL NAL consumes a capture time. Non-VCL NALs travel
         // with whatever picture follows them and must not shift the timeline.
@@ -339,6 +351,7 @@ internal sealed class FfmpegEncoder : IDisposable
         process.Dispose();
     }
 }
+
 
 
 

@@ -45,6 +45,13 @@ internal sealed class AudioCapture : IDisposable
     private int bufferCount;
     private long totalBytes;
     private long firstBufferHundredNanos;
+
+    // Diagnostic counters for the audio timeline. BytesPerFrame is the endpoint's real frame size
+    // (channels * bits/8), recomputed per callback because the endpoint format is not known until
+    // the first packet arrives.
+
+    /// <summary>Bytes per PCM sample frame, from the endpoint's real format.</summary>
+    public int BlockAlign => capture.WaveFormat.BlockAlign;
     private int packetsSeen;
     private double silencePrependedMs;
     private volatile bool disposed;
@@ -112,6 +119,9 @@ internal sealed class AudioCapture : IDisposable
     }
 
     public string Format => $"{capture.WaveFormat.Encoding} {capture.WaveFormat.SampleRate} Hz, {capture.WaveFormat.Channels} ch, {capture.WaveFormat.BitsPerSample} bit";
+
+    /// <summary>The endpoint's real sample rate, used to place each AAC frame on the audio timeline.</summary>
+    public int SampleRate => capture.WaveFormat.SampleRate;
 
     /// <summary>Isolates the loopback from ffmpeg: proves whether WASAPI delivers buffers at all.</summary>
     public static int RunAudioProbe()
