@@ -18,11 +18,112 @@ internal static class Mp4WriterSelfTest
         failures += Check("mp4: both tracks survive in one file", BothTracksSurvive);
         failures += Check("mp4: audio PTS match the capture clock", AudioPtsMatch);
         failures += Check("mp4: audio mutation check (halved timestamps must fail)", AudioMutationIsCaught);
+    failures += Check("mp4: both tracks share one zero when video starts late", SharedZeroVideoLate);
+    failures += Check("mp4: both tracks share one zero when audio starts late", SharedZeroAudioLate);
+    failures += Check("mp4: mutation check (no shared zero must fail)", SharedZeroMutationIsCaught);
         return failures;
     }
 
-    private static int Check(string name, Func<string?> test)
+    /// <summary>
+    /// Video starts 0.6 s AFTER audio. The early audio has no picture to pair with, so it must be
+    /// dropped, and the first surviving video frame and the first surviving audio sample must be the
+    /// SAME physical instant. Checked on absolute times, not on the container: in MP4 the first
+    /// sample of every track is 0 by definition, so a container-level check could not tell the
+    /// aligned and unaligned cases apart at all.
+    /// </summary>
+    private static string? SharedZeroVideoLate()
     {
+        var video = Enumerable.Range(0, 30).Select(i => 10.6 + (i * 0.03)).ToList();
+        var audio = Enumerable.Range(0, 300).Select(i => 10.0 + (i * 0.005)).ToList();
+
+        var aligned = TrackAligner.Align(video, audio);
+
+        if (Math.Abs(aligned.Zero - 10.6) > 1e-9)
+        {
+            return $"zero should be the video start 10.6, got {aligned.Zero:R}";
+        }
+
+        if (Math.Abs(aligned.DroppedVideo) > 1e-9 || Math.Abs(aligned.DroppedAudio - 0.6) > 1e-9)
+        {
+            return $"expected 0 s of video and 0.6 s of audio dropped, got " +
+                $"{aligned.DroppedVideo:R} and {aligned.DroppedAudio:R}";
+        }
+
+        // Same instant: the first video frame and the first kept audio sample, back in absolute time.
+        var firstVideoAbsolute = aligned.VideoTimes[0] + aligned.Zero;
+        var firstAudioAbsolute = aligned.AudioTimes[0] + aligned.Zero;
+        if (Math.Abs(firstVideoAbsolute - firstAudioAbsolute) > 1e-9)
+        {
+            return $"tracks no longer share a moment: video {firstVideoAbsolute:R} vs audio {firstAudioAbsolute:R}";
+        }
+
+        if (aligned.VideoTimes.Any(t => t < 0) || aligned.AudioTimes.Any(t => t < 0))
+        {
+            return "a negative relative time survived alignment";
+        }
+
+        return null;
+    }
+
+    /// <summary>The mirror case: audio starts later, so the head of the VIDEO is dropped instead.</summary>
+    private static string? SharedZeroAudioLate()
+    {
+        var video = Enumerable.Range(0, 30).Select(i => 10.0 + (i * 0.03)).ToList();
+        var audio = Enumerable.Range(0, 300).Select(i => 10.4 + (i * 0.005)).ToList();
+
+        var aligned = TrackAligner.Align(video, audio);
+
+        if (Math.Abs(aligned.Zero - 10.4) > 1e-9)
+        {
+            return $"zero should be the audio start 10.4, got {aligned.Zero:R}";
+        }
+
+        if (Math.Abs(aligned.DroppedVideo - 0.4) > 1e-9 || Math.Abs(aligned.DroppedAudio) > 1e-9)
+        {
+            return $"expected 0.4 s of video and 0 s of audio dropped, got " +
+                $"{aligned.DroppedVideo:R} and {aligned.DroppedAudio:R}";
+        }
+
+        // Video sits on a 30 ms grid and audio on a 5 ms grid, so the first frame at or after the
+        // zero can be up to one video frame late. That is expected, not a desync: the tolerance is
+        // exactly one frame interval, which is the bound you asked for.
+        const double frameInterval = 0.03;
+        var firstVideoAbsolute = aligned.VideoTimes[0] + aligned.Zero;
+        var firstAudioAbsolute = aligned.AudioTimes[0] + aligned.Zero;
+        var gap = Math.Abs(firstVideoAbsolute - firstAudioAbsolute);
+        return gap > frameInterval + 1e-9
+            ? $"tracks no longer share a moment: video {firstVideoAbsolute:R} vs audio {firstAudioAbsolute:R} (gap {gap:R})"
+            : null;
+    }
+
+    /// <summary>
+    /// With alignment disabled, per-track origins are restored and the two tracks no longer describe
+    /// the same moment. If this test passes, the alignment above is not actually doing anything.
+    /// </summary>
+    private static string? SharedZeroMutationIsCaught()
+    {
+        var video = Enumerable.Range(0, 30).Select(i => 10.6 + (i * 0.03)).ToList();
+        var audio = Enumerable.Range(0, 300).Select(i => 10.0 + (i * 0.005)).ToList();
+
+        var mutated = TrackAligner.Align(video, audio, align: false);
+
+        // Each track keeps its own origin, so the absolute moments they describe must now disagree.
+        var firstVideoAbsolute = mutated.VideoTimes[0] + video[0];
+        var firstAudioAbsolute = mutated.AudioTimes[0] + audio[0];
+        if (Math.Abs(firstVideoAbsolute - firstAudioAbsolute) < 0.1)
+        {
+            return "mutation did not break the shared zero, so the alignment test proves nothing";
+        }
+
+        if (mutated.DroppedAudio > 1e-9 || mutated.DroppedVideo > 1e-9)
+        {
+            return "mutation still dropped samples, so it is not really 'alignment off'";
+        }
+
+        return null;
+    }
+
+    private static int Check(string name, Func<string?> test)    {
         try
         {
             var error = test();
