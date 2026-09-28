@@ -62,8 +62,17 @@ internal sealed class ScreenCapture : IDisposable
 
         // Raw ring data first, so a bad slice is visible here and not as an ffprobe error later.
         var (captured, accessUnits) = encoder.TimingCounts;
-        Console.WriteLine($"Export: frames in {captured}, access units out {accessUnits}, " +
-            $"paired {(captured == accessUnits ? "1:1 OK" : "MISMATCH")}");
+
+        // A few frames still in flight is normal: the drain thread reads stdout in chunks and a
+        // couple of access units are always behind when the export happens mid-recording. Only a
+        // larger gap means the encoder actually lost or reordered frames, which would break the
+        // FIFO pairing and invalidate every timestamp in the clip.
+        const int inFlightTolerance = 5;
+        var unpaired = captured - accessUnits;
+        Console.WriteLine(unpaired > inFlightTolerance
+            ? $"Export: frames in {captured}, access units out {accessUnits} -- MISMATCH of {unpaired}, " +
+              "the encoder lost or reordered frames and these timestamps cannot be trusted"
+            : $"Export: frames in {captured}, access units out {accessUnits} (1:1 within tolerance)");
 
         // DELIBERATE CHOICE: an empty audio slice produces a VIDEO-ONLY mp4, not a refusal. Loopback
         // capture intermittently delivers zero buffers, and a user who asked to save a clip wants the
@@ -249,7 +258,8 @@ internal sealed class ScreenCapture : IDisposable
 
         if (videoPath is not null)
         {
-            Console.WriteLine($"Recording {videoPath} [{videoEncoder}]");
+            Console.WriteLine($"Recording [{videoEncoder}] into an in-memory ring, max {RingSeconds:F0}s.");
+            Console.WriteLine("Nothing is written until an export happens (F9 saves 30 s, F10 saves 3 min).");
         }
 
         try
