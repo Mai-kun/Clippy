@@ -140,9 +140,13 @@ jobs:
           # exe, which deflate cannot improve. It stopped being right once ffmpeg (~200 MB of
           # libraries and tables) went in: a stored archive was 443 MB, and deflating the same
           # payload costs a second or two of packaging and takes it to roughly 40 MB.
-          Compress-Archive -Path publish/* -DestinationPath Clippy-win-x64-portable.zip -CompressionLevel Optimal
+          # The zip keeps the name it has always had. Renaming it to "...-portable.zip" looks tidier
+          # but strands every existing copy: the updater in those builds looks for the old name,
+          # would find nothing in this release, and would silently stop updating. The installer does
+          # not have that problem, because it is a brand new asset nobody looks for yet.
+          Compress-Archive -Path publish/* -DestinationPath Clippy-win-x64.zip -CompressionLevel Optimal
 
-          $zip = Get-Item Clippy-win-x64-portable.zip
+          $zip = Get-Item Clippy-win-x64.zip
           "archive: {0:N1} MB" -f ($zip.Length / 1MB)
           "contents:"
           Get-ChildItem publish | Select-Object Name, Length
@@ -152,10 +156,11 @@ jobs:
         with:
           # Both shapes ship on every release. The setup is what most people want; the zip is for
           # anyone who cannot or will not install, and it is the only one a portable copy can update
-          # itself from -- UpdateService picks by whether unins000.exe sits next to the exe.
+          # itself from -- UpdateService picks by whether unins000.exe sits next to the exe. The zip
+          # keeps its long-standing name on purpose: renaming it would strand existing copies.
           files: |
             Clippy-Setup.exe
-            Clippy-win-x64-portable.zip
+            Clippy-win-x64.zip
           # ${{ github.ref_name }} is the tag, so v1.2.3 names the release v1.2.3.
           name: Clippy ${{ github.ref_name }}
           body: |
@@ -165,7 +170,7 @@ jobs:
             прав администратора, создаёт ярлык в меню «Пуск», умеет запускаться при старте Windows
             и обновляется сам.
 
-            **`Clippy-win-x64-portable.zip`** — распакуйте в любую папку и запустите `Clippy.exe`.
+            **`Clippy-win-x64.zip`** — распакуйте в любую папку и запустите `Clippy.exe`.
             Ничего не устанавливается.
 
             `ffmpeg.exe` уже внутри обоих вариантов, отдельно ничего ставить не нужно.

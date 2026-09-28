@@ -25,14 +25,18 @@ internal readonly record struct UpdateInfo(bool Available, string Tag, string Do
 /// </summary>
 internal static class UpdateService
 {
-    private const string CurrentVersion = "v1.0.3";
+    private const string CurrentVersion = "v1.0.4";
     private const string ApiUrl = "https://api.github.com/repos/Mai-kun/Clippy/releases/latest";
 
     /// <summary>Installer, used when the running copy was installed by the setup.</summary>
     private const string AssetSetup = "Clippy-Setup.exe";
 
-    /// <summary>Zip, used by a copy the user just unpacked somewhere.</summary>
-    private const string AssetPortable = "Clippy-win-x64-portable.zip";
+    /// <summary>
+    /// Zip, used by a copy the user just unpacked somewhere. The name is load-bearing: every release
+    /// before v1.0.4 ships this exact asset, and renaming it would leave those builds looking for
+    /// something no release contains, quietly ending updates for everyone already on v1.0.3.
+    /// </summary>
+    private const string AssetPortable = "Clippy-win-x64.zip";
 
     /// <summary>
     /// Inno Setup drops unins000.exe in the application folder, so its presence is what tells the two
