@@ -454,7 +454,14 @@ internal sealed class ScreenCapture : IDisposable
         trayIcon?.Start();
         trayIcon?.HideConsole();
         if (trayIcon is not null)
+        {
             capture.notify = trayIcon.ShowNotification;
+
+            // Fire and forget, deliberately. This is a network call on the way to recording, and a
+            // user whose network hangs must still get their recorder running now, not in ten seconds.
+            if (config.CheckForUpdates)
+                _ = Task.Run(() => trayIcon.RunUpdateCheck(userInitiated: false));
+        }
 
         return capture.Capture(duration);
     }

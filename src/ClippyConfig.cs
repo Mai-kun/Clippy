@@ -42,6 +42,13 @@ public sealed class ClippyConfig
     /// </summary>
     public int VideoBitrateMbps { get; set; } = 6;
 
+    /// <summary>
+    /// Ask GitHub on startup whether a newer release exists. On by default: the check is one small
+    /// request that fails silently, and a recorder that only tells you about updates when you go
+    /// looking for them is a recorder most people never update at all.
+    /// </summary>
+    public bool CheckForUpdates { get; set; } = true;
+
     /// <summary>Where config.json is looked up: beside the binary, not the current directory.</summary>
     public static string Path => System.IO.Path.Combine(AppContext.BaseDirectory, "config.json");
 

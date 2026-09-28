@@ -51,6 +51,7 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_OPEN_FOLDER = 1001;
     private const uint IDC_OPEN_CONFIG = 1002;
     private const uint IDC_TOGGLE_CONSOLE = 1003;
+    private const uint IDC_CHECK_UPDATES = 1005;
     private const uint IDC_EXIT = 1004;
 
     private const int IDI_APPLICATION = 32512;
@@ -426,6 +427,7 @@ public sealed partial class TrayIcon : IDisposable
             AppendMenu(menu, MF_STRING, IDC_OPEN_CONFIG, "Open Config");
             AppendMenu(menu, MF_SEPARATOR, 0, "");
             AppendMenu(menu, MF_STRING, IDC_TOGGLE_CONSOLE, "Show / Hide Log");
+            AppendMenu(menu, MF_STRING, IDC_CHECK_UPDATES, "Check for Updates");
             AppendMenu(menu, MF_STRING, IDC_EXIT, "Exit");
 
             // The mandatory dismissal sequence. GetCursorPos, then SetForegroundWindow, then
@@ -446,6 +448,9 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_TOGGLE_CONSOLE:
                     ToggleConsole();
                     break;
+                case IDC_CHECK_UPDATES:
+                    CheckForUpdates();
+                    break;
                 case IDC_EXIT:
                     onExit();
                     break;
@@ -455,6 +460,49 @@ public sealed partial class TrayIcon : IDisposable
         {
             DestroyMenu(menu);
         }
+    }
+
+    /// <summary>
+    /// Manual update check from the tray menu, and the one place a failed check is worth telling the
+    /// user about: they asked, so silence would look like a broken menu item.
+    /// </summary>
+    private void CheckForUpdates()
+    {
+        _ = RunUpdateCheck(userInitiated: true);
+    }
+
+    /// <summary>
+    /// Shared by the menu item and the startup check.
+    ///
+    /// The two differ in what they DO about a found update, and that difference is the whole reason
+    /// userInitiated exists. Asking from the menu means "update me", so it downloads and installs --
+    /// which replaces the running exe and ends the process, hence fire-and-forget and a very clear
+    /// log line. The startup check only ever mentions it: replacing an exe under a user who did not
+    /// ask for it, mid-game, is not a decision software should make on its own.
+    /// </summary>
+    internal async Task RunUpdateCheck(bool userInitiated)
+    {
+        var info = await UpdateService.CheckForUpdateAsync().ConfigureAwait(false);
+
+        if (!info.Available)
+        {
+            Console.WriteLine($"Update: nothing newer than {UpdateService.Version}.");
+            if (userInitiated)
+                ShowNotification("Clippy Update", $"You are on the latest version ({UpdateService.Version}).");
+            return;
+        }
+
+        Console.WriteLine($"Update: {info.Tag} is available.");
+        if (!userInitiated)
+        {
+            ShowNotification(
+                "Clippy Update",
+                $"{info.Tag} is available. Right-click the tray icon and choose Check for Updates.");
+            return;
+        }
+
+        ShowNotification("Clippy Update", $"Installing {info.Tag}...");
+        await UpdateService.ApplyUpdateAsync(info.DownloadUrl, ShowNotification).ConfigureAwait(false);
     }
 
     private void OpenOutputFolder()
