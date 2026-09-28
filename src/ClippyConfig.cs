@@ -84,7 +84,10 @@ public sealed class ClippyConfig
     {
         try
         {
-            File.WriteAllText(Path, JsonSerializer.Serialize(this, SerializerOptions));
+            // Straight through the source-generated context. JsonSerializer.Serialize(this, options)
+            // is annotated RequiresUnreferencedCode/RequiresDynamicCode and is a real IL2026/IL3050
+            // AOT warning; the JsonTypeInfo overload is the AOT-safe one.
+            File.WriteAllText(Path, JsonSerializer.Serialize(this, ClippyConfigContext.Default.ClippyConfig));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

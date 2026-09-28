@@ -9,6 +9,9 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PublishAot>true</PublishAot>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- Reflection-based JSON and any other trimmed-away metadata should fail the build loudly in
+         CI rather than throwing at runtime on a user's machine. -->
+    <TrimMode>partial</TrimMode>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,6 +21,19 @@
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
     <PackageReference Include="Vortice.Win32.Graphics.Imaging" Version="2.5.0" />
+  </ItemGroup>
+
+  <!-- A portable folder: ffmpeg.exe dropped next to the binary is used in preference to PATH, and
+       both the default config and the bundled tool travel with the published app. -->
+  <ItemGroup>
+    <None Include="ffmpeg.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest"
+          Condition="Exists('ffmpeg.exe')" />
+    <None Include="..\config.example.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- A real capture, committed deliberately. Mp4WriterSelfTest parses REAL SPS/PPS and compares
+         real PTS against ffprobe; invented codec parameters would not exercise the paths that matter.
+         Without this copied, the mp4 test fails on a published binary with FileNotFoundException. -->
+    <None Include="mp4-selftest-frames.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="mp4-selftest-audio.aac" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

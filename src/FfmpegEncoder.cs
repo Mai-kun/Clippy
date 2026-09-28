@@ -70,7 +70,7 @@ internal sealed class FfmpegEncoder : IDisposable
 
         var startInfo = new ProcessStartInfo
         {
-            FileName = "ffmpeg",
+            FileName = FfmpegLocator.Executable,
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardError = true,
