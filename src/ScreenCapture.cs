@@ -319,6 +319,22 @@ internal sealed class ScreenCapture : IDisposable
         return path;
     }
 
+    /// <summary>
+    /// Runs an export from a thread-pool callback, where an escaping exception would kill the
+    /// process without a message.
+    /// </summary>
+    private void GuardedExport(double seconds)
+    {
+        try
+        {
+            ExportClip(seconds);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Export failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     private FfmpegEncoder? encoder;
 
     // Phase 4: the encoders feed these in-memory rings instead of writing files, and a clip is
@@ -472,8 +488,12 @@ internal sealed class ScreenCapture : IDisposable
                 ? new Timer(_ => Stop($"capture duration {timeout.TotalSeconds:F0}s elapsed"), null, timeout, Timeout.InfiniteTimeSpan)
                 : null;
 
+            // The timer callback is a thread-pool thread: an exception thrown out of one of these is
+            // unhandled and ends the process, exactly as it would in the frame callback. Guarded
+            // here rather than inside ExportClip, which returns null for its own expected refusals
+            // and should not have to know who called it.
             using var midExport = exportAtSeconds is { } at
-                ? new Timer(_ => ExportClip(exportDurationSeconds ?? 10), null, TimeSpan.FromSeconds(at), Timeout.InfiniteTimeSpan)
+                ? new Timer(_ => GuardedExport(exportDurationSeconds ?? 10), null, TimeSpan.FromSeconds(at), Timeout.InfiniteTimeSpan)
                 : null;
 
             // Phase 6: the low-level keyboard hook only records the key and signals an event; a
@@ -621,6 +641,25 @@ internal sealed class ScreenCapture : IDisposable
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object _)
     {
         EventLog.Mark("FB_ENTER");
+
+        // This runs on a WinRT-dispatched thread the CLR does not own, and an unhandled exception
+        // there takes the WHOLE process down with no message and no exit code worth reading. That is
+        // what "it recorded for a while and then simply vanished" looked like: one COM failure inside
+        // TryGetNextFrame -- routine when a monitor is reconfigured or a session is locked -- and
+        // the process was gone before any of the orderly teardown in Capture could run.
+        try
+        {
+            OnFrameArrivedCore(sender);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[wgc] frame callback threw ({ex.GetType().Name}: {ex.Message}). " +
+                "Skipping this frame; recording continues.");
+        }
+    }
+
+    private void OnFrameArrivedCore(Direct3D11CaptureFramePool sender)
+    {
         lock (sync)
         {
             EventLog.Mark("FB_LOCK");
@@ -785,9 +824,22 @@ internal sealed class ScreenCapture : IDisposable
         }
     }
 
+    /// <summary>
+    /// The capture item died. WGC raises this when the display configuration changes or a session
+    /// is locked, and it says nothing about whether recording should end.
+    ///
+    /// It used to call Stop, which unwound Capture, exported, and exited the process. For a tray
+    /// recorder whose whole job is to sit in the background, an unrelated monitor hiccup silently
+    /// ending the session -- with no window left to report it in -- is the wrong answer, and it is
+    /// indistinguishable to the user from a crash. The user still quits from the tray, deliberately.
+    /// </summary>
     private void OnItemClosed(GraphicsCaptureItem _, object __)
     {
-        Stop("capture item closed");
+        Console.WriteLine("[wgc] the capture item was closed (display reconfigured, or the session " +
+            "was locked). Frames have stopped arriving. Recording state is kept; " +
+            "quit from the tray to finish.");
+        if (!stopped.IsSet)
+            stopped.Set();
     }
 
     private void LogFrameTiming()
