@@ -500,7 +500,12 @@ internal sealed class ScreenCapture : IDisposable
                             videoEncoder ?? "h264_nvenc",
                             stopwatch,
                             fpsMode);
-                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} -> {videoPath}");
+
+                        // Same as the audio branch: without the drain there is no ring, no SPS/PPS and
+                        // therefore no export at all. Hotkeys work in this mode too, producing the
+                        // deliberate video-only clip when the audio ring is empty.
+                        encoder.StartDrain(videoRing);
+                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring, no audio (max {RingSeconds:F0}s)");
                     }
                 }
 
