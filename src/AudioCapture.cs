@@ -46,6 +46,17 @@ internal sealed class AudioCapture : IDisposable
     private long totalBytes;
     private long firstBufferHundredNanos;
 
+    // Gap filling. Packets are ~10 ms and the device clock drifts by tens of ppm, so anything below
+    // the threshold is left alone on purpose: correcting it would nudge every packet and turn a
+    // measured drift into injected error. The cap keeps a multi-minute silence from materialising as
+    // one huge buffer.
+    private const double GapThresholdSeconds = 0.04;
+    private const double MaxGapFillSeconds = 600;
+    private double anchorQpcSeconds;
+    private long samplesSoFar;
+    private int gapAnchorSet;
+    private int BytesPerFrame => capture.WaveFormat.BlockAlign;
+
     // Diagnostic counters for the audio timeline. BytesPerFrame is the endpoint's real frame size
     // (channels * bits/8), recomputed per callback because the endpoint format is not known until
     // the first packet arrives.
@@ -180,6 +191,39 @@ internal sealed class AudioCapture : IDisposable
                 $"(video origin {videoStartSeconds:F3}s, gap {gapSeconds:F3}s; not prepended)");
         }
 
+        // GAP FILLING. Loopback delivers NO packets at all while the system is silent, so a pause
+        // would otherwise vanish from the timeline entirely and every later sound would be placed
+        // that much too early (measured: a 20 s pause compressed a 60 s clip to 32 s of audio).
+        //
+        // The packet's qpcPosition is its real render time, on the same 10 MHz scale as
+        // Stopwatch.GetTimestamp() (verified: both are 10 MHz from system boot). So a discontinuity is
+        // the moment the packet's own time runs ahead of where the accumulated samples say it should
+        // be. Only gaps beyond the threshold are filled; smaller differences are clock drift of a
+        // few tens of ppm and are deliberately NOT corrected, or every packet would get nudged.
+        var packetQpcSeconds = qpcPosition / 10_000_000.0;
+        if (Interlocked.CompareExchange(ref gapAnchorSet, 1, 0) == 0)
+        {
+            anchorQpcSeconds = packetQpcSeconds;
+            samplesSoFar = 0;
+        }
+
+        var expected = anchorQpcSeconds + (samplesSoFar / (double)SampleRate);
+        var gap = packetQpcSeconds - expected;
+        if (gap > GapThresholdSeconds)
+        {
+            var fillSeconds = Math.Min(gap, MaxGapFillSeconds);
+            var fillSamples = (int)Math.Round(fillSeconds * SampleRate);
+            if (fillSamples > 0)
+            {
+                Console.WriteLine($"[gap] {fillSeconds * 1000:F0} ms of silence inserted at " +
+                    $"{stopwatch.Elapsed.TotalSeconds:F3}s (packet was {gap * 1000:F0} ms late)");
+                sink?.Invoke(new byte[fillSamples * BytesPerFrame], qpcPosition);
+                samplesSoFar += fillSamples;
+            }
+        }
+
+        samplesSoFar += copy.Length / BytesPerFrame;
+
         // The QPC position is the packet's true capture time on the same system clock that
         // -use_wallclock_as_timestamps reads, which is what keeps audio on the video timeline.
         sink?.Invoke(copy, qpcPosition);
@@ -224,3 +268,4 @@ internal sealed class AudioCapture : IDisposable
             $"Audio: {bufferCount} buffers, {totalBytes} bytes, started at {Interlocked.Read(ref firstBufferHundredNanos) / 10_000.0:F3}s on the capture clock.");
     }
 }
+
