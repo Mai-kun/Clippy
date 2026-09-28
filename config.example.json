@@ -1,0 +1,9 @@
+{
+  "OutputFolder": "output",
+  "ShortClipSeconds": 30,
+  "LongClipSeconds": 180,
+  "ShortClipHotkey": "F9",
+  "LongClipHotkey": "F10",
+  "PlaySoundNotification": true,
+  "StartMinimizedToTray": false
+}

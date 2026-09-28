@@ -26,6 +26,9 @@ internal sealed class ScreenCapture : IDisposable
     private readonly GraphicsCaptureSession session;
     private readonly string outputDirectory;
     private readonly ClippyConfig config;
+
+    /// <summary>The settings this recorder was started with, for the tray menu to reuse.</summary>
+    public ClippyConfig Config => config;
     private readonly ManualResetEventSlim stopped = new(false);
     private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
@@ -378,7 +381,7 @@ internal sealed class ScreenCapture : IDisposable
     }
 
     /// <summary>Records a raw video stream: every captured frame is piped to ffmpeg.</summary>
-    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null, ClippyConfig? config = null)
+    public static int RunVideo(TimeSpan duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null, ClippyConfig? config = null, bool tray = false)
     {
         // Without audio there is no mux, so the encoder writes a raw Annex B stream. Naming that file
         // .mp4 would be actively misleading: the bytes are correct but the extension lies.
@@ -397,6 +400,13 @@ internal sealed class ScreenCapture : IDisposable
             exportAtSeconds = exportAt,
             exportDurationSeconds = exportDuration,
         };
+
+        // The tray owns the process lifetime: "Exit" has to run the same teardown as Ctrl+C, or
+        // stopping from the menu would leave the ffmpeg pipes and the ring buffer unwritten.
+        using var trayIcon = tray ? new TrayIcon(capture.Config, Path.GetDirectoryName(videoPath)!, capture.RequestStop) : null;
+        trayIcon?.Start();
+        trayIcon?.HideConsole();
+
         return capture.Capture(duration);
     }
 
@@ -764,6 +774,13 @@ internal sealed class ScreenCapture : IDisposable
 
         lastFrameTime = now;
     }
+
+    /// <summary>
+    /// Asks the capture to finish and tear down. Public because the tray's Exit item calls it from
+    /// its own message-pump thread, and it must go through the same path as Ctrl+C so the ffmpeg
+    /// pipes are drained and the ring's contents are not thrown away.
+    /// </summary>
+    public void RequestStop() => Stop("exit requested from the tray menu");
 
     private void Stop(string reason)
     {

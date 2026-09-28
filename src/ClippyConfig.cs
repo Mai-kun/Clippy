@@ -19,6 +19,13 @@ public sealed class ClippyConfig
     public string LongClipHotkey { get; set; } = "F10";
     public bool PlaySoundNotification { get; set; } = true;
 
+    /// <summary>
+    /// Start with the console hidden, living only in the tray. False by default: while the recorder
+    /// is being developed the log is the whole point, and a process that vanishes into the tray
+    /// looks identical to one that crashed on startup.
+    /// </summary>
+    public bool StartMinimizedToTray { get; set; }
+
     /// <summary>Where config.json is looked up: beside the binary, not the current directory.</summary>
     public static string Path => System.IO.Path.Combine(AppContext.BaseDirectory, "config.json");
 

@@ -73,9 +73,16 @@ if (args.FirstOrDefault() == "--record")
     {
         exportDuration = dur;
     }
+    // --tray / --minimized imply the tray icon even when the config does not ask for it, so the flag
+    // on the command line wins over the file.
+    var trayRequested = config.StartMinimizedToTray
+        || args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase)
+                      || a.Equals("--minimized", StringComparison.OrdinalIgnoreCase));
+
     return Clippy.ScreenCapture.RunVideo(
         TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode, withAudio || audioCaptureOnly, audioCaptureOnly,
-        args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration, config);
+        args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration, config,
+        trayRequested);
 }
 
 if (args.FirstOrDefault() == "--test-audio-timeline")
