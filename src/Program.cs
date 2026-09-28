@@ -42,6 +42,22 @@ if (args.Length == 0)
         tray: true);
 }
 
+if (args.Contains("--self-update"))
+{
+    // Forces the whole download-and-install path without a tray icon, so the one branch that is
+    // impossible to test by hand (it replaces the running exe and exits) can still be exercised
+    // on demand. Also the thing to ask a user to run when an update misbehaves.
+    var found = await UpdateService.CheckForUpdateAsync();
+    Console.WriteLine(found.Available
+        ? $"{UpdateService.Version} -> {found.Tag}: {found.DownloadUrl}"
+        : $"{UpdateService.Version} is current; nothing to install.");
+    if (!found.Available)
+        return 0;
+
+    await UpdateService.ApplyUpdateAsync(found.DownloadUrl, null);
+    return 0;
+}
+
 if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
 {
     return PrintUsage();
@@ -159,6 +175,7 @@ static int PrintUsage()
     Console.WriteLine("                              you quit it from the tray. Reads config.json.");
     Console.WriteLine();
     Console.WriteLine("  --help, -h, --usage        this text");
+    Console.WriteLine("  --self-update             check for and install an update, then exit");
     Console.WriteLine();
     Console.WriteLine("Modes:");
     Console.WriteLine("  --record [seconds]         record to a file for a fixed time (default 60s)");
