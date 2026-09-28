@@ -31,6 +31,18 @@ public sealed class HotkeyService : IDisposable
     private Thread? worker;
     private Thread? pump;
     private readonly ManualResetEvent hookReady = new(false);
+    // The hook procedure MUST be held in a field, and this is not a style preference.
+    //
+    // Passing `HookProc` as a method group creates a delegate object that nothing references once
+    // SetWindowsHookEx returns. The GC is then free to collect it, and Native AOT frees the native
+    // thunk with it. The OS does not care: it kept the raw function pointer and calls it on the next
+    // key press, so the process dies with STATUS_ACCESS_VIOLATION (0xc0000005) at a fixed offset,
+    // with no managed exception, no message, and no crash log -- the handler never runs because
+    // there is nothing to catch. That is exactly "pressing F9 closes the program": the key does not
+    // crash anything, it merely is the first thing to reach a hook that has become a dangling
+    // pointer. A JIT build hides it because the collector is less eager; only the AOT binary that
+    // users download crashes.
+    private HookProcDelegate? hookProc;
     private IntPtr hook = IntPtr.Zero;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -101,7 +113,9 @@ public sealed class HotkeyService : IDisposable
     private void HookThread()
     {
         hookReady.Reset();
-        hook = SetWindowsHookEx(WH_KEYBOARD_LL, HookProc, GetModuleHandle(null), 0);
+        // Stored in the field so it stays alive for as long as the OS holds the pointer.
+        hookProc = HookProc;
+        hook = SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, GetModuleHandle(null), 0);
         hookReady.Set();
 
         if (hook == IntPtr.Zero)
