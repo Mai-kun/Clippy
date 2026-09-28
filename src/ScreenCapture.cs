@@ -106,28 +106,47 @@ internal sealed class ScreenCapture : IDisposable
         writer.SetParameterSets(encoder.Sps, encoder.Pps);
         writer.SetDimensions(videoWidth, videoHeight);
 
+        // ONE shared zero for both tracks, not a per-track origin. See TrackAligner for why, and for
+        // why neither track is privileged: whichever starts later defines t=0 and the other is cut.
+        var videoTimes = new List<double>();
+        foreach (var packet in videoPackets.Skip(start))
+        {
+            var nalType = packet.Span[0] & 0x1F;
+            if (nalType is >= 1 and <= 5)
+            {
+                videoTimes.Add(packet.CaptureClockSeconds);
+            }
+        }
+
+        var alignment = TrackAligner.Align(videoTimes, audioPackets.Select(p => p.CaptureClockSeconds).ToList());
+        Console.WriteLine($"Export: zero at {alignment.Zero:F3}s, " +
+            $"dropped {alignment.DroppedVideo * 1000:F0} ms of video, {alignment.DroppedAudio * 1000:F0} ms of audio");
+
         // One MP4 sample per access unit. A VCL NAL is one picture; the non-VCL NALs that PRECEDE it
         // belong to it, so they buffer until the VCL arrives. Emitting on the VCL is what keeps the
         // boundaries honest: a non-VCL NAL after a VCL already starts the NEXT access unit.
         var pending = new List<ReadOnlyMemory<byte>>();
+        var timeIndex = 0;
         foreach (var packet in videoPackets.Skip(start))
         {
             var nalType = packet.Span[0] & 0x1F;
             var isVcl = nalType is >= 1 and <= 5;
             pending.Add(packet.Data.AsMemory(0, packet.Length));
 
-            if (isVcl)
+            if (isVcl && timeIndex < alignment.VideoTimes.Count)
             {
-                // The VCL NAL's own capture time is the picture's time; the leading non-VCL NALs may
-                // have arrived a fraction earlier and would skew the sample backwards.
-                writer.AddVideoSample(pending, packet.CaptureClockSeconds);
+                writer.AddVideoSample(pending, alignment.VideoTimes[timeIndex++]);
+                pending.Clear();
+            }
+            else if (isVcl)
+            {
                 pending.Clear();
             }
         }
 
-        foreach (var packet in audioPackets)
+        for (var i = 0; i < audioPackets.Count && i < alignment.AudioTimes.Count; i++)
         {
-            writer.AddAudioSample(packet.Span, packet.CaptureClockSeconds);
+            writer.AddAudioSample(audioPackets[i].Span, alignment.AudioTimes[i]);
         }
 
         var path = Path.Combine(outputDirectory, $"clip-{DateTime.Now:HHmmssfff}.mp4");
@@ -262,6 +281,7 @@ internal sealed class ScreenCapture : IDisposable
             // hand over what ffmpeg already emitted, then export whatever the rings still hold.
             encoder?.WaitForDrain(TimeSpan.FromSeconds(3));
             audioEncoder?.WaitForDrain(TimeSpan.FromSeconds(3));
+            audioEncoder?.PrintSampleAccounting();
             ExportClip(duration?.TotalSeconds ?? 10);
             return 0;
         }
