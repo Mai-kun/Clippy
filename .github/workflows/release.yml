@@ -51,6 +51,30 @@ jobs:
           -p:PublishAot=true
           -o publish
 
+      # Runs immediately after publish, BEFORE anything is deleted, moved or copied. The selftests
+      # must judge the binary exactly as dotnet produced it, not a folder this workflow has been
+      # rearranging underneath them. ffprobe comes from the runner's PATH (setup-ffmpeg above), so
+      # nothing here has to preserve a copy.
+      - name: Verify the selftests
+        shell: pwsh
+        run: |
+          # A green build that cannot write an MP4 is not a release. These run against the
+          # published native binary, not a dotnet-hosted one, so AOT trimming shows up here.
+          $exe = 'publish/Clippy.exe'
+          if (-not (Test-Path $exe)) { throw "publish/Clippy.exe is missing" }
+
+          # Loudly confirm the tool the mp4 checks depend on is really reachable. Without this the
+          # ffprobe-dependent checks would SKIP and the release would ship with them unverified.
+          if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+            throw 'ffprobe is not on PATH; --test-mp4 would silently skip its deep checks'
+          }
+
+          foreach ($t in '--test-parsers', '--test-ring', '--test-mp4', '--test-audio-timeline') {
+            & $exe $t
+            if ($LASTEXITCODE -ne 0) { throw "$t failed with exit $LASTEXITCODE" }
+            "ok  $t"
+          }
+
       # 26 MB of symbols that no end user can do anything with. Uploading them to a separate
       # asset would let a crash reporter symbolicate later, which is worth doing when there is
       # actually a crash reporter; today it is just a slow download.
@@ -74,37 +98,30 @@ jobs:
       # Ship ffmpeg inside the archive. It is not committed to the repo, so the repository does not
       # grow by ~80 MB, and the user gets a folder that works with no setup at all. FfmpegLocator
       # prefers a bundled ffmpeg.exe over PATH, so dropping it next to Clippy.exe is enough.
+      #
+      # ffprobe is deliberately NOT shipped. Clippy never calls it at runtime -- only the selftests
+      # do, and those run here on the runner -- so bundling it would add ~200 MB of nothing to a
+      # download. Its absence costs a user nothing beyond being unable to re-run --test-mp4 locally.
       - name: Bundle ffmpeg
         shell: pwsh
         run: |
           $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source
           Copy-Item $ffmpeg publish/ffmpeg.exe
-          # ffprobe ships alongside ffmpeg and the portable folder is only complete with it: the
-          # selftests and any future verification need it, and a user who has it can debug locally.
-          $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
-          if ($ffprobe) { Copy-Item $ffprobe.Source publish/ffprobe.exe }
-          Get-ChildItem publish/ffmpeg.exe, publish/ffprobe.exe -ErrorAction SilentlyContinue |
-            Select-Object Name, Length
-
-      - name: Verify the selftests
-        shell: pwsh
-        run: |
-          # A green build that cannot write an MP4 is not a release. These run against the
-          # published native binary, not a dotnet-hosted one, so AOT trimming shows up here.
-          $exe = 'publish/Clippy.exe'
-          foreach ($t in '--test-parsers', '--test-ring', '--test-mp4', '--test-audio-timeline') {
-            & $exe $t
-            if ($LASTEXITCODE -ne 0) { throw "$t failed with exit $LASTEXITCODE" }
-            "ok  $t"
-          }
+          Get-Item publish/ffmpeg.exe | Select-Object Name, Length
 
       - name: Package
         shell: pwsh
         run: |
-          # Stored, not Deflated: the payload is a native exe that does not compress, so deflate
-          # only burns CPU to gain nothing.
-          Compress-Archive -Path publish/* -DestinationPath Clippy-win-x64.zip -CompressionLevel NoCompression
-          Get-Item Clippy-win-x64.zip | Select-Object Name, Length
+          # Optimal, not NoCompression. That was the right call when the archive held a 6 MB native
+          # exe, which deflate cannot improve. It stopped being right once ffmpeg (~200 MB of
+          # libraries and tables) went in: a stored archive was 443 MB, and deflating the same
+          # payload costs a second or two of packaging and takes it to roughly 40 MB.
+          Compress-Archive -Path publish/* -DestinationPath Clippy-win-x64.zip -CompressionLevel Optimal
+
+          $zip = Get-Item Clippy-win-x64.zip
+          "archive: {0:N1} MB" -f ($zip.Length / 1MB)
+          "contents:"
+          Get-ChildItem publish | Select-Object Name, Length
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
