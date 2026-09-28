@@ -2,6 +2,22 @@
 using System.Runtime.CompilerServices;
 using Clippy;
 
+// Installed before anything else can fail. In tray mode the console is hidden, so a crash leaves the
+// user with a vanished tray icon and no explanation at all -- and no way to report it. This writes
+// the reason to a file next to the exe where it can actually be found, and puts the same line on
+// screen for the case where the console happens to be visible.
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+{
+    var ex = e.ExceptionObject as Exception;
+    CrashLog.Write(
+        $"UNHANDLED: {ex?.GetType().FullName}: {ex?.Message}\n{ex?.StackTrace}");
+};
+TaskScheduler.UnobservedTaskException += (_, e) =>
+{
+    CrashLog.Write($"UNOBSERVED TASK: {e.Exception}");
+    e.SetObserved();
+};
+
 // No arguments is the normal case and must not be a usage screen: the user double-clicked the exe
 // because they want it recording, not because they want to read a help text. Everything the run
 // needs comes from config.json, so the default path is the same one --record builds by hand.

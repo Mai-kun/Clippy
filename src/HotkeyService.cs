@@ -133,30 +133,42 @@ public sealed class HotkeyService : IDisposable
                 continue;
             }
 
+            // Breadcrumbs, because a failure here used to end the process with nothing on screen.
+            CrashLog.Write($"hotkey: export of {seconds / 1000.0:F0}s starting");
             try
             {
                 export(seconds / 1000.0);
+                CrashLog.Write("hotkey: export returned normally");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Export failed: {ex.GetType().Name}: {ex.Message}");
+                CrashLog.Write($"hotkey: export threw {ex.GetType().FullName}: {ex.Message}\n{ex.StackTrace}");
             }
         }
     }
 
     private IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam)
     {
-        if (code >= 0 && (wParam.ToInt32() == WM_KEYDOWN || wParam.ToInt32() == WM_SYSKEYDOWN))
+        try
         {
-            var vk = Marshal.ReadInt32(lParam);
-            double? seconds = bindings.TryGetValue(vk, out var configured) ? configured : null;
-
-            if (seconds is { } s)
+            if (code >= 0 && (wParam.ToInt32() == WM_KEYDOWN || wParam.ToInt32() == WM_SYSKEYDOWN))
             {
-                // Everything below is the hook callback, so it stays trivial.
-                Interlocked.Exchange(ref pendingTicks, (long)(s * 1000));
-                work.Set();
+                var vk = Marshal.ReadInt32(lParam);
+                double? seconds = bindings.TryGetValue(vk, out var configured) ? configured : null;
+
+                if (seconds is { } s)
+                {
+                    // Everything below is the hook callback, so it stays trivial.
+                    Interlocked.Exchange(ref pendingTicks, (long)(s * 1000));
+                    work.Set();
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            // This runs inside a native callback: anything thrown here unwinds straight through the
+            // OS message pump and takes the process with it, so it is caught and logged instead.
+            CrashLog.Write($"hotkey hook threw {ex.GetType().FullName}: {ex.Message}");
         }
 
         return CallNextHookEx(hook, code, wParam, lParam);
