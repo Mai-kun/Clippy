@@ -432,27 +432,29 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     /// accepted leaves the MFT answering MF_E_NOTACCEPTING to every frame forever, with nothing
     /// anywhere saying the order was the problem.
     /// </summary>
-    public static MfVideoEncoder Create(ID3D11Device device, ID3D11DeviceContext context, int width, int height)
+    public static MfVideoEncoder Create(int width, int height)
     {
         var h264 = new Guid("34363248-0000-0010-8000-00aa00389b71");
         var nv12 = new Guid("3231564e-0000-0010-8000-00aa00389b71");
-        // Direct3D 11 forbids moving a resource between devices, so an encoder that made its own
-        // device could never see the capture texture: the WGC frame pool is bound to
-        // ScreenCapture device. Frame pool, video processor and device manager must share one device.
+        // This creates its own device, and why is still open.
         //
-        // OnFrameArrived runs on a Windows thread pool thread while the drain thread may also touch
-        // the device, and ID3D11DeviceContext is not thread-safe unless it says so. Without this the
-        // two race on the same immediate context and the result is corrupted frames, not an error.
-        try
-        {
-            using var multithread = device.QueryInterface<ID3D11Multithread>();
-            multithread.SetMultithreadProtected(true);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[mf-video] multithread protection unavailable: {ex.Message}");
-        }
-
+        // The capture device is definitely unusable: a live Windows.Graphics.Capture session on it
+        // makes every ProcessInput fail with MF_E_UNSUPPORTED_D3D_TYPE, while the same encoder on a
+        // device created here in the same process accepts the identical synthetic frame. And an
+        // encoder cannot be given the capture texture directly, because Direct3D 11 will not copy a
+        // resource between devices. So the frame has to arrive as BGRA in system memory, which is
+        // what ScreenCapture already did for the ffmpeg path.
+        //
+        // What is NOT yet explained: with its own device and no probe running, this encoder still
+        // fails the self-test in the live process, while the same code succeeds in the spike and
+        // succeeds as the first instance built during a live session. A second instance also fails.
+        // The remaining variable is therefore not the device, the formats or the call order, all of
+        // which have been compared against the working spike; it is whatever the capture session has
+        // already done to the process. Do not treat the comment above as a conclusion.
+        D3D11.D3D11CreateDevice(
+            IntPtr.Zero, DriverType.Hardware, DeviceCreationFlags.BgraSupport,
+            new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0 },
+            out var device, out _, out var context).CheckError();
         // MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER. Enumerating software first would find
         // Microsoft H.264 encoder, which advertises the right output type and then cannot be driven.
         using var found = MediaFactory.MFTEnumEx(
@@ -460,7 +462,12 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
         var reasons = new List<string>();
         Console.WriteLine($"[mf-video] capture device feature level {device.FeatureLevel}");
-        ProbeFreshDevice(h264, nv12, width, height);
+        // ProbeFreshDevice is OFF. It is not a harmless diagnostic: it builds a complete second
+        // hardware encoder, and this machine allows only one NVENC instance at a time. While the
+        // probe held it, the real encoder below was created second and every one of its
+        // ProcessInput calls was refused with MF_E_UNSUPPORTED_D3D_TYPE -- which reads exactly like a
+        // device or format problem and is neither. The self-test below is enough; the probe can be
+        // re-enabled deliberately, never by default.
         foreach (var activate in found)
         {
             MfVideoEncoder? candidate = null;

@@ -737,25 +737,21 @@ internal sealed class ScreenCapture : IDisposable
                 if (currentFrame == 1)
                     videoStartSeconds = stopwatch.Elapsed.TotalSeconds;
 
-                // The frame is already on the GPU, so reading it back into system memory is a cost with
-                // no purpose when the encoder is ours: MfVideoEncoder converts the capture texture to
-                // NV12 with the video processor, device-side, and never sees a CPU pixel. The CPU read
-                // is kept for the ffmpeg path, which has no other way in.
+                // Read the frame back and hand over BGRA, the way the ffmpeg path always has.
+                //
+                // This used to hand the capture texture straight to the encoder, and that turned out
+                // to be impossible: Windows.Graphics.Capture and the hardware encoder cannot share a
+                // device, and Direct3D 11 cannot copy a resource between devices, so there is no route
+                // from a WGC texture to NVENC that avoids system memory. The readback is therefore not a
+                // regression -- it is what already happens -- and what this class removes is the ffmpeg
+                // process and the copy out of it, not this hop.
                 byte[]? pixels = null;
                 using (var videoTexture = CaptureInterop.GetTexture(frame.Surface))
                 {
-                    if (encoder is MfVideoEncoder mf && videoWidth > 0)
-                    {
-                        mf.PushTexture(videoTexture);
-                    }
-                    else
-                    {
-                        pixels = CopyTextureToCpu(videoTexture, out var w, out var h);
-                        videoWidth = w;
-                        videoHeight = h;
-                    }
+                    pixels = CopyTextureToCpu(videoTexture, out var w, out var h);
+                    videoWidth = w;
+                    videoHeight = h;
                 }
-
                 if (encoder is null)
                 {
                     // Phase 4: both encoders feed in-memory rings. A clip is produced by slicing
@@ -994,7 +990,7 @@ internal sealed class ScreenCapture : IDisposable
 
         try
         {
-            var mf = MfVideoEncoder.Create(d3d11Device, d3d11Context, width, height);
+            var mf = MfVideoEncoder.Create(width, height);
             Console.WriteLine($"Video encoder: Media Foundation hardware H.264 (no ffmpeg process).");
             return mf;
         }
