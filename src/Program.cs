@@ -210,7 +210,6 @@ static int PrintUsage()
     Console.WriteLine("  --test-parsers             H.264 / AAC parser self-test");
     Console.WriteLine("  --test-ring                ring buffer self-test");
     Console.WriteLine("  --test-mp4                 MP4 writer self-test");
-    Console.WriteLine("  --test-nvenc-native       spike: can the native NVENC bridge encode a real BGRA texture?");
     Console.WriteLine("  --test-nvenc-native       spike: can the native NVENC bridge encode a BGRA texture?");
     Console.WriteLine("  --test-mft-audio          spike: can the system AAC encoder emit ADTS?");
     Console.WriteLine("  --test-mft-video          spike: can a system H.264 MFT be driven at all?");

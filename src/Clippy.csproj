@@ -12,6 +12,10 @@
     <!-- Reflection-based JSON and any other trimmed-away metadata should fail the build loudly in
          CI rather than throwing at runtime on a user's machine. -->
     <TrimMode>partial</TrimMode>
+
+    <!-- The icon for the executable, and the source for the taskbar, the Alt-Tab entry and the tray:
+         TrayIcon reads it back out of this binary with ExtractIconW, so all four show the same thing. -->
+    <ApplicationIcon>assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>

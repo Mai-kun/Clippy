@@ -24,6 +24,9 @@ AppId={{7C4B1D2E-9F3A-4A5B-8C6D-1E2F3A4B5C6D}
 AppName={#AppName}
 AppVersion={#PublishVersion}
 AppPublisher=Clippy Authors
+;   Icon for the installer itself and for the shortcuts it creates. Every path in this script is
+;   relative to it, so the same relative walk reaches into src\assets for the application icon.
+SetupIconFile=..\src\assets\app.ico
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
 OutputBaseFilename=Clippy-Setup

@@ -197,6 +197,45 @@ public sealed partial class TrayIcon : IDisposable
     [LibraryImport("user32.dll", EntryPoint = "LoadIconW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial nint LoadIcon(nint instance, nint name);
 
+    // Extracts an icon embedded in an executable, by path. This is how the tray picks up whatever
+    // ApplicationIcon put in the csproj, so the taskbar, the Alt-Tab entry, the Explorer icon and the
+    // tray all show the same thing instead of drifting apart.
+    //
+    // hInstance is NULL on purpose: that makes the shell read the icon out of the file on disk, which
+    // is the icon as installed. Passing our own module handle would look it up in the loaded image
+    // instead, which also works but ties the result to this run rather than to the executable.
+    [LibraryImport("shell32.dll", EntryPoint = "ExtractIconW", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial nint ExtractIcon(nint instance, string exePath, uint iconIndex);
+
+    /// <summary>
+    /// The application's own icon, or the generic system one when it cannot be read.
+    /// </summary>
+    /// <remarks>
+    /// ExtractIconW answers with the value 1, not NULL, when the index is out of range or the file
+    /// carries no icons, so both have to be treated as failure. Checking only for NULL leaves a
+    /// bogus handle in the notification data and the tray shows nothing at all -- a failure that
+    /// looks identical to "the shell ignored us".
+    /// <para>
+    /// The handle is deliberately never destroyed. The shell does not own icons returned by
+    /// ExtractIconW and never frees them, and this one has to stay valid for the life of the tray
+    /// icon; leaking a single 32x32 handle in a process that may run for days is cheaper than
+    /// handing the shell a freed icon.
+    /// </para>
+    /// </remarks>
+    private static nint LoadApplicationIcon()
+    {
+        var path = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(path))
+        {
+            var icon = ExtractIcon(0, path, 0);
+            if (icon != 0 && icon != 1)
+                return icon;
+        }
+
+        Console.WriteLine($"Tray: no embedded icon found in {path ?? "(unknown path)"}, using the system one.");
+        return LoadIcon(0, new nint(IDI_APPLICATION));
+    }
+
     [LibraryImport("user32.dll", EntryPoint = "CreatePopupMenu")]
     private static partial nint CreatePopupMenu();
 
@@ -380,9 +419,9 @@ public sealed partial class TrayIcon : IDisposable
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
 
-        // IDI_APPLICATION is a MAKEINTRESOURCE id, i.e. the bare number as a pointer. Passing it as a
-        // string made LoadIconW look for a named icon called "32512" and return 0.
-        nid.hIcon = LoadIcon(0, new nint(IDI_APPLICATION));
+        // The icon embedded in this executable. Replaces IDI_APPLICATION, which put the generic
+        // window glyph in the tray no matter what the exe carried.
+        nid.hIcon = LoadApplicationIcon();
 
         // Copies straight into the inline UTF-16 buffer. CopyFrom stops at the NUL, so the rest of
         // the array stays zeroed as the default initialisation left it.
