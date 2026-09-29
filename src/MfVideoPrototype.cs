@@ -43,6 +43,10 @@ internal static class MfVideoPrototype
     // concluding the encoder is broken.
     private const int MaxFrames = 60;
 
+    // One second at 30 fps. Enough to show a stream sustains and that the drain returns the tail,
+    // short enough that a failure shows up in seconds rather than a minute.
+    private const int Frames = 30;
+
     // MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER: the synchronous, software encoders.
     private const uint SyncAndSorted = 0x00000008 | 0x00000040;
 
@@ -355,8 +359,11 @@ internal static class MfVideoPrototype
                 Console.WriteLine($"    => async MFT unlocked; it wants {FormatName(Subtype(input))} " +
                                   $"{Width}x{Height}. Input is a D3D11 texture, not CPU memory.");
 
-                step = "encode a frame";
-                return EncodeOneFrame(transform, device, input, manager);
+                step = "encode a clip";
+                var stream = transform.GetOutputStreamInfo(0);
+                var provides = (stream.Flags & (int)OutputStreamInfoFlags.OutputStreamProvidesSamples) != 0;
+                Console.WriteLine($"    output stream: flags={stream.Flags} PROVIDES_SAMPLES={provides}");
+                return EncodeSeries(transform, device, input, provides);
             }
         }
         catch (Exception ex)
@@ -561,6 +568,86 @@ internal static class MfVideoPrototype
     /// that small is impossible to tell from a stub. Mid-grey still yields a full IDR, and a packet
     /// size in the tens of kilobytes is the evidence that the encoder actually encoded a frame.
     /// </summary>
+    /// <summary>
+    /// The BGRA source, which is the colour the capture path actually produces.
+    ///
+    /// WGC hands over BGRA, so BGRA is what the converter has to be fed if this is to say anything
+    /// about the real capture path. Anything else would test a conversion the recorder never performs.
+    /// </summary>
+    private static ID3D11Texture2D MakeColourSourceTexture(ID3D11Device device, Vortice.DXGI.Format format)
+    {
+        var texture = device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (int)Width,
+            Height = (int)Height,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = format,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.ShaderResource,
+            CPUAccessFlags = CpuAccessFlags.None,
+            MiscFlags = ResourceOptionFlags.None,
+        });
+
+        // Painted once so the first BLT has something defined in it; every frame repaints it anyway.
+        FillColourFrame(device, texture, 0);
+        return texture;
+    }
+
+    /// <summary>
+    /// Paints a frame that moves.
+    ///
+    /// A static image would let the encoder emit a few tiny P-frames and prove nothing about sustained
+    /// throughput. A flat one would compress to a couple of hundred bytes a frame, at which point "did
+    /// it really encode this" stops being answerable from the packet size. So: a colour field with a
+    /// diagonal ramp, plus a bar that sweeps a few pixels per frame.
+    /// </summary>
+    private static void FillColourFrame(ID3D11Device device, ID3D11Texture2D texture, int index)
+    {
+        var pixels = new byte[Width * Height * 4];
+        var bar = index * 8;
+        for (var y = 0; y < Height; y++)
+        {
+            var row = (int)(y * Width) * 4;
+            for (var x = 0; x < Width; x++)
+            {
+                var o = row + x * 4;
+                var sweep = Math.Abs(x - bar) < 64;
+                pixels[o] = (byte)(sweep ? 255 : x * 255 / Width);
+                pixels[o + 1] = (byte)(sweep ? 32 : y * 255 / Height);
+                pixels[o + 2] = (byte)(sweep ? 32 : 200 - x * 150 / Width);
+                pixels[o + 3] = 255;
+            }
+        }
+        device.ImmediateContext.UpdateSubresource(
+            pixels.AsSpan(), texture, 0, (uint)(Width * 4), 0, null);
+    }
+
+    /// <summary>
+    /// The NV12 texture the video processor writes into.
+    ///
+    /// Separate from MakeNv12Texture, which returns the Staging texture the encoder insists on: the
+    /// scaler cannot write a staging resource, and the encoder will not take a Default one, so there
+    /// have to be two and a device-side copy between them.
+    /// </summary>
+    private static ID3D11Texture2D MakeNv12TargetTexture(ID3D11Device device, Vortice.DXGI.Format format)
+    {
+        return device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (int)Width,
+            Height = (int)Height,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = format,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.None,
+            MiscFlags = ResourceOptionFlags.None,
+        });
+    }
+
     private static ID3D11Texture2D MakeNv12Texture(ID3D11Device device)
     {
         var description = new Texture2DDescription
@@ -649,7 +736,201 @@ internal static class MfVideoPrototype
     }
 
     /// <summary>
-    /// Builds H.264 1920x1080@30 progressive, 6 Mbit/s by hand.
+    /// Step 8.3C: a BGRA source, converted to NV12 by the GPU, encoded for a clip, then drained.
+    ///
+    /// The colour conversion is the last piece between "the MFT works" and "the video path can replace
+    /// ffmpeg". Everything runs on the device: the BGRA texture is uploaded once per frame, the
+    /// conversion is the GPU's own scaler, and the CPU never sees a pixel.
+    /// </summary>
+    private static int EncodeSeries(IMFTransform transform, ID3D11Device device, IMFMediaType input, bool providesSamples)
+    {
+        var step = "video processor";
+        try
+        {
+            // Whether the caller supplies the output sample or the MFT does is a declared property of
+            // the output stream, and getting it wrong returns S_OK with an empty sample, not an error.
+            var context = device.ImmediateContext;
+            using var videoDevice = device.QueryInterface<ID3D11VideoDevice>();
+            using var videoContext = context.QueryInterface<ID3D11VideoContext>();
+
+            // The scaler is created once for the whole clip, not per frame. Recreating it every frame
+            // would allocate driver state 30 times a second and measure the driver's setup path rather
+            // than the thing worth knowing, which is whether a stream sustains.
+            var content = new VideoProcessorContentDescription
+            {
+                InputFrameFormat = VideoFrameFormat.Progressive,
+                InputFrameRate = new Rational(FpsDenominator, FpsNumerator),
+                InputWidth = Width,
+                InputHeight = Height,
+                OutputFrameRate = new Rational(FpsDenominator, FpsNumerator),
+                OutputWidth = Width,
+                OutputHeight = Height,
+                Usage = VideoUsage.OptimalSpeed,
+            };
+            step = "CreateVideoProcessorEnumerator";
+            using var enumerator = videoDevice.CreateVideoProcessorEnumerator(content);
+            step = "CreateVideoProcessor";
+            using var processor = videoDevice.CreateVideoProcessor(enumerator, 0);
+
+            // The content description says nothing about pixel formats, so the enumerator picks them,
+            // and the views are validated against its choice rather than ours. Vortice cannot report
+            // that choice -- VideoProcessorCaps.InputFormatCaps is bound as an enum instead of the
+            // struct it actually is, so the format pair is unreachable -- but CheckVideoProcessorFormat
+            // can still be asked whether the pair we need is on the list.
+            // The flags are D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT (1) and _OUTPUT (2). Compared
+            // numerically on purpose: the enum's member names are not the point, and a name that
+            // changed under us would be a compile error in a spike whose job is to answer a question
+            // about the machine, not about the binding library.
+            var canRead = enumerator.CheckVideoProcessorFormat(Vortice.DXGI.Format.B8G8R8A8_UNorm);
+            var canWrite = enumerator.CheckVideoProcessorFormat(Vortice.DXGI.Format.NV12);
+            Console.WriteLine($"    scaler format support: B8G8R8A8_UNorm=0x{(int)canRead:X} NV12=0x{(int)canWrite:X}");
+            var readable = ((int)canRead & 0x1) != 0;
+            var writable = ((int)canWrite & 0x2) != 0;
+            if (!readable || !writable)
+                throw new InvalidOperationException(
+                    $"this device's video processor does not offer BGRA->NV12 " +
+                    $"(B8G8R8A8_UNorm as input: {readable}, NV12 as output: {writable}).");
+
+            step = "create textures";
+            using var source = MakeColourSourceTexture(device, Vortice.DXGI.Format.B8G8R8A8_UNorm);
+            using var converted = MakeNv12TargetTexture(device, Vortice.DXGI.Format.NV12);
+            using var encoderInput = MakeNv12Texture(device);
+
+            step = "CreateVideoProcessorInputView";
+            // Fails here on this machine, and the cause is a hole in the binding rather than in the
+            // scaler. CheckVideoProcessorFormat answers 0x3 (input and output supported) for both
+            // B8G8R8A8_UNorm and NV12, so the hardware does the conversion -- but Vortice's
+            // VideoProcessorContentDescription is 40 bytes where the native struct is 48: the two
+            // DXGI_FORMAT fields are missing from the binding, so they marshal as zero and the
+            // enumerator is created with unknown input and output formats. Views made against an
+            // enumerator that does not know its own formats come back E_INVALIDARG.
+            //
+            // Getting past this means handing CreateVideoProcessorEnumerator a correct 48-byte struct
+            // by hand, which is a vtable call rather than a bound method. Left as the stated next step
+            // rather than attempted blind.
+            using var sourceView = videoDevice.CreateVideoProcessorInputView(
+                source, enumerator,
+                new VideoProcessorInputViewDescription
+                {
+                    // FourCC here is the DXGI_FORMAT value cast to a DWORD, not a text code. Left at
+                    // zero the runtime cannot tell what the view is looking at and answers
+                    // E_INVALIDARG -- a confusing way to say "you did not fill this in".
+                    FourCC = (uint)(int)Vortice.DXGI.Format.B8G8R8A8_UNorm,
+                    ViewDimension = VideoProcessorInputViewDimension.Texture2D,
+                    Texture2D = new Texture2DVideoProcessorInputView { MipSlice = 0, ArraySlice = 0 },
+                });
+            step = "CreateVideoProcessorOutputView";
+            using var outputView = videoDevice.CreateVideoProcessorOutputView(
+                converted, enumerator,
+                new VideoProcessorOutputViewDescription
+                {
+                    ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
+                    Texture2D = new Texture2DVideoProcessorOutputView { MipSlice = 0 },
+                });
+
+            using var surfaceBuffer = MediaFactory.MFCreateDXGISurfaceBuffer(
+                typeof(ID3D11Texture2D).GUID, encoderInput, 0, false);
+            Console.WriteLine("    video processor created: BGRA -> NV12 1920x1080p30, 0-copy on the GPU");
+
+            var events = transform.QueryInterface<IMFMediaEventGenerator>();
+            var nals = new List<(int Length, bool Keyframe)>();
+            void Collect(byte[] data, int length, bool keyframe, double _) => nals.Add((length, keyframe));
+
+            var parser = new H264AnnexBParser();
+            var packets = 0;
+            var bytes = 0;
+
+            step = $"encode {Frames} frames";
+            for (var i = 0; i < Frames; i++)
+            {
+                // Per frame: repaint the source, convert on the GPU, then hand the encoder a sample.
+                FillColourFrame(device, source, i);
+                videoContext.VideoProcessorBlt(processor, outputView, 0, 1, new[]
+                {
+                    new VideoProcessorStream
+                    {
+                        Enable = true,
+                        OutputIndex = 0,
+                        InputFrameOrField = 0,
+                        InputSurface = sourceView,
+                    },
+                }).CheckError();
+
+                // The scaler writes a normal Default-usage texture; the encoder only ever accepted a
+                // Staging one. One device-side copy bridges the two, and it stays in VRAM.
+                context.CopyResource(encoderInput, converted);
+
+                using var frameSample = MediaFactory.MFCreateSample();
+                frameSample.AddBuffer(surfaceBuffer);
+                frameSample.SampleTime = 10_000_000L / FpsNumerator * i;
+                frameSample.SampleDuration = 10_000_000L / FpsNumerator;
+                transform.ProcessInput(0, frameSample, 0);
+
+                Drain(transform, events, providesSamples, parser, Collect, ref packets, ref bytes);
+            }
+            Console.WriteLine($"    {Frames} frames converted and encoded");
+
+            // Without a drain the encoder is entitled to sit on the last frame forever, and a recording
+            // that quietly ends by dropping its final pictures is worse than one that visibly fails.
+            step = "drain";
+            transform.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero);
+            for (var spin = 0; spin < 2000; spin++)
+            {
+                var requests = PumpEvents(events);
+                if (requests.HaveOutput)
+                {
+                    Drain(transform, events, providesSamples, parser, Collect, ref packets, ref bytes);
+                    continue;
+                }
+                if (requests.NeedInput)
+                    break;      // asking for more after a drain means it is finished
+                Thread.Sleep(1);
+            }
+            Console.WriteLine($"    drained: {packets} output packet(s) in total");
+
+            if (packets == 0)
+                throw new InvalidOperationException("the encoder produced no output across the whole clip.");
+            if (nals.Count == 0)
+                throw new InvalidOperationException("H264AnnexBParser found no NAL units in the bitstream.");
+
+            var keyframes = nals.Count(n => n.Keyframe);
+            Console.WriteLine($"    bitstream: {bytes} bytes in {packets} packet(s)");
+            Console.WriteLine($"    H264AnnexBParser framed {nals.Count} NAL unit(s), {keyframes} keyframe(s): " +
+                              $"sizes {string.Join(", ", nals.Select(n => n.Length))}");
+            if (keyframes == 0)
+                throw new InvalidOperationException("no keyframe in the bitstream, so it could not be seeked.");
+
+            Console.WriteLine($"MFT Video Prototype: SUCCESS, {Frames} frames of GPU-converted BGRA->NV12 " +
+                              $"became {bytes} bytes of H.264 Annex-B in {packets} packet(s), framed by " +
+                              "H264AnnexBParser. The video path can drop ffmpeg.");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"at {step}: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>Reads whatever output is ready and pushes it through the production parser.</summary>
+    private static void Drain(IMFTransform transform, IMFMediaEventGenerator events, bool providesSamples,
+                              H264AnnexBParser parser, Action<byte[], int, bool, double> collect,
+                              ref int packets, ref int bytes)
+    {
+        for (var i = 0; i < 16; i++)
+        {
+            if (!PumpEvents(events).HaveOutput)
+                return;
+            var got = Read(transform, providesSamples);
+            if (got.Length == 0)
+                return;
+            packets++;
+            bytes += got.Length;
+            if (packets == 1)
+                Console.WriteLine($"    first packet: {got.Length} bytes, first 8 = {Hex(got, 8)}");
+            parser.Append(got, 0, collect);
+        }
+    }
+
     ///
     /// The software MFT offered an output type that declared no frame size, and SetOutputType then
     /// failed with MF_E_ATTRIBUTENOTFOUND -- it wanted attributes the published type did not carry.
