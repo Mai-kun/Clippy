@@ -129,23 +129,42 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     /// </remarks>
     public void PushTexture(ID3D11Texture2D source)
     {
-        // The input view was built over cpuSource, and a video processor view is bound to one texture
-        // for life -- so the capture frame has to be copied into it first. It is a device-side copy of
-        // a 1080p BGRA surface, roughly 8 MB, and the CPU never sees it; what this avoids is the staging
-        // map and the 8 MB managed allocation per frame that CopyTextureToCpu does, which is the cost
-        // that actually matters at 30 fps.
-        context.CopyResource(cpuSource, source);
-
-        var stream = new VideoProcessorStream
+        // MF_E_UNSUPPORTED_D3D_TYPE (0xC00D36D5) is a Media Foundation code; DirectX cannot raise it.
+        // So it comes from one of exactly two places -- the surface buffer, or ProcessInput -- and
+        // every step here is logged with its own HRESULT to find out which. Each step is also named,
+        // because an exception that arrives with a step label instead of a bare code is the only
+        // difference between a five-minute diagnosis and an afternoon.
+        var step = "describe WGC texture";
+        try
         {
-            Enable = true,
-            OutputIndex = 0,
-            InputFrameOrField = 0,
-            InputSurface = sourceView,
-        };
-        videoContext.VideoProcessorBlt(videoProcessor, targetView, 0, 1, new[] { stream }).CheckError();
-        context.CopyResource(nv12Staging, nv12Target);
-        SubmitFrame();
+            var d = source.Description;
+            Console.WriteLine($"[mf-video] wgc desc: {d.Width}x{d.Height} format={d.Format} " +
+                              $"usage={d.Usage} bind={d.BindFlags} cpu={d.CPUAccessFlags} " +
+                              $"mips={d.MipLevels} array={d.ArraySize}");
+
+            step = "CopyResource(wgc -> cpuSource)";
+            context.CopyResource(cpuSource, source);
+
+            step = "VideoProcessorBlt";
+            var stream = new VideoProcessorStream
+            {
+                Enable = true,
+                OutputIndex = 0,
+                InputFrameOrField = 0,
+                InputSurface = sourceView,
+            };
+            videoContext.VideoProcessorBlt(videoProcessor, targetView, 0, 1, new[] { stream }).CheckError();
+
+            step = "CopyResource(nv12Target -> nv12Staging)";
+            context.CopyResource(nv12Staging, nv12Target);
+
+            step = "ProcessInput";
+            SubmitFrame();
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"mf-video step '{step}' failed: {ex.Message}", ex);
+        }
     }
 
     private void SubmitFrame()
@@ -440,6 +459,8 @@ internal sealed class MfVideoEncoder : IVideoEncoder
             TransformCategoryGuids.VideoEncoder, 0x00000004 | 0x00000040, null, null);
 
         var reasons = new List<string>();
+        Console.WriteLine($"[mf-video] capture device feature level {device.FeatureLevel}");
+        ProbeFreshDevice(h264, nv12, width, height);
         foreach (var activate in found)
         {
             MfVideoEncoder? candidate = null;
@@ -459,6 +480,55 @@ internal sealed class MfVideoEncoder : IVideoEncoder
             "no usable H.264 Media Foundation encoder on this machine. Media Foundation needs a " +
             "registered hardware encoder; the software one that ships with Windows is present but " +
             "does not work. Tried: " + string.Join("; ", reasons));
+    }
+
+    /// <summary>
+    /// Runs the same self-test on a device made here, in the same process, and prints the result.
+    ///
+    /// ScreenCapture's device is not a plain D3D11CreateDevice: it is wrapped out of a DXGI device with
+    /// CreateDirect3D11DeviceFromDXGIDevice, which is what Windows.Graphics.Capture requires, and a
+    /// device obtained that way is not guaranteed to have the same feature set as one created
+    /// directly. The self-test on the capture device already failed, so this is the one comparison
+    /// left that settles it: same code, same process, same moment, two devices. If this one passes,
+    /// the encoder is fine and the capture device is what the MFT objects to.
+    /// </summary>
+    private static void ProbeFreshDevice(Guid h264, Guid nv12, int width, int height)
+    {
+        try
+        {
+            D3D11.D3D11CreateDevice(
+                IntPtr.Zero, DriverType.Hardware, DeviceCreationFlags.BgraSupport,
+                new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0 },
+                out var fresh, out _, out _).CheckError();
+            using (fresh)
+            {
+                Console.WriteLine($"[mf-video] fresh device feature level {fresh.FeatureLevel}");
+                foreach (var activate in MediaFactory.MFTEnumEx(
+                    TransformCategoryGuids.VideoEncoder, 0x00000004 | 0x00000040, null, null))
+                {
+                    try
+                    {
+                        Build(activate, h264, nv12, width, height, fresh, fresh.ImmediateContext).Dispose();
+                        return;
+                    }
+                    catch (SharpGenException ex) when (ex.HResult == 0xC00D36BD)
+                    {
+                        // MF_E_INVALIDTYPE: that candidate is the HEVC encoder, which is not the one
+                        // under test. Carry on to the next rather than calling the probe failed --
+                        // stopping here would have reported a device verdict for a codec mismatch.
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[mf-video] fresh-device probe failed: {ex.Message}");
+                        return;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[mf-video] fresh-device probe could not run: {ex.Message}");
+        }
     }
 
     private static MfVideoEncoder Build(
@@ -546,10 +616,90 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
         var surfaceBuffer = MediaFactory.MFCreateDXGISurfaceBuffer(
             typeof(ID3D11Texture2D).GUID, nv12Staging, 0, false);
+        Console.WriteLine($"[mf-video] MFCreateDXGISurfaceBuffer accepted; encoding {width}x{height}");
+
+        // Isolation test, run once at construction while nothing else is running.
+        //
+        // The spike encoded 30 frames on a device it created itself, in an empty process. This runs the
+        // identical sequence on the capture device, with a synthetic frame, before any real capture
+        // exists. It is a two-way switch: if it passes, the device, the manager and the encoder are
+        // sound and the fault is in what WGC hands over or in when ProcessInput is called; if it fails,
+        // the fault is in the setup and is here, in a log with nothing else moving around it.
+        RunSelfTest(transform, surfaceBuffer, width, height);
 
         return new MfVideoEncoder(
             transform, device, deviceContext, videoDevice, videoContext, processor,
             sourceView, targetView, cpuSource, nv12Target, nv12Staging, surfaceBuffer, width, height);
+    }
+
+    /// <summary>
+    /// Pushes one synthetic frame through a fully configured encoder and says whether it worked.
+    ///
+    /// Everything here is the spike's sequence, unchanged, on the capture device. There is no capture
+    /// session yet and no other thread, so whatever this reports is a property of the encoder
+    /// configuration alone -- which is the point. The output of a frame the encoder will actually
+    /// receive is discarded: the drain thread has not started and the ring does not exist yet, so the
+    /// bytes go nowhere and the first real frame's access unit is the second one out of the encoder.
+    /// That costs one frame of timestamps at startup and saves guessing about a 5-byte error code.
+    /// </summary>
+    private static void RunSelfTest(IMFTransform transform, IMFMediaBuffer surfaceBuffer, int width, int height)
+    {
+        var step = "self-test: create sample";
+        try
+        {
+            using var sample = MediaFactory.MFCreateSample();
+            sample.AddBuffer(surfaceBuffer);
+            sample.SampleTime = 0;
+            sample.SampleDuration = 10_000_000L / Fps;
+
+            step = "self-test: ProcessInput";
+            transform.ProcessInput(0, sample, 0);
+            Console.WriteLine("[mf-video] SELF-TEST: synthetic NV12 frame accepted by ProcessInput.");
+            Console.WriteLine("[mf-video] => the device, the device manager and the encoder are sound. " +
+                              "Any MF_E_UNSUPPORTED_D3D_TYPE in the live path comes from the WGC texture " +
+                              "or from calling ProcessInput when the MFT is not asking for a frame.");
+
+            step = "self-test: read output";
+            var info = transform.GetOutputStreamInfo(0);
+            var provides = (info.Flags & (int)OutputStreamInfoFlags.OutputStreamProvidesSamples) != 0;
+            using var probe = MediaFactory.MFCreateSample();
+            var data = new OutputDataBuffer { StreamID = 0, Sample = provides ? null : probe };
+            if (!provides)
+                probe.AddBuffer(MediaFactory.MFCreateMemoryBuffer(4 * 1024 * 1024));
+            for (var i = 0; i < 32; i++)
+            {
+                try
+                {
+                    transform.ProcessOutput(ProcessOutputFlags.None, 1, ref data, out _).CheckError();
+                }
+                catch (SharpGenException ex) when (ex.HResult is NeedsMoreInput or NotAccepting or Unexpected)
+                {
+                    System.Threading.Thread.Sleep(5);
+                    continue;
+                }
+
+                var produced = data.Sample ?? probe;
+                if (produced is null)
+                    break;
+                using var contiguous = produced.ConvertToContiguousBuffer();
+                contiguous.Lock(out _, out _, out var length);
+                contiguous.Unlock();
+                if (length > 0)
+                {
+                    Console.WriteLine($"[mf-video] SELF-TEST: first output packet {length} bytes. " +
+                                      "The whole path works; nothing is broken in the encoder.");
+                    return;
+                }
+            }
+            Console.WriteLine("[mf-video] SELF-TEST: ProcessInput succeeded but no output arrived " +
+                              "within 32 attempts.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[mf-video] SELF-TEST FAILED at {step}: {ex.Message}");
+            Console.WriteLine("[mf-video] => the failure is in the encoder configuration itself, on the " +
+                              "capture device, with no capture running. That is where to look next.");
+        }
     }
 
     private static IMFMediaType BuildType(Guid subtype, int width, int height)
