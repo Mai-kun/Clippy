@@ -4,6 +4,9 @@ using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 using Vortice.MediaFoundation;
+using Windows.Graphics.Capture;
+using Windows.Graphics.DirectX;
+using Windows.Graphics.DirectX.Direct3D11;
 
 namespace Clippy;
 
@@ -63,7 +66,7 @@ internal static class MfVideoPrototype
         MediaFactory.MFStartup(useLightVersion: false).CheckError();
         try
         {
-            return Probe();
+            return Probe(withLiveCapture: false);
         }
         finally
         {
@@ -72,8 +75,72 @@ internal static class MfVideoPrototype
         }
     }
 
-    private static int Probe()
+    /// <summary>
+    /// Run the spike's own 30-frame loop with a real Windows.Graphics.Capture session already running.
+    ///
+    /// The spike encodes 30 frames in an empty process and the production encoder is refused in one
+    /// with a capture running, and everything inside the encoder has been compared and found identical.
+    /// So the only honest way to tell "the encoder is broken" from "capture monopolises the DXVA path on
+    /// this driver" is to run the same loop here with the session up and see which happens.
+    /// </summary>
+    public static int RunWithLiveCapture() => Probe(withLiveCapture: true);
+
+    private sealed class Disposable(Action dispose) : IDisposable
     {
+        public void Dispose() => dispose();
+    }
+
+    private static IDisposable? StartLiveCaptureSession()
+    {
+        try
+        {
+            D3D11.D3D11CreateDevice(
+                IntPtr.Zero, DriverType.Hardware, DeviceCreationFlags.BgraSupport,
+                new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0 },
+                out var d3dDevice, out _, out _).CheckError();
+            var direct3DDevice = CaptureInterop.CreateDirect3DDevice(d3dDevice);
+            var item = CaptureInterop.CreateItemForPrimaryMonitor();
+            var pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
+                direct3DDevice, DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, item.Size);
+            var session = pool.CreateCaptureSession(item);
+            session.IsBorderRequired = false;
+
+            // Drain the pool while it runs, so the driver is doing the work it does in the recorder
+            // rather than merely holding a session open.
+            var stop = new CancellationTokenSource();
+            var pump = new Thread(() =>
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    using var frame = pool.TryGetNextFrame();
+                    if (frame is null)
+                        Thread.Sleep(4);
+                }
+            })
+            { IsBackground = true, Name = "spike wgc pump" };
+            pump.Start();
+            session.StartCapture();
+            Console.WriteLine("A live Windows.Graphics.Capture session is running on the primary monitor.");
+            return new Disposable(() =>
+            {
+                stop.Cancel();
+                // GraphicsCaptureSession has no Stop/Close in this projection; dropping the
+                // pool ends the session, which is all a diagnostic teardown needs.
+                pool.Dispose();
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Could not start a capture session: {ex.Message}");
+            Console.WriteLine("This run proves nothing about a live session; it is the empty-process case.");
+            return null;
+        }
+    }
+    private static int Probe(bool withLiveCapture)
+    {
+        using var live = withLiveCapture ? StartLiveCaptureSession() : null;
+        if (live is not null)
+            Thread.Sleep(750);   // let the session reach a steady state before measuring
         Console.WriteLine("MFT video encoders on this machine");
         Console.WriteLine("=================================");
         var driven = 0;

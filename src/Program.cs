@@ -63,10 +63,11 @@ if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
     return PrintUsage();
 }
 
-if (args.Contains("--test-mft-video"))
-{
-    return MfVideoPrototype.Run();
-}
+  if (args.Contains("--test-mft-video-wgc"))
+      return MfVideoPrototype.RunWithLiveCapture();
+
+  if (args.Contains("--test-mft-video"))
+      return MfVideoPrototype.Run();
 
 if (args.Contains("--test-mft-audio"))
 {
@@ -208,6 +209,7 @@ static int PrintUsage()
     Console.WriteLine("  --test-mp4                 MP4 writer self-test");
     Console.WriteLine("  --test-mft-audio          spike: can the system AAC encoder emit ADTS?");
     Console.WriteLine("  --test-mft-video          spike: can a system H.264 MFT be driven at all?");
+    Console.WriteLine("  --test-mft-video-wgc      the same spike, with a live capture session running");
     Console.WriteLine();
     Console.WriteLine($"Config: {ClippyConfig.Path}");
     return 0;
