@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
@@ -96,7 +96,7 @@ internal sealed class AudioCapture : IDisposable
             .WithLoopbackCapture()
             // NOTE: NAudio's WasapiRecorderBuilder exposes no way to change the buffer size (no
             // BufferMilliseconds, and WithLoopbackCapture takes none), so the 100 ms default stays.
-            // It is not needed: the AudioEncoder now anchors on qpcPosition rather than on arrival,
+            // It is not needed: the FfmpegAudioEncoder now anchors on qpcPosition rather than on arrival,
             // which removes the buffer age from the timeline instead of trying to shrink it.
             .Build();
         recorder.DataAvailable += handler;

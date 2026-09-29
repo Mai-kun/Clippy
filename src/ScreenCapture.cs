@@ -762,14 +762,14 @@ internal sealed class ScreenCapture : IDisposable
                         {
                             audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
                             audio = new AudioCapture(stopwatch, videoStartSeconds);
-                            audioEncoder = AudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing, masterZeroSeconds, logDirectory: logsDirectory);
+                            audioEncoder = FfmpegAudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing, masterZeroSeconds, logDirectory: logsDirectory);
                             audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
                             // An f32le input probes without data, so audio reaches ready on its own.
                             audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
                             Console.WriteLine($"Audio: system loopback [{audio.Format}]");
                         }
 
-                        encoder = FfmpegEncoder.StartWithFallback(
+                        encoder = FfmpegVideoEncoder.StartWithFallback(
                             videoOnlyPath,
                             videoWidth,
                             videoHeight,
@@ -783,7 +783,7 @@ internal sealed class ScreenCapture : IDisposable
                     }
                     else
                     {
-                        encoder = FfmpegEncoder.StartWithFallback(
+                        encoder = FfmpegVideoEncoder.StartWithFallback(
                             videoPath,
                             videoWidth,
                             videoHeight,
@@ -938,7 +938,7 @@ internal sealed class ScreenCapture : IDisposable
         if (!hadEncoder || videoPath is null || ring is null)
             return;
 
-        encoder = FfmpegEncoder.StartWithFallback(
+        encoder = FfmpegVideoEncoder.StartWithFallback(
             videoOnlyPath ?? videoPath,
             newWidth,
             newHeight,

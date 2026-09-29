@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.Diagnostics;
 
 namespace Clippy;
@@ -7,10 +7,10 @@ namespace Clippy;
 /// Writes captured frames straight into a child ffmpeg process as raw BGRA over stdin.
 /// No ring buffer: the caller serialises writes, and a slow encoder simply drops capture pace.
 ///
-/// Audio is NOT handled here: it runs in its own process (AudioEncoder). Two live inputs in one
+/// Audio is NOT handled here: it runs in its own process (FfmpegAudioEncoder). Two live inputs in one
 /// ffmpeg deadlocked — measured 6 audio packets read out of ~450 while video flowed fine.
 /// </summary>
-internal sealed class FfmpegEncoder : IVideoEncoder
+internal sealed class FfmpegVideoEncoder : IVideoEncoder
 {
     private readonly Process process;
     private readonly Stream stdin;
@@ -24,7 +24,7 @@ internal sealed class FfmpegEncoder : IVideoEncoder
     private int startedWrites;
     private bool disposed;
 
-    private FfmpegEncoder(
+    private FfmpegVideoEncoder(
         Process process,
         Stream stdin,
         string outputPath,
@@ -94,7 +94,7 @@ internal sealed class FfmpegEncoder : IVideoEncoder
         };
     }
 
-    public static FfmpegEncoder Start(
+    public static FfmpegVideoEncoder Start(
         string outputPath,
         int width,
         int height,
@@ -199,7 +199,7 @@ internal sealed class FfmpegEncoder : IVideoEncoder
         process.BeginErrorReadLine();
 
         var stdin = process.StandardInput.BaseStream;
-        return new FfmpegEncoder(process, stdin, outputPath, logDirectory, stopwatch, timingLog, debugLog, gate);
+        return new FfmpegVideoEncoder(process, stdin, outputPath, logDirectory, stopwatch, timingLog, debugLog, gate);
     }
 
     /// <summary>
@@ -209,7 +209,7 @@ internal sealed class FfmpegEncoder : IVideoEncoder
     /// single frame, so the process exits within milliseconds. That makes a short probe window a
     /// reliable signal and lets Clippy work on an AMD or Intel machine instead of failing to record.
     /// </summary>
-    public static FfmpegEncoder StartWithFallback(
+    public static FfmpegVideoEncoder StartWithFallback(
         string outputPath,
         int width,
         int height,
@@ -398,7 +398,7 @@ internal sealed class FfmpegEncoder : IVideoEncoder
     public void Write(byte[] bgraPixels, double systemTimeMs)
     {
         if (disposed)
-            throw new ObjectDisposedException(nameof(FfmpegEncoder));
+            throw new ObjectDisposedException(nameof(FfmpegVideoEncoder));
 
         var index = ++startedWrites;
         var captureMs = stopwatch.Elapsed.TotalMilliseconds;

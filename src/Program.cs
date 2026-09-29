@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using Clippy;
 
@@ -150,7 +150,7 @@ if (args.FirstOrDefault() == "--record")
 
 if (args.FirstOrDefault() == "--test-audio-timeline")
 {
-    return Clippy.AudioEncoder.SelfTest() ? 0 : 1;
+    return Clippy.FfmpegAudioEncoder.SelfTest() ? 0 : 1;
 }
 
 if (args.FirstOrDefault() == "--capture")

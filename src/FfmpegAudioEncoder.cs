@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 
 namespace Clippy;
@@ -15,7 +15,7 @@ namespace Clippy;
 /// ponytail: WASAPI delivers 10 ms packets, so a bounded queue (default 512, ~5 s) absorbs bursts
 /// without unbounded growth. Overflow is counted, never silent.
 /// </summary>
-internal sealed class AudioEncoder : IAudioEncoder
+internal sealed class FfmpegAudioEncoder : IAudioEncoder
 {
     private readonly Process process;
     private readonly Stream stdin;
@@ -33,7 +33,7 @@ internal sealed class AudioEncoder : IAudioEncoder
     private int droppedBuffers;
     private bool disposed;
 
-    private AudioEncoder(
+    private FfmpegAudioEncoder(
         Process process,
         Stream stdin,
         Stopwatch stopwatch,
@@ -53,7 +53,7 @@ internal sealed class AudioEncoder : IAudioEncoder
         this.queueLimit = queueLimit;
     }
 
-    public static AudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, RingBuffer ring, double masterZeroSeconds, int queueLimit = 512, string? logDirectory = null)
+    public static FfmpegAudioEncoder Start(string path, AudioCapture format, Stopwatch stopwatch, RingBuffer ring, double masterZeroSeconds, int queueLimit = 512, string? logDirectory = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         if (File.Exists(path))
@@ -113,7 +113,7 @@ internal sealed class AudioEncoder : IAudioEncoder
         process.BeginErrorReadLine();
 
         var timingLog = new StreamWriter(LogPaths.Resolve(logDirectory, path, ".audio-timing.csv"), append: false) { AutoFlush = true };
-        var encoder = new AudioEncoder(
+        var encoder = new FfmpegAudioEncoder(
             process,
             process.StandardInput.BaseStream,
             stopwatch,
@@ -349,7 +349,7 @@ internal sealed class AudioEncoder : IAudioEncoder
             throw new InvalidOperationException("Audio ffmpeg did not exit within 30s and was killed.");
         }
 
-        // Same lock discipline as FfmpegEncoder: the stderr reader thread writes debugLog.
+        // Same lock discipline as FfmpegVideoEncoder: the stderr reader thread writes debugLog.
         lock (debugLog)
         {
             timingLog.Dispose();
