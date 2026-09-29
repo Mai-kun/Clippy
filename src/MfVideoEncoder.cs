@@ -503,24 +503,27 @@ internal sealed class MfVideoEncoder : IVideoEncoder
             using (fresh)
             {
                 Console.WriteLine($"[mf-video] fresh device feature level {fresh.FeatureLevel}");
+                var n = 0;
                 foreach (var activate in MediaFactory.MFTEnumEx(
                     TransformCategoryGuids.VideoEncoder, 0x00000004 | 0x00000040, null, null))
                 {
+                    n++;
                     try
                     {
                         Build(activate, h264, nv12, width, height, fresh, fresh.ImmediateContext).Dispose();
+                        Console.WriteLine($"[mf-video] FRESH-DEVICE PROBE PASSED on candidate #{n}: a synthetic " +
+                                          "frame went through on a device created here, in this process. " +
+                                          "The capture device is therefore what the MFT objects to.");
                         return;
-                    }
-                    catch (SharpGenException ex) when (ex.HResult == 0xC00D36BD)
-                    {
-                        // MF_E_INVALIDTYPE: that candidate is the HEVC encoder, which is not the one
-                        // under test. Carry on to the next rather than calling the probe failed --
-                        // stopping here would have reported a device verdict for a codec mismatch.
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[mf-video] fresh-device probe failed: {ex.Message}");
-                        return;
+                        // Every candidate is reported, unfiltered. An earlier version tried to skip
+                        // MF_E_INVALIDTYPE as "this is the HEVC encoder" and returned on anything else,
+                        // which meant the probe could print a verdict after testing exactly one
+                        // candidate -- and did, quietly, while looking conclusive.
+                        Console.WriteLine($"[mf-video] fresh-device probe candidate #{n}: " +
+                                          $"{ex.GetType().Name} {ex.Message}");
                     }
                 }
             }
