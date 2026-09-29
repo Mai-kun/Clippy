@@ -219,7 +219,9 @@ internal static class MfVideoPrototype
             Console.WriteLine("    ProcessInput accepted one frame");
 
             step = "ProcessOutput";
-            var encoded = Read(transform);
+            // The software path always wants a caller-supplied sample; only the hardware encoders set
+            // PROVIDES_SAMPLES, and this branch never sees one of those.
+            var encoded = Read(transform, providesSamples: false);
             if (encoded.Length == 0)
                 throw new InvalidOperationException("ProcessOutput produced no bytes (look-ahead or empty queue).");
             Console.WriteLine($"    ProcessOutput: {encoded.Length} bytes, first 8 = {Hex(encoded, 8)}");
@@ -392,6 +394,21 @@ internal static class MfVideoPrototype
             transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
             Console.WriteLine("    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING / START_OF_STREAM sent");
 
+            // Whether the caller supplies the output sample or the MFT does is not a detail to guess
+            // at -- it is a declared property of the output stream, and getting it wrong returns S_OK
+            // with an empty sample rather than an error.
+            step = "GetOutputStreamInfo";
+            var outputInfo = transform.GetOutputStreamInfo(0);
+            // OutputStreamInfo.Flags comes back as a raw int, so the comparison is against the enum's
+            // value rather than the enum itself.
+            var providesSamples =
+                (outputInfo.Flags & (int)OutputStreamInfoFlags.OutputStreamProvidesSamples) != 0;
+            Console.WriteLine($"    output stream: flags={outputInfo.Flags} " +
+                              $"PROVIDES_SAMPLES={providesSamples} -> " +
+                              (providesSamples
+                                  ? "the MFT allocates the sample; passing one would get an empty one back"
+                                  : "we supply the sample"));
+
             step = "allocate NV12 texture";
             using var texture = MakeNv12Texture(device);
             Console.WriteLine($"    NV12 {Width}x{Height} texture allocated and painted");
@@ -421,7 +438,17 @@ internal static class MfVideoPrototype
 
                 if (requests.HaveOutput)
                 {
-                    var got = Read(transform);
+                    byte[] got;
+                    try
+                    {
+                        got = Read(transform, providesSamples);
+                    }
+                    catch (SharpGenException ex)
+                    {
+                        // Which call failed matters: the same HRESULT out of ProcessInput and out of
+                        // ProcessOutput would point at completely different parts of the contract.
+                        throw new InvalidOperationException($"ProcessOutput failed: 0x{ex.HResult:x8}", ex);
+                    }
                     if (got.Length > 0)
                     {
                         encoded = got;
@@ -449,6 +476,10 @@ internal static class MfVideoPrototype
                     catch (SharpGenException ex) when (ex.HResult == NotAccepting)
                     {
                         diags.Add("input queue full");
+                    }
+                    catch (SharpGenException ex)
+                    {
+                        throw new InvalidOperationException($"ProcessInput failed: 0x{ex.HResult:x8}", ex);
                     }
 
                     if (fed <= 3 || fed == MaxFrames)
@@ -518,22 +549,21 @@ internal static class MfVideoPrototype
     }
 
     /// <summary>
-    /// Allocates an NV12 texture and paints it with a real pattern if the driver allows it.
+    /// Allocates an NV12 texture and fills it with mid-grey.
     ///
-    /// The honest constraint: NV12 is a video format, and whether a given driver lets a caller write
-    /// one directly is not guaranteed. So this tries the direct route and falls back to an untouched
-    /// texture, and says which one happened. Falling back is not fatal -- an uninitialised NV12 buffer
-    /// is still valid YUV samples, and an IDR frame of noise proves exactly as much about the MFT as
-    /// an IDR frame of grey. What it would NOT prove is anything about our own colour conversion, which
-    /// does not exist yet and is deliberately not written here.
+    /// The fill goes through UpdateSubresource from a managed array rather than through a staging
+    /// texture and Map. Map needs CPU access to the surface, and D3D11 refuses that for NV12 on this
+    /// driver -- the earlier version caught that and fed an untouched texture, which is fine for proving
+    /// the encoder runs but proves nothing about the picture. UpdateSubresource is a copy, not a map,
+    /// so it does not need CPU access to the destination.
     ///
-    /// ponytail: uninitialised texture on drivers that refuse CPU access. Next step, not this one, is
-    /// a real BGRA->NV12 conversion fed by the WGC texture; until that exists there is nothing here
-    /// to compare a painted frame against.
+    /// Grey, not black: a black frame compresses to a few dozen bytes, and a "first H.264 packet"
+    /// that small is impossible to tell from a stub. Mid-grey still yields a full IDR, and a packet
+    /// size in the tens of kilobytes is the evidence that the encoder actually encoded a frame.
     /// </summary>
     private static ID3D11Texture2D MakeNv12Texture(ID3D11Device device)
     {
-        var baseDescription = new Texture2DDescription
+        var description = new Texture2DDescription
         {
             Width = (int)Width,
             Height = (int)Height,
@@ -541,47 +571,34 @@ internal static class MfVideoPrototype
             ArraySize = 1,
             Format = Vortice.DXGI.Format.NV12,
             SampleDescription = new SampleDescription(1, 0),
-            Usage = ResourceUsage.Default,
-            BindFlags = BindFlags.None,          // NV12 is not a shader resource
-            CPUAccessFlags = CpuAccessFlags.None,
+
+            // Staging, not Default -- and this is not a guess. A previous version had a "fallback"
+            // that set Usage=Staging, threw while creating the texture, and then handed the same
+            // description back still carrying Staging. That accidentally-correct texture was the only
+            // one the encoder ever accepted; creating it as Default gives
+            // MF_E_UNSUPPORTED_D3D_TYPE on the very first ProcessInput. Tidying that up "properly"
+            // is what broke the pipeline.
+            Usage = ResourceUsage.Staging,
+            CPUAccessFlags = CpuAccessFlags.Write,
             MiscFlags = ResourceOptionFlags.None,
         };
 
-        var context = device.ImmediateContext;
+        var texture = device.CreateTexture2D(description);
 
-        // A CPU-writable NV12 texture is the nice case: fill the luma plane and the interleaved
-        // chroma plane directly, no conversion anywhere.
-        try
-        {
-            baseDescription.Usage = ResourceUsage.Staging;
-            baseDescription.CPUAccessFlags = CpuAccessFlags.Write;
-            using var cpuTexture = device.CreateTexture2D(baseDescription);
+        // NV12 is a luma plane followed by an interleaved chroma plane, one byte per component.
+        var luma = (int)(Width * Height);
+        var pixels = new byte[luma + luma / 2];
+        Array.Fill(pixels, (byte)128);
 
-            var map = context.Map(cpuTexture, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None);
-            var lumaSize = (int)(Width * Height);
-            unsafe
-            {
-                var pixels = (byte*)map.DataPointer;
-                for (var i = 0; i < lumaSize; i++)
-                    pixels[i] = (byte)(16 + i % 200);           // a moving ramp
-                for (var i = lumaSize; i < lumaSize + lumaSize / 2; i++)
-                    pixels[i] = 128;                            // flat chroma
-            }
-            context.Unmap(cpuTexture, 0);
-
-            baseDescription.Usage = ResourceUsage.Default;
-            baseDescription.CPUAccessFlags = CpuAccessFlags.None;
-            var filled = device.CreateTexture2D(baseDescription);
-            context.CopyResource(filled, cpuTexture);
-            return filled;
-        }
-        catch (Exception ex)
-        {
-            // Not a driver fault worth failing over: report it and hand back a blank texture.
-            Console.WriteLine($"    (note: this driver will not let a caller write NV12 directly " +
-                              $"[{ex.GetType().Name}]; feeding an untouched texture instead)");
-            return device.CreateTexture2D(baseDescription);
-        }
+        // Mid-grey, not black: a black frame compresses to a few dozen bytes, and a "first H.264
+        // packet" that small cannot be told from a stub. A packet in the tens of kilobytes is the
+        // evidence that a real frame went through the encoder.
+        //
+        // The Span overload rather than the raw-pointer one: it derives the copy size from the data,
+        // so a wrong pitch cannot turn into a driver-level complaint about the resource.
+        device.ImmediateContext.UpdateSubresource(
+            pixels.AsSpan(), texture, 0, (uint)Width, 0, null);
+        return texture;
     }
 
     /// <summary>What the MFT's event queue is asking for, as of the last pump.</summary>
@@ -772,14 +789,28 @@ internal static class MfVideoPrototype
         }
     }
 
-    /// <summary>One ProcessOutput, with the two answers that are normal rather than failures.</summary>
-    private static byte[] Read(IMFTransform transform)
+    /// <summary>
+    /// One ProcessOutput, with the three answers that are normal rather than failures.
+    ///
+    /// The MFT decides where the sample comes from, and MFT_OUTPUT_STREAM_PROVIDES_SAMPLES is what
+    /// says so. When it is set the encoder allocates the output sample itself -- in driver memory --
+    /// and the caller must hand ProcessOutput a NULL sample. Passing a preallocated one instead does
+    /// not fail: ProcessOutput answers S_OK and hands back an empty sample, which is indistinguishable
+    /// from an encoder that swallowed 60 frames and produced nothing. Reading the flag is the whole
+    /// difference between those two stories.
+    /// </summary>
+    private static byte[] Read(IMFTransform transform, bool providesSamples)
     {
-        using var sample = MediaFactory.MFCreateSample();
-        // Pre-allocated, as with the audio encoder: an empty IMFSample makes ProcessOutput fail with
-        // E_INVALIDARG that has nothing to do with the codec.
-        sample.AddBuffer(MediaFactory.MFCreateMemoryBuffer(4 * 1024 * 1024));
-        var data = new OutputDataBuffer { StreamID = 0, Sample = sample };
+        IMFSample? own = null;
+        var data = new OutputDataBuffer { StreamID = 0, Sample = null };
+        if (!providesSamples)
+        {
+            // Pre-allocated, as with the audio encoder: an empty IMFSample makes ProcessOutput fail
+            // with E_INVALIDARG that has nothing to do with the codec.
+            own = MediaFactory.MFCreateSample();
+            own.AddBuffer(MediaFactory.MFCreateMemoryBuffer(4 * 1024 * 1024));
+            data.Sample = own;
+        }
 
         try
         {
@@ -787,18 +818,35 @@ internal static class MfVideoPrototype
         }
         catch (SharpGenException ex) when (ex.HResult is NeedMoreInput or NotAccepting or Unexpected)
         {
-            // All three mean "keep going", not "broken": look-ahead, a full input queue, and
-            // E_UNEXPECTED, which a hardware encoder returns when ProcessOutput is called before it
-            // has anything -- it is a normal state of the feed/drain loop, not a failure.
+            own?.Dispose();
             return [];
         }
 
-        using var contiguous = sample.ConvertToContiguousBuffer();
-        contiguous.Lock(out var src, out _, out var length);
-        var bytes = new byte[length];
-        Marshal.Copy(src, bytes, 0, length);
-        contiguous.Unlock();
-        return bytes;
+        // With PROVIDES_SAMPLES this is the encoder's own sample; without it, the one allocated above.
+        var produced = data.Sample ?? own;
+        if (produced is null)
+        {
+            own?.Dispose();
+            return [];
+        }
+
+        try
+        {
+            using var contiguous = produced.ConvertToContiguousBuffer();
+            // Lock returns (pointer, maxLength, currentLength). It is currentLength that says how many
+            // bytes the encoder actually wrote; maxLength is only the capacity, and using it would
+            // report the entire 4 MB as a single packet.
+            contiguous.Lock(out var src, out _, out var length);
+            var bytes = new byte[length];
+            if (length > 0)
+                Marshal.Copy(src, bytes, 0, length);
+            contiguous.Unlock();
+            return bytes;
+        }
+        finally
+        {
+            own?.Dispose();
+        }
     }
 
     private static readonly Guid Nv12 = new("3231564e-0000-0010-8000-00aa00389b71");
