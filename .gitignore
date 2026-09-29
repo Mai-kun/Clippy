@@ -503,3 +503,9 @@ output/
 
 # config.json is generated next to the binary on first run.
 config.json
+# Clippy: artefacts of the native NVENC bridge (src\native\build.cmd). Only the
+# sources and NVIDIA's own nvEncodeAPI.h belong in history; the DLL is a build
+# output, is machine specific, and is produced by the release workflow.
+src/native/clippy_nvenc.dll
+src/native/clippy_nvenc.exp
+src/native/clippy_nvenc.lib

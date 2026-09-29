@@ -36,4 +36,19 @@
     <None Include="mp4-selftest-audio.aac" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!-- The native NVENC bridge, built by src\native\build.cmd. -->
+  <!-- CopyToPublishDirectory on a None item does not carry a file from a nested folder into the -->
+  <!-- publish directory here, so a target copies it instead. It must sit next to Clippy.exe: the -->
+  <!-- P/Invoke name is bare and is resolved against the application directory. The encoder treats a -->
+  <!-- missing DLL as "no hardware encoder on this machine" and falls back to ffmpeg, so a build -->
+  <!-- machine without MSVC still produces a working binary. -->
+  <Target Name="CopyNvencBridge" AfterTargets="Build;Publish">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\native\clippy_nvenc.dll"
+          DestinationFolder="$(OutDir)"
+          Condition="Exists('$(MSBuildProjectDirectory)\native\clippy_nvenc.dll') AND '$(OutDir)' != ''" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\native\clippy_nvenc.dll"
+          DestinationFolder="$(PublishDir)"
+          Condition="Exists('$(MSBuildProjectDirectory)\native\clippy_nvenc.dll') AND '$(PublishDir)' != ''" />
+  </Target>
+
 </Project>

@@ -762,17 +762,20 @@ internal sealed class ScreenCapture : IDisposable
                 if (currentFrame == 1)
                     videoStartSeconds = stopwatch.Elapsed.TotalSeconds;
 
-                // Read the frame back and hand over BGRA, the way the ffmpeg path always has.
+                // Hand the frame over the way this encoder can take it.
                 //
-                // This used to hand the capture texture straight to the encoder, and that turned out
-                // to be impossible: Windows.Graphics.Capture and the hardware encoder cannot share a
-                // device, and Direct3D 11 cannot copy a resource between devices, so there is no route
-                // from a WGC texture to NVENC that avoids system memory. The readback is therefore not a
-                // regression -- it is what already happens -- and what this class removes is the ffmpeg
-                // process and the copy out of it, not this hop.
+                // This used to read every frame back to system memory unconditionally, on the comment
+                // that Windows.Graphics.Capture and the hardware encoder "cannot share a device". That
+                // does not hold here: this class creates one D3D11 device and hands the very same one
+                // to both the capture and the encoder, so a frame-pool texture is already on the
+                // encoder's device and no copy between devices is involved. The direct NVENC path
+                // therefore hands the texture to the encoder as it is, further down. Every other
+                // encoder still gets BGRA, because the ffmpeg and media-foundation encoders take CPU
+                // pixels and that has not changed.
                 byte[]? pixels = null;
-                using (var videoTexture = CaptureInterop.GetTexture(frame.Surface))
+                if (encoder is not NvencDirectVideoEncoder)
                 {
+                    using var videoTexture = CaptureInterop.GetTexture(frame.Surface);
                     pixels = CopyTextureToCpu(videoTexture, out var w, out var h);
                     videoWidth = w;
                     videoHeight = h;
@@ -834,9 +837,19 @@ internal sealed class ScreenCapture : IDisposable
                 // stopwatch origin is subtracted once and both tracks share one hardware clock.
                 var frameQpcSeconds = frame.SystemRelativeTime.Ticks / (double)System.Diagnostics.Stopwatch.Frequency;
                 encoder.EnqueueCaptureTime(frameQpcSeconds - masterZeroSeconds);
-                if (pixels is not null)
-                    if (pixels is not null)
+
+                if (encoder is NvencDirectVideoEncoder directNvenc)
+                {
+                    // The texture is opened here and released immediately after, because the encoder
+                    // reads it where it lives and the frame pool recycles the surface as soon as this
+                    // frame is disposed. No staging copy is made anywhere on this path.
+                    using var directTexture = CaptureInterop.GetTexture(frame.Surface);
+                    directNvenc.PushTexture(directTexture);
+                }
+                else if (pixels is not null)
+                {
                     encoder.Write(pixels, frame.SystemRelativeTime.TotalMilliseconds);
+                }
 
                 // The first write is what lets ffmpeg finish probing and open its input; only then is
                 // it meaningful to wait for readiness. Both processes are confirmed up before any
@@ -973,6 +986,23 @@ internal sealed class ScreenCapture : IDisposable
         Stopwatch clock, string fpsMode, string? logs)
     {
         var wanted = preferred ?? config.VideoEncoder;
+
+        // The direct NVENC path, and the one that removes the ffmpeg process entirely. It is only
+        // offered when explicitly asked for, or when the media-foundation preference was asked for:
+        // preferring it silently would change what every existing config does, and a preference in
+        // this project has always been allowed to fail into ffmpeg rather than stop the recording.
+        var wantDirect = string.Equals(wanted, "nvenc_direct", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(wanted, "media_foundation", StringComparison.OrdinalIgnoreCase);
+
+        if (wantDirect)
+        {
+            var direct = TryCreateNvencDirect(width, height);
+            if (direct is not null)
+                return direct;
+
+            Console.WriteLine("Video encoder: direct NVENC unavailable -> falling back to ffmpeg.");
+        }
+
         if (!string.Equals(wanted, "media_foundation", StringComparison.OrdinalIgnoreCase))
         {
             return FfmpegVideoEncoder.StartWithFallback(
@@ -993,6 +1023,32 @@ internal sealed class ScreenCapture : IDisposable
                 path, width, height, "libx264", config.VideoBitrateMbps, clock, fpsMode, logs);
         }
     }
+
+    /// <summary>
+    /// The frame rate handed to the encoder for rate control and keyframe interval.
+    /// </summary>
+    /// <remarks>
+    /// It does not set the output frame rate and must not be read as if it did. Windows.Graphics.Capture
+    /// delivers frames at the display's refresh rate, and the ffmpeg path is run in passthrough mode
+    /// for the same reason: the timeline comes from the per-frame capture timestamps queued in this
+    /// class, which is what makes the recorded clip variable-frame-rate and A/V aligned. This number
+    /// only tells the encoder how to spread the bitrate and how often to emit a keyframe, so being out
+    /// of step with the display costs a denser GOP, not a wrong duration.
+    /// </remarks>
+    private const int RateControlFps = 30;
+
+    /// <summary>
+    /// Opens the direct NVENC session on the capture's own D3D11 device, or returns null.
+    /// </summary>
+    /// <remarks>
+    /// The device is not interchangeable: Windows.Graphics.Capture and the encoder are given the same
+    /// <see cref="d3d11Device"/>, so a texture from the frame pool can go to NVENC where it already
+    /// lives. D3D11 cannot copy between two devices, so a session opened on any other one would
+    /// quietly put every frame back through system memory and undo the point of the class.
+    /// </remarks>
+    private IVideoEncoder? TryCreateNvencDirect(int width, int height) =>
+        NvencDirectVideoEncoder.TryCreate(
+            d3d11Device, width, height, RateControlFps, config.VideoBitrateMbps * 1_000_000);
 
     /// <summary>Stages a GPU texture into system RAM as tightly packed BGRA rows.</summary>
     private byte[] CopyTextureToCpu(ID3D11Texture2D texture, out int width, out int height)

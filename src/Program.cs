@@ -66,6 +66,9 @@ if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
   if (args.Contains("--test-mft-video-wgc"))
       return MfVideoPrototype.RunWithLiveCapture();
 
+  if (args.Contains("--test-nvenc-native"))
+      return NvencNativeSpike.Run();
+
   if (args.Contains("--test-mft-video"))
       return MfVideoPrototype.Run();
 
@@ -207,6 +210,8 @@ static int PrintUsage()
     Console.WriteLine("  --test-parsers             H.264 / AAC parser self-test");
     Console.WriteLine("  --test-ring                ring buffer self-test");
     Console.WriteLine("  --test-mp4                 MP4 writer self-test");
+    Console.WriteLine("  --test-nvenc-native       spike: can the native NVENC bridge encode a real BGRA texture?");
+    Console.WriteLine("  --test-nvenc-native       spike: can the native NVENC bridge encode a BGRA texture?");
     Console.WriteLine("  --test-mft-audio          spike: can the system AAC encoder emit ADTS?");
     Console.WriteLine("  --test-mft-video          spike: can a system H.264 MFT be driven at all?");
     Console.WriteLine("  --test-mft-video-wgc      the same spike, with a live capture session running");
