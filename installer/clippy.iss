@@ -1,15 +1,15 @@
 ; Clippy installer.
 ;
 ; Built by the release workflow, which passes the tag in:
-;   ISCC.exe /DPublishVersion=1.0.5 installer\clippy.iss
-; A human running it by hand gets 1.0.5, which is fine for a smoke test.
+;   ISCC.exe /DPublishVersion=1.1.0 installer\clippy.iss
+; A human running it by hand gets 1.1.0, which is fine for a smoke test.
 ;
 ; Every path is relative to this file, so the script does not care where the repository sits.
 
 #ifndef PublishVersion
   ; Only used when ISCC is run by hand. The release workflow always passes the tag as
   ; /DPublishVersion=, so the two can never disagree about what release this is.
-  #define PublishVersion "1.0.5"
+  #define PublishVersion "1.1.0"
 #endif
 
 #ifndef PublishDir

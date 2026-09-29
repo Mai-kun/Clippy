@@ -70,6 +70,7 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_RATE_6 = 1302;
     private const uint IDC_RATE_8 = 1303;
     private const uint IDC_RATE_12 = 1304;
+    private const uint IDC_ENCODER_DIRECT = 1403;
     private const uint IDC_ENCODER_NVENC = 1401;
     private const uint IDC_ENCODER_X264 = 1402;
     private const uint IDC_KEYS_F9 = 1501;
@@ -507,6 +508,9 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_RATE_12:
                     ApplySetting("Bitrate", "12 Mbps", c => c.VideoBitrateMbps = 12, live: false);
                     break;
+                case IDC_ENCODER_DIRECT:
+                    ApplySetting("Encoder", "nvenc_direct", c => c.VideoEncoder = "nvenc_direct", live: false);
+                    break;
                 case IDC_ENCODER_NVENC:
                     ApplySetting("Encoder", "h264_nvenc", c => c.VideoEncoder = "h264_nvenc", live: false);
                     break;
@@ -603,7 +607,8 @@ public sealed partial class TrayIcon : IDisposable
             (IDC_RATE_12, "12 Mbps (~450 MB RAM)", config.VideoBitrateMbps == 12));
 
         var encoder = Submenu(menu, "Video Encoder",
-            (IDC_ENCODER_NVENC, "NVIDIA NVENC (h264_nvenc)", config.VideoEncoder == "h264_nvenc"),
+            (IDC_ENCODER_DIRECT, "Direct NVENC (0-copy VRAM, no ffmpeg)", config.VideoEncoder == "nvenc_direct"),
+            (IDC_ENCODER_NVENC, "NVIDIA NVENC via ffmpeg (h264_nvenc)", config.VideoEncoder == "h264_nvenc"),
             (IDC_ENCODER_X264, "CPU x264 (libx264)", config.VideoEncoder == "libx264"));
 
         var keys = Submenu(menu, "Hotkeys",

@@ -34,16 +34,21 @@ public sealed class ClippyConfig
     public bool StartMinimizedToTray { get; set; }
 
     /// <summary>
-    /// ffmpeg's video encoder. "h264_nvenc" needs an NVIDIA GPU; on a machine without one the encoder
-    /// is rejected at startup and FfmpegVideoEncoder falls back to libx264 automatically, so this value is
-    /// a preference rather than a requirement.
+    /// Which video encoder runs. "nvenc_direct" (the default) is the native bridge: the captured
+    /// texture goes into NVENC where it already sits, so nothing is copied out of VRAM and no ffmpeg
+    /// process is started at all.
+    ///
+    /// A preference, never a requirement. Every value degrades rather than fails: "nvenc_direct" needs
+    /// an NVIDIA GPU and clippy_nvenc.dll, and falls back to "h264_nvenc" with a line in the log when
+    /// either is missing; "h264_nvenc" needs an NVIDIA GPU and falls back to libx264. A recording that
+    /// stopped because an encoder was unavailable would be a worse outcome than a slower one.
     /// </summary>
-    public string VideoEncoder { get; set; } = "h264_nvenc";
+    public string VideoEncoder { get; set; } = "nvenc_direct";
 
     /// <summary>
     /// Video bitrate in Mbps, used by the hardware (NVENC) rate control. The ring buffer holds
     /// ENCODED NAL units, so this value is close to a direct multiplier on its memory use:
-    /// 8 Mbps cost ~380 MB, and 6 Mbps costs proportionally less. Clamped to 2-50, because below 2
+    /// The figures quoted in the tray menu are the ones to go by. Clamped to 2-50, because below 2
     /// the picture falls apart and above 50 the buffer grows without any visible gain.
     /// Ignored by the software fallback, which is CRF-controlled and quality-targeted by design.
     /// </summary>

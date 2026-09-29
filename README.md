@@ -20,8 +20,18 @@
 - **Портативный архив** — `Clippy-win-x64.zip`. Распакуйте в любую папку и запустите `Clippy.exe`.
 
 `ffmpeg.exe` лежит рядом и в архиве, и в установке — распаковывать отдельно не нужно. Он нужен
-только кодировщику `h264_nvenc`; на `nvenc_direct` (прямой NVENC) процесс ffmpeg не запускается
-вообще. `clippy_nvenc.dll` тоже уже на месте.
+только кодировщику `h264_nvenc`; на `nvenc_direct` (прямой NVENC, вариант по умолчанию) процесс
+ffmpeg не запускается вообще. `clippy_nvenc.dll` тоже уже на месте.
+
+### Через Winget
+
+```powershell
+winget install Mai-kun.Clippy
+```
+
+Менеджер пакетов Windows сам скачает установщик, поставит Clippy для текущего пользователя
+и будет обновлять при выходе новых версий. Обновление вручную: `winget upgrade Mai-kun.Clippy`.
+Удаление: `winget uninstall Mai-kun.Clippy`.
 
 Появится окно консоли с логом и иконка в трее. Дальше работайте в играх — нажмите **F9** сразу
 после яркого момента, и последние 30 секунд окажутся в файле.
@@ -61,7 +71,7 @@
 | `PlaySoundNotification` | `true` | Звук после сохранения |
 | `StartMinimizedToTray` | `false` | Запуск сразу без окна консоли |
 | `CheckForUpdates` | `true` | Проверка новых версий при старте (один запрос к GitHub) |
-| `VideoEncoder` | `h264_nvenc` | Кодек: `nvenc_direct` / `h264_nvenc` / `h264_qsv` / `h264_amf` / `libx264` |
+| `VideoEncoder` | `nvenc_direct` | Кодек: `nvenc_direct` / `h264_nvenc` / `h264_qsv` / `h264_amf` / `libx264` |
 | `VideoBitrateMbps` | `6` | Битрейт для NVENC, диапазон 2–50 |
 | `AudioEncoder` | `media_foundation` | `media_foundation` (AAC средствами Windows) / `ffmpeg` |
 
@@ -101,15 +111,15 @@ Clippy непрерывно держит в RAM кольцевой буфер п
 | **Short Clip Duration** | 15 / 30 / 60 секунд — длина клипа по F9 |
 | **Long Clip Duration** | 1 / 2 / 3 / 5 минут — длина клипа по F10 |
 | **Video Bitrate / RAM** | 4 / 6 / 8 / 12 Мбит/с, рядом показана оценка расхода памяти |
-| **Video Encoder** | `h264_nvenc` или `libx264` |
+| **Video Encoder** | `nvenc_direct`, `h264_nvenc` или `libx264` |
 | **Hotkeys** | пара `F9/F10` или `F11/F12` |
 | **Show / Hide Log** | показать или скрыть окно консоли с логом |
 | **Check for Updates** | проверить релиз на GitHub |
 | **Exit** | корректно завершить работу |
 
 Пять подменю меняют настройки на лету: галочка переезжает на новое значение, файл `config.json`
-переписывается, и следующий клип берёт уже его. Переменные `nvenc_direct` в трее нет — этот кодировщик
-включается только в конфиге, правкой одной строки.
+переписывается, и следующий клип берёт уже его. Смена кодировщика применяется со следующей
+перезапуска записи, а не к текущей.
 
 Исчезновение иконки — это `Exit`. Clippy не сворачивается в фоновый режим незаметно: пока иконка
 есть, запись идёт.
@@ -190,6 +200,12 @@ dotnet publish src/Clippy.csproj -c Release -r win-x64 -p:PublishAot=true -o pub
 > «vswhere.exe is not recognized», добавьте её в `PATH` вручную.
 
 ## Релизы
+
+Текущая версия — **1.1.0**. Первый релиз с прямым NVENC по умолчанию.
+
+Манифест для Winget лежит в [`winget/Mai-kun.Clippy.yaml`](winget/Mai-kun.Clippy.yaml). Это шаблон:
+перед отправкой в `microsoft/winget-pkgs` нужно подставить настоящий SHA256 сборки
+(`Get-FileHash .\Clippy-Setup.exe -Algorithm SHA256`) и поднять `PackageVersion`.
 
 Каждый тег публикует два файла:
 

@@ -987,10 +987,9 @@ internal sealed class ScreenCapture : IDisposable
     {
         var wanted = preferred ?? config.VideoEncoder;
 
-        // The direct NVENC path, and the one that removes the ffmpeg process entirely. It is only
-        // offered when explicitly asked for, or when the media-foundation preference was asked for:
-        // preferring it silently would change what every existing config does, and a preference in
-        // this project has always been allowed to fail into ffmpeg rather than stop the recording.
+        // The direct NVENC path, and the one that removes the ffmpeg process entirely. It is the
+        // default, and it is also what the media-foundation preference now resolves to, since both
+        // mean "no ffmpeg process".
         var wantDirect = string.Equals(wanted, "nvenc_direct", StringComparison.OrdinalIgnoreCase) ||
                          string.Equals(wanted, "media_foundation", StringComparison.OrdinalIgnoreCase);
 
@@ -1000,7 +999,23 @@ internal sealed class ScreenCapture : IDisposable
             if (direct is not null)
                 return direct;
 
-            Console.WriteLine("Video encoder: direct NVENC unavailable -> falling back to ffmpeg.");
+            // The fallback name has to be replaced here rather than left to fall through. "nvenc_direct"
+            // is a Clippy-level preference and not an ffmpeg encoder, so handing it to ffmpeg below
+            // would produce a confusing "unknown encoder" further down instead of this one clear line.
+            // Recording continues either way: an instant replay that captures nothing is worse than one
+            // that spends a process on it.
+            Console.WriteLine("Video encoder: direct NVENC is unavailable on this machine " +
+                              "(needs an NVIDIA GPU and clippy_nvenc.dll).");
+
+            // Only "nvenc_direct" is rewritten. A "media_foundation" preference asked for the MFT
+            // encoder, and that path is still reachable below; overwriting it here would quietly turn
+            // one preference into a different one.
+            if (string.Equals(wanted, "nvenc_direct", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("Video encoder: using ffmpeg with h264_nvenc instead -- recording will " +
+                                  "work, but frames pass through system memory and a helper process starts.");
+                wanted = "h264_nvenc";
+            }
         }
 
         if (!string.Equals(wanted, "media_foundation", StringComparison.OrdinalIgnoreCase))

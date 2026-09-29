@@ -1,0 +1,67 @@
+# Microsoft Winget manifest for Clippy.
+#
+# Template only: the InstallerSha256 below is a placeholder and MUST be replaced with the real hash of
+# the uploaded Clippy-Setup.exe before this is submitted to microsoft/winget-pkgs. Winget rejects a
+# manifest whose hash does not match the asset, and a wrong hash is worse than no manifest.
+#
+# To produce it:
+#   1. publish the v1.1.0 release so Clippy-Setup.exe exists on the release page
+#   2. download it
+#   3. Get-FileHash .\Clippy-Setup.exe -Algorithm SHA256
+#   4. paste the value into InstallerSha256 and bump PackageVersion for the next release
+#
+# To submit:
+#   winget create --manifest-packageidentifier Mai-kun.Clippy ^
+#                  --manifest-path .\winget\Mai-kun.Clippy.yaml
+PackageIdentifier: Mai-kun.Clippy
+PackageVersion: 1.1.0
+PackageName: Clippy
+Publisher: Mai-kun
+PublisherUrl: https://github.com/Mai-kun/Clippy
+PublisherSupportUrl: https://github.com/Mai-kun/Clippy/issues
+Author: Mai-kun
+License: MIT
+LicenseUrl: https://github.com/Mai-kun/Clippy/blob/main/LICENSE
+ShortDescription: Instant replay recorder for Windows, with zero-copy hardware NVENC.
+Description: |-
+  Clippy is an instant replay recorder: it keeps a rolling buffer in memory, so a keypress saves
+  the last 30 seconds or the last 3 minutes rather than starting a recording after the fact.
+
+  Video is encoded by the GPU. On NVIDIA cards the default path hands the captured texture straight
+  to NVENC through a small native bridge, so frames never leave video memory and no encoder process
+  is started; there is a verified ffmpeg fallback for every other machine. Audio is encoded by
+  Windows Media Foundation in-process, so ffmpeg is not involved in sound at all.
+
+  Clips are muxed to MP4 by a built-in muxer with no re-encoding, and audio and video are aligned on
+  a shared clock, which is what keeps long replays in sync.
+
+  Ships as a single self-contained executable: Native AOT, no .NET runtime required.
+
+Moniker: clippy
+Tags:
+  - instant-replay
+  - screen-recorder
+  - game-capture
+  - nvenc
+  - video
+  - windows
+
+ReleaseDate: 2026-09-29
+Installers:
+  - Architecture: x64
+    InstallerType: inno
+    Scope: user
+    InstallerSwitches:
+      Silent: /VERYSILENT
+      SilentWithProgress: /SILENT
+    UpgradeBehavior: install
+    # PLACEHOLDER -- replace with: Get-FileHash .\Clippy-Setup.exe -Algorithm SHA256
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    ReleaseUrl: https://github.com/Mai-kun/Clippy/releases/download/v1.1.0/Clippy-Setup.exe
+    DisplayName: Clippy 1.1.0
+    AppsAndFeaturesEntries:
+      - DisplayName: Clippy
+        DisplayVersion: 1.1.0
+        Publisher: Clippy Authors
+        ProductCode: Clippy
+        UpgradeCode: {7C4B1D2E-9F3A-4A5B-8C6D-1E2F3A4B5C6D}
