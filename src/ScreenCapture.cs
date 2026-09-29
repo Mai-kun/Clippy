@@ -347,6 +347,8 @@ internal sealed class ScreenCapture : IDisposable
     /// swapping the encoder a change that cannot reach the A/V alignment.
     /// </summary>
     private IVideoEncoder? encoder;
+    /// <summary>True once the audio side has been wired on the first frame.</summary>
+    private bool audioInitialised;
 
     // Phase 4: the encoders feed these in-memory rings instead of writing files, and a clip is
     // produced by slicing them. The only thing the two share is the capture clock on each packet.
@@ -508,6 +510,29 @@ internal sealed class ScreenCapture : IDisposable
 
         try
         {
+        // The video encoder is built HERE, before the capture session starts, and the ordering is the
+        // point rather than a detail. Built from inside the first frame callback it answered
+        // MF_E_UNSUPPORTED_D3D_TYPE to every ProcessInput, while the identical code succeeds when a
+        // capture session is already live -- which points at what starting the session does to the
+        // process before the encoder exists. The resolution is known from item.Size, so nothing here is
+        // a guess and nothing has to wait for a frame.
+        if (videoPath is not null && encoder is null)
+        {
+            videoRing = new RingBuffer(RingSeconds, isVideo: true);
+            audioRing = new RingBuffer(RingSeconds, isVideo: false);
+            encoder = StartVideoEncoder(
+                withAudio ? Path.ChangeExtension(videoPath, ".video.h264") : videoPath,
+                videoWidth,
+                videoHeight,
+                videoEncoder ?? config.VideoEncoder,
+                stopwatch,
+                fpsMode,
+                logsDirectory);
+            encoder.StartDrain(videoRing);
+            Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring, " +
+                (withAudio ? "with audio" : "no audio") + $" (max {RingSeconds:F0}s), before StartCapture");
+        }
+
             session.StartCapture();
             using var timer = duration is { } timeout
                 ? new Timer(_ => Stop($"capture duration {timeout.TotalSeconds:F0}s elapsed"), null, timeout, Timeout.InfiniteTimeSpan)
@@ -752,22 +777,16 @@ internal sealed class ScreenCapture : IDisposable
                     videoWidth = w;
                     videoHeight = h;
                 }
-                if (encoder is null)
+                if (!audioInitialised)
                 {
-                    // Phase 4: both encoders feed in-memory rings. A clip is produced by slicing
-                    // those rings, not by reading back files.
-                    videoRing = new RingBuffer(RingSeconds, isVideo: true);
-                    audioRing = new RingBuffer(RingSeconds, isVideo: false);
+                    // The video encoder is already running: it was built before StartCapture, which is
+                    // the whole point of the move. Only the audio side is left, and it still waits for
+                    // the first frame because videoStartSeconds is stamped there and AudioCapture needs it.
+                    audioInitialised = true;
 
                     if (withAudio)
                     {
-                        // Bisection mode: real WASAPI buffers arrive and the callback really runs,
-                        // but no audio ffmpeg exists and nothing is written anywhere. Isolates
-                        // "Clippy's own threads upset video capture" from "two ffmpeg processes".
-                        // Elementary streams, not containers (phase 4.0): the ring buffer slices these
-                        // byte streams directly, so there is no container to carry timestamps.
                         videoOnlyPath = Path.ChangeExtension(videoPath, ".video.h264");
-
                         if (audioCaptureOnly)
                         {
                             audio = new AudioCapture(stopwatch, videoStartSeconds);
@@ -786,34 +805,6 @@ internal sealed class ScreenCapture : IDisposable
                             audioEncoder.StartDrain(audioRing);
                             Console.WriteLine($"Audio: system loopback [{audio.Format}]");
                         }
-
-                        encoder = StartVideoEncoder(
-                            videoOnlyPath,
-                            videoWidth,
-                            videoHeight,
-                            videoEncoder ?? config.VideoEncoder,
-                            stopwatch,
-                            fpsMode,
-                            logsDirectory);
-                        encoder.StartDrain(videoRing);
-                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring (max {RingSeconds:F0}s)");
-                    }
-                    else
-                    {
-                        encoder = StartVideoEncoder(
-                            videoPath,
-                            videoWidth,
-                            videoHeight,
-                            videoEncoder ?? config.VideoEncoder,
-                            stopwatch,
-                            fpsMode,
-                            logsDirectory);
-
-                        // Same as the audio branch: without the drain there is no ring, no SPS/PPS and
-                        // therefore no export at all. Hotkeys work in this mode too, producing the
-                        // deliberate video-only clip when the audio ring is empty.
-                        encoder.StartDrain(videoRing);
-                        Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring, no audio (max {RingSeconds:F0}s)");
                     }
                 }
 
