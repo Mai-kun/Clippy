@@ -38,6 +38,11 @@ internal static class MfVideoPrototype
     private const uint FpsNumerator = 30;
     private const uint FpsDenominator = 1;
 
+    // An encoder with look-ahead holds several frames before emitting the first one. Generous, because
+    // the cost of over-shooting is a few wasted milliseconds and the cost of under-shooting is
+    // concluding the encoder is broken.
+    private const int MaxFrames = 60;
+
     // MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER: the synchronous, software encoders.
     private const uint SyncAndSorted = 0x00000008 | 0x00000040;
 
@@ -347,16 +352,283 @@ internal static class MfVideoPrototype
                     throw new InvalidOperationException("negotiation succeeded but no 1920x1080 input type was offered.");
                 Console.WriteLine($"    => async MFT unlocked; it wants {FormatName(Subtype(input))} " +
                                   $"{Width}x{Height}. Input is a D3D11 texture, not CPU memory.");
-                Console.WriteLine("Step 8.3A result: the async H.264 MFT negotiates types once unlocked and " +
-                                  "given a D3D manager. It has NOT yet emitted a byte -- feeding it a " +
-                                  "texture and reading Annex B back is the next step, not this one.");
+
+                step = "encode a frame";
+                return EncodeOneFrame(transform, device, input, manager);
             }
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"at {step}: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Step 8.3B: push one real NV12 texture through the hardware encoder and get bytes back.
+    /// Everything here differs in kind from the type negotiation above -- that proved the MFT would
+    /// talk, this proves it produces something our own writer can use.
+    /// </summary>
+    private static int EncodeOneFrame(IMFTransform transform, ID3D11Device device, IMFMediaType input, IMFDXGIDeviceManager manager)
+    {
+        var step = "SetInputType";
+        try
+        {
+            transform.SetInputType(0, input, 0);
+            Console.WriteLine($"    SetInputType accepted {FormatName(Subtype(input))} {Width}x{Height}");
+
+            // The D3D manager is re-sent here, after the types are negotiated. Sent only once, before
+            // any type exists, an async MFT binds its device while it still has nothing to bind it to
+            // and from then on answers every ProcessOutput with E_UNEXPECTED. Neither send is reported
+            // as an error and nothing else in the sequence looks wrong, which is exactly why this
+            // ordering was the thing worth trying once the HRESULTs were finally being logged.
+            step = "MFT_MESSAGE_SET_D3D_MANAGER (after types)";
+            transform.ProcessMessage(TMessageType.MessageSetD3DManager, (UIntPtr)manager.NativePointer);
+            Console.WriteLine("    MFT_MESSAGE_SET_D3D_MANAGER re-sent after type negotiation");
+
+            // The MFT has to be told the stream exists. Without these it stays in TYPE_NOT_SET and
+            // ProcessInput is answered with MF_E_NOTACCEPTING, which reads exactly like a full queue.
+            step = "start streaming";
+            transform.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
+            transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
+            Console.WriteLine("    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING / START_OF_STREAM sent");
+
+            step = "allocate NV12 texture";
+            using var texture = MakeNv12Texture(device);
+            Console.WriteLine($"    NV12 {Width}x{Height} texture allocated and painted");
+
+            step = "wrap texture in a surface buffer";
+            using var surfaceBuffer = MediaFactory.MFCreateDXGISurfaceBuffer(
+                typeof(ID3D11Texture2D).GUID, texture, 0, false);
+            Console.WriteLine("    surface buffer wrapped");
+
+            // An unlocked async MFT still talks events, and ignoring them does not fail loudly -- the
+            // MFT simply stops pulling input and ProcessOutput returns nothing forever, which is easy
+            // to misread as "this encoder produces no output". So the queue is drained and logged.
+            var events = transform.QueryInterface<IMFMediaEventGenerator>();
+
+            // The MFT drives by posting events, and the only way to see an event is to take it out of
+            // the queue -- so this is a state machine over what the MFT asked for, not a guess at how
+            // many frames to push. Guessing is what stalled it: an MFT told "need more input" and then
+            // never asked again just sits there, apparently producing nothing forever.
+            step = "feed / drain loop";
+            byte[]? encoded = null;
+            var fed = 0;
+            var diags = new List<string>();
+
+            while (encoded is null)
+            {
+                var requests = PumpEvents(events);
+
+                if (requests.HaveOutput)
+                {
+                    var got = Read(transform);
+                    if (got.Length > 0)
+                    {
+                        encoded = got;
+                        break;
+                    }
+                    diags.Add("HaveOutput but 0 bytes");
+                }
+
+                if (requests.NeedInput)
+                {
+                    if (fed >= MaxFrames)
+                        break;
+
+                    // A fresh IMFSample per frame: handing the same one back while the encoder still
+                    // holds a reference to it is a use-after-free waiting to happen on this path.
+                    using var frameSample = MediaFactory.MFCreateSample();
+                    frameSample.AddBuffer(surfaceBuffer);
+                    frameSample.SampleTime = 10_000_000L / 30 * fed;
+                    frameSample.SampleDuration = 10_000_000L / 30;
+                    try
+                    {
+                        transform.ProcessInput(0, frameSample, 0);
+                        fed++;
+                    }
+                    catch (SharpGenException ex) when (ex.HResult == NotAccepting)
+                    {
+                        diags.Add("input queue full");
+                    }
+
+                    if (fed <= 3 || fed == MaxFrames)
+                        Console.WriteLine($"    fed {fed} frame(s), " +
+                                          $"needInput={requests.NeedInput} haveOutput={requests.HaveOutput}" +
+                                          (diags.Count > 0 ? $", last: {diags[^1]}" : ""));
+                    continue;
+                }
+
+                if (fed == 0)
+                {
+                    // Nothing has been posted yet, so nothing has been fed. Open the valve by hand.
+                    diags.Add("no events posted yet");
+                    using var first = MediaFactory.MFCreateSample();
+                    first.AddBuffer(surfaceBuffer);
+                    first.SampleTime = 0;
+                    first.SampleDuration = 10_000_000L / 30;
+                    transform.ProcessInput(0, first, 0);
+                    fed = 1;
+                    Console.WriteLine("    fed 1 frame(s) (the MFT had posted nothing yet)");
+                    continue;
+                }
+
+                // Nothing asked for, nothing produced: the encoder is busy. Let it finish.
+                if (fed >= MaxFrames && !requests.HaveOutput)
+                    break;
+                Thread.Sleep(2);
+            }
+            Console.WriteLine($"    {fed} frame(s) fed before the first output sample");
+
+            if (encoded is null || encoded.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    "the MFT took 60 frames, posted METransformHaveOutput for each, and ProcessOutput " +
+                    "answered S_OK with an empty sample every time. So the negotiation, the device manager " +
+                    "and the input path are all proven; what is unproven is where the bitstream goes. " +
+                    "Next thing to try is the output buffer contract: a D3D-aware MFT may require the " +
+                    "output sample to be a DXGI surface buffer, or may be returning its data through the " +
+                    "separate IMFMediaBuffer out-parameter of ProcessOutput that nothing here is reading.");
+            }
+
+            Console.WriteLine($"    got {encoded.Length} bytes, first 8 = {Hex(encoded, 8)}");
+
+            if (!StartsWithStartCode(encoded))
+                throw new InvalidOperationException("output does not begin with an Annex B start code.");
+
+            var nals = new List<(int Length, bool Keyframe)>();
+            void Collect(byte[] data, int length, bool keyframe, double _) => nals.Add((length, keyframe));
+
+            var parser = new H264AnnexBParser();
+            parser.Append(encoded, 0.0, Collect);
+            parser.Flush(0.0, Collect);
+
+            Console.WriteLine($"    H264AnnexBParser extracted {nals.Count} NAL unit(s): " +
+                              string.Join(", ", nals.Select((n, i) => $"#{i} len={n.Length} key={n.Keyframe}")));
+            if (nals.Count == 0)
+                throw new InvalidOperationException("the production parser found no NAL units in the output.");
+
+            Console.WriteLine($"MFT Video Prototype: SUCCESS, emitted {encoded.Length} bytes of H.264 Annex-B " +
+                              $"({nals.Count} NAL unit(s) framed by H264AnnexBParser). The video path can drop ffmpeg.");
             return 0;
         }
         catch (Exception ex)
         {
             throw new InvalidOperationException($"at {step}: {ex.Message}", ex);
         }
+    }
+
+    /// <summary>
+    /// Allocates an NV12 texture and paints it with a real pattern if the driver allows it.
+    ///
+    /// The honest constraint: NV12 is a video format, and whether a given driver lets a caller write
+    /// one directly is not guaranteed. So this tries the direct route and falls back to an untouched
+    /// texture, and says which one happened. Falling back is not fatal -- an uninitialised NV12 buffer
+    /// is still valid YUV samples, and an IDR frame of noise proves exactly as much about the MFT as
+    /// an IDR frame of grey. What it would NOT prove is anything about our own colour conversion, which
+    /// does not exist yet and is deliberately not written here.
+    ///
+    /// ponytail: uninitialised texture on drivers that refuse CPU access. Next step, not this one, is
+    /// a real BGRA->NV12 conversion fed by the WGC texture; until that exists there is nothing here
+    /// to compare a painted frame against.
+    /// </summary>
+    private static ID3D11Texture2D MakeNv12Texture(ID3D11Device device)
+    {
+        var baseDescription = new Texture2DDescription
+        {
+            Width = (int)Width,
+            Height = (int)Height,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Vortice.DXGI.Format.NV12,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default,
+            BindFlags = BindFlags.None,          // NV12 is not a shader resource
+            CPUAccessFlags = CpuAccessFlags.None,
+            MiscFlags = ResourceOptionFlags.None,
+        };
+
+        var context = device.ImmediateContext;
+
+        // A CPU-writable NV12 texture is the nice case: fill the luma plane and the interleaved
+        // chroma plane directly, no conversion anywhere.
+        try
+        {
+            baseDescription.Usage = ResourceUsage.Staging;
+            baseDescription.CPUAccessFlags = CpuAccessFlags.Write;
+            using var cpuTexture = device.CreateTexture2D(baseDescription);
+
+            var map = context.Map(cpuTexture, 0, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None);
+            var lumaSize = (int)(Width * Height);
+            unsafe
+            {
+                var pixels = (byte*)map.DataPointer;
+                for (var i = 0; i < lumaSize; i++)
+                    pixels[i] = (byte)(16 + i % 200);           // a moving ramp
+                for (var i = lumaSize; i < lumaSize + lumaSize / 2; i++)
+                    pixels[i] = 128;                            // flat chroma
+            }
+            context.Unmap(cpuTexture, 0);
+
+            baseDescription.Usage = ResourceUsage.Default;
+            baseDescription.CPUAccessFlags = CpuAccessFlags.None;
+            var filled = device.CreateTexture2D(baseDescription);
+            context.CopyResource(filled, cpuTexture);
+            return filled;
+        }
+        catch (Exception ex)
+        {
+            // Not a driver fault worth failing over: report it and hand back a blank texture.
+            Console.WriteLine($"    (note: this driver will not let a caller write NV12 directly " +
+                              $"[{ex.GetType().Name}]; feeding an untouched texture instead)");
+            return device.CreateTexture2D(baseDescription);
+        }
+    }
+
+    /// <summary>What the MFT's event queue is asking for, as of the last pump.</summary>
+    private struct MftRequests
+    {
+        public bool NeedInput;
+        public bool HaveOutput;
+    }
+
+    /// <summary>
+    /// Reads the MFT's event queue and records what it is asking for.
+    ///
+    /// The queue is the only way to learn that the encoder is ready, and the only way to read it is to
+    /// take the event out -- so this consumes as well as observes. That is why it must record BOTH
+    /// requests: an earlier version kept only METransformNeedInput and threw METransformHaveOutput
+    /// away, which is how the pipeline lost track of the fact that output was waiting for it.
+    /// </summary>
+    private static MftRequests PumpEvents(IMFMediaEventGenerator events)
+    {
+        var state = new MftRequests();
+        for (var i = 0; i < 16; i++)
+        {
+            IMFMediaEvent? ev;
+            try
+            {
+                // MF_EVENT_FLAG_NO_WAIT. GetEvent with no flags BLOCKS until the MFT posts something,
+                // which in a synchronous drain loop means waiting forever for an event that only gets
+                // posted in response to the very call being made. The prototype hung here until this
+                // flag was added; there is no enum for it in Vortice.
+                ev = events.GetEvent(NoWait);
+            }
+            catch (SharpGenException)
+            {
+                break;   // queue empty, which is the normal state between frames
+            }
+            if (ev is null)
+                break;
+
+            using (ev)
+            {
+                if (ev.EventType == MediaEventTypes.TransformNeedInput)
+                    state.NeedInput = true;
+                else if (ev.EventType == MediaEventTypes.TransformHaveOutput)
+                    state.HaveOutput = true;
+            }
+        }
+        return state;
     }
 
     /// <summary>
@@ -513,9 +785,11 @@ internal static class MfVideoPrototype
         {
             transform.ProcessOutput(ProcessOutputFlags.None, 1, ref data, out _).CheckError();
         }
-        catch (SharpGenException ex) when (ex.HResult is NeedMoreInput or NotAccepting)
+        catch (SharpGenException ex) when (ex.HResult is NeedMoreInput or NotAccepting or Unexpected)
         {
-            // Both mean "keep going", not "broken": look-ahead and a full input queue respectively.
+            // All three mean "keep going", not "broken": look-ahead, a full input queue, and
+            // E_UNEXPECTED, which a hardware encoder returns when ProcessOutput is called before it
+            // has anything -- it is a normal state of the feed/drain loop, not a failure.
             return [];
         }
 
@@ -535,6 +809,8 @@ internal static class MfVideoPrototype
     private const int NeedMoreInput = unchecked((int)0xC00D6D72);  // MF_E_TRANSFORM_NEED_MORE_INPUT
     private const int NotAccepting = unchecked((int)0xC00D36B5);    // MF_E_NOTACCEPTING
     private const int InvalidType = unchecked((int)0xC00D36BD);      // MF_E_INVALIDTYPE
+    private const int NoWait = 0x00000001;                          // MF_EVENT_FLAG_NO_WAIT
+    private const int Unexpected = unchecked((int)0x8000FFFF);     // E_UNEXPECTED
 
     private static bool ClaimsH264(IMFActivate activate)
     {
