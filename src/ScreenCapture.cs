@@ -587,12 +587,21 @@ internal sealed class ScreenCapture : IDisposable
     /// (-use_wallclock_as_timestamps) starting at the same instant, so both files already share one
     /// zero. An offset here would paper over a real misalignment instead of measuring it, so the
     /// start_time of each input is compared instead and reported.
+    ///
+    /// Since phase 4 the clip is built by slicing the rings, and neither encoder writes a file, so this
+    /// whole path is normally reached with nothing to mux. It still has to be SAFE when that happens:
+    /// the first version threw an unhandled InvalidOperationException out of ffmpeg's "No such file",
+    /// which crashed the recorder during shutdown -- after the recording was already complete. A
+    /// missing input is a normal outcome here, not an error worth taking the process down for.
     /// </summary>
     private void MuxVideoAndAudio(string videoInput, string audioInput, string output)
     {
-        if (!File.Exists(audioInput))
+        if (!File.Exists(videoInput) || !File.Exists(audioInput))
         {
-            Console.WriteLine("Mux skipped: no audio file was produced.");
+            var missing = !File.Exists(videoInput)
+                ? Path.GetFileName(videoInput)
+                : Path.GetFileName(audioInput);
+            Console.WriteLine($"Mux skipped: {missing} was not produced; the clip is written from the rings.");
             return;
         }
 
@@ -762,10 +771,10 @@ internal sealed class ScreenCapture : IDisposable
                         {
                             audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
                             audio = new AudioCapture(stopwatch, videoStartSeconds);
-                            audioEncoder = FfmpegAudioEncoder.Start(audioOnlyPath, audio, stopwatch, audioRing, masterZeroSeconds, logDirectory: logsDirectory);
+                            audioEncoder = StartAudioEncoder(config, audio, audioOnlyPath, stopwatch, audioRing, masterZeroSeconds, logsDirectory);
                             audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
-                            // An f32le input probes without data, so audio reaches ready on its own.
                             audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
+                            audioEncoder.StartDrain(audioRing);
                             Console.WriteLine($"Audio: system loopback [{audio.Format}]");
                         }
 
@@ -1029,6 +1038,42 @@ internal sealed class ScreenCapture : IDisposable
             throw new InvalidOperationException($"D3D11CreateDevice failed: {result.Description}");
 
         return device;
+    }
+
+    /// <summary>
+    /// Builds the audio encoder the config asked for, falling back to ffmpeg if the MFT path cannot be
+    /// set up here.
+    ///
+    /// The fallback is automatic and loud on purpose. A machine without a usable AAC MFT still has to
+    /// record audio, and a recorder that silently captured nothing would be discovered much later --
+    /// when a clip had no sound. Saying "fell back" once at startup is the whole difference.
+    /// </summary>
+    private static IAudioEncoder StartAudioEncoder(
+        ClippyConfig config,
+        AudioCapture audio,
+        string audioPath,
+        Stopwatch stopwatch,
+        RingBuffer ring,
+        double masterZeroSeconds,
+        string? logsDirectory)
+    {
+        var wantMf = !string.Equals(config.AudioEncoder, "ffmpeg", StringComparison.OrdinalIgnoreCase);
+
+        if (wantMf)
+        {
+            try
+            {
+                return MfAudioEncoder.Start(audio, masterZeroSeconds);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+            {
+                Console.WriteLine($"[audio] Media Foundation encoder unavailable ({ex.GetType().Name}: {ex.Message})");
+                Console.WriteLine("[audio] falling back to ffmpeg for audio -- the recording still works, " +
+                                  "it just needs the ffmpeg process again.");
+            }
+        }
+
+        return FfmpegAudioEncoder.Start(audioPath, audio, stopwatch, ring, masterZeroSeconds, logDirectory: logsDirectory);
     }
 }
 

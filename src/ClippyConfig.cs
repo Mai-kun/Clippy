@@ -50,6 +50,16 @@ public sealed class ClippyConfig
     public int VideoBitrateMbps { get; set; } = 6;
 
     /// <summary>
+    /// Which audio encoder runs. "media_foundation" (default) uses the Windows AAC MFT in-process and
+    /// needs no ffmpeg at all; "ffmpeg" forces the old two-process path.
+    ///
+    /// A preference, not a requirement, for the same reason VideoEncoder is: if the MFT cannot be
+    /// configured the recorder falls back to ffmpeg automatically and says so, because an instant
+    /// replay that captures no sound is worse than one that spends a process on it.
+    /// </summary>
+    public string AudioEncoder { get; set; } = "media_foundation";
+
+    /// <summary>
     /// Ask GitHub on startup whether a newer release exists. On by default: the check is one small
     /// request that fails silently, and a recorder that only tells you about updates when you go
     /// looking for them is a recorder most people never update at all.

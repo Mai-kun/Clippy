@@ -162,6 +162,24 @@ internal sealed class AudioCapture : IDisposable
     /// <summary>The endpoint's real sample rate, used to place each AAC frame on the audio timeline.</summary>
     public int SampleRate => capture.WaveFormat.SampleRate;
 
+    /// <summary>The endpoint's real channel count, which the MFT path has to be configured for.</summary>
+    public int Channels => capture.WaveFormat.Channels;
+
+    /// <summary>
+    /// Are the callback's bytes 32-bit float? The MFT wants integer PCM, so the encoder has to know
+    /// which conversion to apply, and guessing produces noise rather than an error.
+    /// </summary>
+    public bool IsFloat32
+    {
+        get
+        {
+            var format = capture.WaveFormat;
+            if (format.Encoding == WaveFormatEncoding.Extensible && format is WaveFormatExtensible extensible)
+                return extensible.SubFormat == IeeeFloatSubtype;
+            return format.Encoding == WaveFormatEncoding.IeeeFloat;
+        }
+    }
+
     /// <summary>Isolates the loopback from ffmpeg: proves whether WASAPI delivers buffers at all.</summary>
     public static int RunAudioProbe()
     {
