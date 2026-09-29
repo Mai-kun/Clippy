@@ -593,19 +593,16 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
         // The spike filled this texture before the first frame and this class did not, which was the
         // one remaining step of the working sequence that had never been reproduced. Filled once
-        // here: an untouched staging surface is not what the encoder was shown to accept, and the
-        // cost is a single 3 MB write at construction rather than one per frame.
-        try
-        {
-            var grey = new byte[(width * height * 3) / 2];
-            Array.Fill(grey, (byte)128);
-            deviceContext.UpdateSubresource(grey.AsSpan(), nv12Staging, 0, (uint)width, 0, null);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[mf-video] could not prefill the NV12 surface: {ex.Message}");
-        }
-
+        // The spike filled this texture before the first frame and this class did not. Filled once
+        // here, because an uninitialised staging surface is the one state in which
+        // MF_E_UNSUPPORTED_D3D_TYPE is the documented answer.
+        //
+        // Not wrapped in a catch that prints and continues: a swallowed failure here would leave exactly
+        // that uninitialised surface feeding the encoder, turning a loud and obviously-wrong surface
+        // into a quiet stream of rejected frames.
+        var grey = new byte[(width * height * 3) / 2];
+        Array.Fill(grey, (byte)128);
+        deviceContext.UpdateSubresource(grey.AsSpan(), nv12Staging, 0, (uint)width, 0, null);
         var sourceView = videoDevice.CreateVideoProcessorInputView(
             cpuSource, enumerator,
             new VideoProcessorInputViewDescription
