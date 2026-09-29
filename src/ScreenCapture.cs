@@ -994,7 +994,7 @@ internal sealed class ScreenCapture : IDisposable
 
         try
         {
-            var mf = MfVideoEncoder.Create(width, height);
+            var mf = MfVideoEncoder.Create(d3d11Device, d3d11Context, width, height);
             Console.WriteLine($"Video encoder: Media Foundation hardware H.264 (no ffmpeg process).");
             return mf;
         }

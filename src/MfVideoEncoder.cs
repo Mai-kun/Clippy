@@ -398,8 +398,8 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         targetView.Dispose();
         videoContext.Dispose();
         videoDevice.Dispose();
-        context.Dispose();
-        device.Dispose();
+        // device and context belong to ScreenCapture and outlive this encoder; releasing them here
+        // would leave the capture path on a dead device.
         transform.Dispose();
         ready.Dispose();
         drained.Dispose();
@@ -413,15 +413,26 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     /// accepted leaves the MFT answering MF_E_NOTACCEPTING to every frame forever, with nothing
     /// anywhere saying the order was the problem.
     /// </summary>
-    public static MfVideoEncoder Create(int width, int height)
+    public static MfVideoEncoder Create(ID3D11Device device, ID3D11DeviceContext context, int width, int height)
     {
         var h264 = new Guid("34363248-0000-0010-8000-00aa00389b71");
         var nv12 = new Guid("3231564e-0000-0010-8000-00aa00389b71");
-
-        D3D11.D3D11CreateDevice(
-            IntPtr.Zero, DriverType.Hardware, DeviceCreationFlags.BgraSupport,
-            new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0 },
-            out var device, out _, out _).CheckError();
+        // Direct3D 11 forbids moving a resource between devices, so an encoder that made its own
+        // device could never see the capture texture: the WGC frame pool is bound to
+        // ScreenCapture device. Frame pool, video processor and device manager must share one device.
+        //
+        // OnFrameArrived runs on a Windows thread pool thread while the drain thread may also touch
+        // the device, and ID3D11DeviceContext is not thread-safe unless it says so. Without this the
+        // two race on the same immediate context and the result is corrupted frames, not an error.
+        try
+        {
+            using var multithread = device.QueryInterface<ID3D11Multithread>();
+            multithread.SetMultithreadProtected(true);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[mf-video] multithread protection unavailable: {ex.Message}");
+        }
 
         // MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER. Enumerating software first would find
         // Microsoft H.264 encoder, which advertises the right output type and then cannot be driven.
@@ -434,7 +445,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
             MfVideoEncoder? candidate = null;
             try
             {
-                candidate = Build(activate, h264, nv12, width, height, device);
+                candidate = Build(activate, h264, nv12, width, height, device, context);
                 return candidate;
             }
             catch (Exception ex)
@@ -451,7 +462,8 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     }
 
     private static MfVideoEncoder Build(
-        IMFActivate activate, Guid h264, Guid nv12, int width, int height, ID3D11Device device)
+        IMFActivate activate, Guid h264, Guid nv12, int width, int height,
+        ID3D11Device device, ID3D11DeviceContext deviceContext)
     {
         var transform = activate.ActivateObject<IMFTransform>();
 
@@ -459,7 +471,8 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         // synchronously. Without this nothing below works, and the error names nothing helpful.
         transform.Attributes.Set(TransformAttributeKeys.TransformAsyncUnlock, 1u);
 
-        var deviceContext = device.ImmediateContext;
+        // The caller's context, fetched a second time here would be an AddRef that Dispose balances by
+        // releasing something the capture path still owns.
         var videoDevice = device.QueryInterface<ID3D11VideoDevice>();
         var videoContext = deviceContext.QueryInterface<ID3D11VideoContext>();
 
@@ -497,6 +510,21 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         // MF_E_UNSUPPORTED_D3D_TYPE on the very first ProcessInput, while a staging one is accepted.
         var nv12Staging = device.CreateTexture2D(
             Nv12Description(width, height, BindFlags.None, staging: true));
+
+        // The spike filled this texture before the first frame and this class did not, which was the
+        // one remaining step of the working sequence that had never been reproduced. Filled once
+        // here: an untouched staging surface is not what the encoder was shown to accept, and the
+        // cost is a single 3 MB write at construction rather than one per frame.
+        try
+        {
+            var grey = new byte[(width * height * 3) / 2];
+            Array.Fill(grey, (byte)128);
+            deviceContext.UpdateSubresource(grey.AsSpan(), nv12Staging, 0, (uint)width, 0, null);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[mf-video] could not prefill the NV12 surface: {ex.Message}");
+        }
 
         var sourceView = videoDevice.CreateVideoProcessorInputView(
             cpuSource, enumerator,
