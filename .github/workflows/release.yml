@@ -206,6 +206,22 @@ jobs:
           "contents:"
           Get-ChildItem publish | Select-Object Name, Length
 
+      # Submits the installer to microsoft/winget-pkgs so `winget install Mai-kun.Clippy` works.
+      # Requires a WINGET_TOKEN repository secret holding a PAT with the public_repo scope.
+      #
+      # A failure here does NOT fail the release: the GitHub release and both installers are already
+      # published by the time this runs, and losing the package manager listing is recoverable while a
+      # red X on the release is not. So the step is allowed to fail and the next one is what marks
+      # the workflow green.
+      - name: Submit to Windows Package Manager (Winget)
+        if: startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true
+        uses: vedantmgoyal2009/winget-releaser@v2
+        with:
+          identifier: Mai-kun.Clippy
+          installer-type: inno
+          token: ${{ secrets.WINGET_TOKEN }}
+
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
@@ -239,3 +255,4 @@ jobs:
             Клипы в `clips/`, отладочные логи в `logs/`.
           draft: false
           generate_release_notes: true
+

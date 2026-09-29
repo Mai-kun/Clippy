@@ -322,6 +322,11 @@ internal sealed class ScreenCapture : IDisposable
             Console.WriteLine($"Export: notification failed ({ex.GetType().Name}: {ex.Message}).");
         }
 
+        // After the file exists, not before: a quota check that ran first could delete the clip this
+        // export is about to write, if the folder were already at the limit and this clip's name
+        // happened to sort oldest.
+        ClipsQuota.Enforce(outputDirectory, config.MaxClipsFolderSizeGB);
+
         return path;
     }
 
@@ -554,7 +559,8 @@ internal sealed class ScreenCapture : IDisposable
             {
                 hotkeys = new HotkeyService(seconds => ExportClip(seconds), config);
                 hotkeys.Start();
-                Console.WriteLine("Hotkeys: F9 saves 30 s, F10 saves 3 min.");
+                Console.WriteLine($"Hotkeys: {config.ShortClipHotkey} saves {config.ShortClipSeconds:F0} s, " +
+                                    $"{config.LongClipHotkey} saves {config.LongClipSeconds:F0} s.");
 
                 // Lets the tray menu rebind without a restart, the one setting that can.
                 if (tray is not null)
@@ -569,7 +575,23 @@ internal sealed class ScreenCapture : IDisposable
             encoder?.WaitForDrain(TimeSpan.FromSeconds(3));
             audioEncoder?.WaitForDrain(TimeSpan.FromSeconds(3));
             audioEncoder?.PrintSampleAccounting();
-            ExportClip(duration?.TotalSeconds ?? 10);
+
+            // No automatic export on the way out. In tray mode `duration` is null, and that path used
+            // to slice ten seconds out of the ring every time the process ended -- quitting from the
+            // tray, closing the window or cancelling Ctrl+C all produced a file nobody asked for,
+            // silently overwriting nothing and quietly filling the disk.
+            //
+            // With an explicit --record N the file IS the point of the run, so that mode still writes.
+            // Everything else is a hotkey or an --export-at, both of which are deliberate.
+            if (duration is { } requested)
+            {
+                ExportClip(requested.TotalSeconds);
+            }
+            else
+            {
+                Console.WriteLine("Exiting without saving a clip. Press your hotkey to save one.");
+            }
+
             return 0;
         }
         finally

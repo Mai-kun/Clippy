@@ -71,8 +71,15 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_RATE_8 = 1303;
     private const uint IDC_RATE_12 = 1304;
     private const uint IDC_ENCODER_DIRECT = 1403;
+    private const uint IDC_PICK_FOLDER = 1601;
+    private const uint IDC_QUOTA_0 = 1610;
+    private const uint IDC_QUOTA_10 = 1611;
+    private const uint IDC_QUOTA_20 = 1612;
+    private const uint IDC_QUOTA_30 = 1613;
+    private const uint IDC_QUOTA_50 = 1614;
     private const uint IDC_ENCODER_NVENC = 1401;
     private const uint IDC_ENCODER_X264 = 1402;
+    private const uint IDC_KEYS_F8 = 1500;
     private const uint IDC_KEYS_F9 = 1501;
     private const uint IDC_KEYS_F11 = 1502;
 
@@ -446,6 +453,7 @@ public sealed partial class TrayIcon : IDisposable
         try
         {
             AppendMenu(menu, MF_STRING, IDC_OPEN_FOLDER, "Open Clips Folder");
+            AppendMenu(menu, MF_STRING, IDC_PICK_FOLDER, "Select Clips Folder...");
             AppendMenu(menu, MF_STRING, IDC_OPEN_CONFIG, "Open Config");
             AppendMenu(menu, MF_SEPARATOR, 0, "");
             AppendSettingsMenus(menu);
@@ -517,6 +525,21 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_ENCODER_X264:
                     ApplySetting("Encoder", "libx264", c => c.VideoEncoder = "libx264", live: false);
                     break;
+                case IDC_KEYS_F8:
+                    ApplySetting("Hotkeys", "F8 / F9", c =>
+                    {
+                        c.ShortClipHotkey = "F8";
+                        c.LongClipHotkey = "F9";
+                    }, live: true);
+                    break;
+                case IDC_PICK_FOLDER:
+                    PickClipsFolder();
+                    break;
+                case IDC_QUOTA_0: ApplyQuota(0); break;
+                case IDC_QUOTA_10: ApplyQuota(10); break;
+                case IDC_QUOTA_20: ApplyQuota(20); break;
+                case IDC_QUOTA_30: ApplyQuota(30); break;
+                case IDC_QUOTA_50: ApplyQuota(50); break;
                 case IDC_KEYS_F9:
                     ApplySetting("Hotkeys", "F9 / F10",
                         c => { c.ShortClipHotkey = "F9"; c.LongClipHotkey = "F10"; }, live: true);
@@ -612,12 +635,20 @@ public sealed partial class TrayIcon : IDisposable
             (IDC_ENCODER_X264, "CPU x264 (libx264)", config.VideoEncoder == "libx264"));
 
         var keys = Submenu(menu, "Hotkeys",
+            (IDC_KEYS_F8, "F8 / F9  (default)", config.ShortClipHotkey == "F8"),
             (IDC_KEYS_F9, "F9 / F10", config.ShortClipHotkey == "F9"),
             (IDC_KEYS_F11, "F11 / F12", config.ShortClipHotkey == "F11"));
 
+        var quota = Submenu(menu, "Clips Storage Limit",
+            (IDC_QUOTA_0, "Unlimited", config.MaxClipsFolderSizeGB == 0),
+            (IDC_QUOTA_10, "10 GB", config.MaxClipsFolderSizeGB == 10),
+            (IDC_QUOTA_20, "20 GB", config.MaxClipsFolderSizeGB == 20),
+            (IDC_QUOTA_30, "30 GB", config.MaxClipsFolderSizeGB == 30),
+            (IDC_QUOTA_50, "50 GB", config.MaxClipsFolderSizeGB == 50));
+
         // Keep the handles alive until after the parent menu is shown; the OS reads them during
         // TrackPopupMenuEx, not during AppendMenu.
-        _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = keys;
+        _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = keys; _ = quota;
     }
 
     private nint Submenu(nint parent, string title, params (uint Id, string Text, bool Checked)[] items)
@@ -639,6 +670,60 @@ public sealed partial class TrayIcon : IDisposable
     /// change them, so they take effect on the next session. Pretending otherwise would leave a
     /// check mark next to a setting that is not in force.
     /// </summary>
+    /// <summary>
+    /// Asks for a clips folder and stores the answer.
+    /// </summary>
+    /// <remarks>
+    /// The chosen path is absolute, which is what makes it survive a different working directory:
+    /// ResolveOutputFolder returns a rooted folder unchanged, and a relative one would follow whatever
+    /// the process happened to start in.
+    /// <para>
+    /// The quota runs immediately after, not at the next save. Moving the folder is the one moment a
+    /// user is definitely paying attention, so it is the one moment to find out that the new location is
+    /// already over the limit.
+    /// </para>
+    /// </remarks>
+    private void PickClipsFolder()
+    {
+        string? picked;
+        try
+        {
+            picked = FolderPicker.Pick("Choose where Clippy should save clips");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Folder picker failed ({ex.GetType().Name}: {ex.Message}).");
+            ShowNotification("Clippy", "Could not open the folder picker.");
+            return;
+        }
+
+        // A cancelled dialog is the most ordinary outcome there is and is not worth a notification.
+        if (picked is null)
+        {
+            Console.WriteLine("Folder picker: cancelled.");
+            return;
+        }
+
+        config.OutputFolder = picked;
+        config.Save();
+        Console.WriteLine($"Settings: OutputFolder = {picked}");
+        ShowNotification("Clippy", $"Clips folder updated: {picked}");
+
+        var deleted = ClipsQuota.Enforce(picked, config.MaxClipsFolderSizeGB);
+        if (deleted > 0)
+            ShowNotification("Clippy", $"Clips folder updated: {picked} (removed {deleted} old clip(s) over quota)");
+    }
+
+    /// <summary>Stores a new storage ceiling and enforces it against the current folder at once.</summary>
+    private void ApplyQuota(int gigabytes)
+    {
+        ApplySetting("Clips Storage Limit", gigabytes == 0 ? "Unlimited" : $"{gigabytes} GB",
+            c => c.MaxClipsFolderSizeGB = gigabytes, live: false);
+
+        var deleted = ClipsQuota.Enforce(config.ResolveOutputFolder(), gigabytes);
+        if (deleted > 0)
+            Console.WriteLine($"Quota: {deleted} clip(s) removed immediately.");
+    }
     private void ApplySetting(string name, string value, Action<ClippyConfig> mutate, bool live)
     {
         mutate(config);

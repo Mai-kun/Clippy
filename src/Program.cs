@@ -197,7 +197,7 @@ static int PrintUsage()
     Console.WriteLine();
     Console.WriteLine("Modifiers for --record:");
     Console.WriteLine("  --audio                    include system audio");
-    Console.WriteLine("  --hotkeys                  enable F9 / F10 clip export while recording");
+    Console.WriteLine("  --hotkeys                  enable the clip hotkeys (F8 / F9 by default)");
     Console.WriteLine("  --tray                     run in the tray (also --minimized)");
     Console.WriteLine("  --encoder=NAME             h264_nvenc | h264_qsv | h264_amf; falls back to libx264");
     Console.WriteLine("  --fps-mode=MODE            passthrough | vfr | cfr");

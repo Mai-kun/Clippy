@@ -22,8 +22,8 @@ public sealed class ClippyConfig
     public string LogsFolder { get; set; } = "logs";
     public double ShortClipSeconds { get; set; } = 30;
     public double LongClipSeconds { get; set; } = 180;
-    public string ShortClipHotkey { get; set; } = "F9";
-    public string LongClipHotkey { get; set; } = "F10";
+    public string ShortClipHotkey { get; set; } = "F8";
+    public string LongClipHotkey { get; set; } = "F9";
     public bool PlaySoundNotification { get; set; } = true;
 
     /// <summary>
@@ -53,6 +53,45 @@ public sealed class ClippyConfig
     /// Ignored by the software fallback, which is CRF-controlled and quality-targeted by design.
     /// </summary>
     public int VideoBitrateMbps { get; set; } = 6;
+
+    /// <summary>
+    /// A ceiling on how much disk the clips folder may use, in gigabytes. 0 means no ceiling.
+    /// </summary>
+    /// <remarks>
+    /// Clips accumulate silently, which is exactly the kind of thing a user does not notice until the
+    /// disk is full and something unrelated fails. When this is above zero, the oldest clips are deleted
+    /// after every save and again at startup, oldest first, until the folder fits. Only *.mp4 is counted
+    /// and only *.mp4 is deleted: the folder may hold other files, and silently removing a user's
+    /// unrelated downloads to satisfy a video quota would be unforgivable.
+    ///
+    /// The permitted values are 0, 10, 20, 30 and 50. Anything else is replaced by 0, so a typo means
+    /// "no limit" rather than "one gigabyte", which would delete clips without the user having asked
+    /// for a limit at all.
+    /// </remarks>
+    /// <summary>
+    /// The clips folder as an absolute path.
+    /// </summary>
+    /// <remarks>
+    /// One definition, because the quota, the tray's "open folder" and the exporter all have to be
+    /// looking at the same directory or the quota will police a folder nobody writes to.
+    /// <para>
+    /// A rooted <see cref="OutputFolder"/> wins over the base directory, which is what makes the
+    /// tray's folder picker work: it stores an absolute path and this returns it unchanged.
+    /// </para>
+    /// </remarks>
+    public string ResolveOutputFolder()
+    {
+        // Fully qualified on purpose. This class has a `Path` member of its own -- the location of the
+        // config file -- and inside the class body that name wins over System.IO.Path, so an unqualified
+        // Path.Combine here does not compile.
+        var folder = OutputFolder;
+        return System.IO.Path.GetFullPath(
+            System.IO.Path.IsPathRooted(folder)
+                ? folder
+                : System.IO.Path.Combine(AppContext.BaseDirectory, folder));
+    }
+
+    public int MaxClipsFolderSizeGB { get; set; }
 
     /// <summary>
     /// Which audio encoder runs. "media_foundation" (default) uses the Windows AAC MFT in-process and
@@ -114,15 +153,22 @@ public sealed class ClippyConfig
             if (config.LongClipSeconds <= 0)
                 config.LongClipSeconds = 180;
             if (!TryParseHotkey(config.ShortClipHotkey, out _))
-                config.ShortClipHotkey = "F9";
+                config.ShortClipHotkey = "F8";
             if (!TryParseHotkey(config.LongClipHotkey, out _))
-                config.LongClipHotkey = "F10";
+                config.LongClipHotkey = "F9";
+            if (config.MaxClipsFolderSizeGB is not (0 or 10 or 20 or 30 or 50))
+                config.MaxClipsFolderSizeGB = 0;
             if (string.IsNullOrWhiteSpace(config.OutputFolder))
                 config.OutputFolder = "clips";
             if (string.IsNullOrWhiteSpace(config.LogsFolder))
                 config.LogsFolder = "logs";
             if (config.VideoBitrateMbps is < 2 or > 50)
                 config.VideoBitrateMbps = 6;
+
+            // At startup as well as after every save. Startup is the half that matters: it is the only
+            // moment the user is not actively recording, so it is the safe time to reclaim a few hundred
+            // megabytes rather than making a save slow down to pay for last week's backlog.
+            ClipsQuota.Enforce(config.ResolveOutputFolder(), config.MaxClipsFolderSizeGB);
 
             return config;
         }
