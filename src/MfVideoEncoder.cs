@@ -53,6 +53,8 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
     private readonly ConcurrentQueue<double> captureTimes = new();
     private readonly List<IMFSample> inFlight = [];   // the MFT holds each one until it is encoded
+    private readonly ConcurrentQueue<IMFSample> inputQueue = new();
+
     private readonly H264AnnexBParser parser = new();
     private readonly object parserGate = new();
     private readonly ManualResetEventSlim ready = new(false);
@@ -62,7 +64,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     private RingBuffer? target;
     private volatile bool stopping;
     private double currentAccessUnitTime = -1;
-    private int captured;
+    private long captured;
     private int accessUnits;
     private long inFlightFrames;
     private int producedFrames;
@@ -98,7 +100,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
     public byte[]? Sps => sps;
     public byte[]? Pps => pps;
-    public (int Captured, int AccessUnits) TimingCounts => (captured, accessUnits);
+    public (int Captured, int AccessUnits) TimingCounts => ((int)captured, accessUnits);
 
     public void EnqueueCaptureTime(double captureClockSeconds) => captureTimes.Enqueue(captureClockSeconds);
 
@@ -167,41 +169,31 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         }
     }
 
+    /// <summary>
+    /// Queues one frame for the encoder. It does not call ProcessInput itself.
+    ///
+    /// An asynchronous MFT takes input when it asks for it, and calling ProcessInput at some other
+    /// moment is what MF_E_UNSUPPORTED_D3D_TYPE and MF_E_NOTACCEPTING both come from. So the capture
+    /// thread only prepares -- a sample wrapping the staging surface -- and the drain thread decides
+    /// when the frame is actually handed over, which is where METransformNeedInput arrives. This is
+    /// the arrangement the spike used, and it is the one that worked.
+    /// </summary>
     private void SubmitFrame()
     {
         if (stopping)
             return;
 
         var sample = MediaFactory.MFCreateSample();
-        // Not disposed here on purpose: the MFT keeps the sample and its surface for as long as the
-        // frame is in flight, and releasing our reference the moment ProcessInput returns leaves the
-        // encoder waiting on a surface nobody owns.
-        lock (inFlight)
-            inFlight.Add(sample);
-
+        // Not disposed here: the drain thread hands it to ProcessInput, and the MFT keeps its own
+        // reference to it and to the surface behind it until the frame is encoded.
         sample.AddBuffer(surfaceBuffer);
-        sample.SampleTime = 10_000_000L / Fps * Interlocked.Read(ref inFlightFrames);
+        sample.SampleTime = 10_000_000L / Fps * Interlocked.Read(ref queuedFrames);
         sample.SampleDuration = 10_000_000L / Fps;
-
-        for (var attempt = 0; ; attempt++)
-        {
-            try
-            {
-                transform.ProcessInput(0, sample, 0);
-                Interlocked.Increment(ref inFlightFrames);
-                Interlocked.Increment(ref captured);
-                return;
-            }
-            catch (SharpGenException ex) when (ex.HResult == NotAccepting)
-            {
-                // The encoder input queue is full: backpressure, not failure. At 30 fps this should not
-                // happen, and if it does it is a latency problem rather than a correctness one.
-                if (attempt > 250)
-                    throw new InvalidOperationException("the hardware encoder stopped accepting frames", ex);
-                Thread.Sleep(1);
-            }
-        }
+        inputQueue.Enqueue(sample);
+        Interlocked.Increment(ref queuedFrames);
     }
+
+    private long queuedFrames;
     public void StartDrain(RingBuffer targetBuffer)
     {
         target = targetBuffer;
@@ -241,22 +233,42 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         {
             while (!stopping)
             {
-                if (PumpEvents())
-                {
+                PumpEvents(out var needInput, out var haveOutput);
+
+                // Input first. METransformNeedInput is the MFT saying it has room, and it is the only
+                // moment a frame may be handed over; feeding at any other time is exactly what
+                // MF_E_UNSUPPORTED_D3D_TYPE and MF_E_NOTACCEPTING come from.
+                if (needInput)
+                    FeedOneQueuedSample();
+                else if (Interlocked.Read(ref captured) == 0)
+                    // An unlocked asynchronous MFT may not post METransformNeedInput until it has
+                    // been given something, so waiting for the request before the very first frame
+                    // waits forever. The spike opened the valve by hand for exactly this reason, and
+                    // dropping it is why the queue sat full while the recorder produced nothing.
+                    FeedOneQueuedSample();
+
+                if (haveOutput)
                     DrainOnce();
-                    continue;
-                }
-                Thread.Sleep(1);
+
+                if (!needInput && !haveOutput)
+                    Thread.Sleep(1);
             }
 
-            // Shutdown: ask for whatever is still inside, then take it. Without this the last GOP is
-            // dropped silently, and a recording that loses its final second looks like a clean stop.
+            // Shutdown: hand over whatever is still queued, ask for the rest, then take it. Without
+            // this the last GOP is dropped silently, and a recording that loses its final second looks
+            // exactly like a clean stop.
             try
             {
+                while (inputQueue.TryDequeue(out var pending))
+                {
+                    try { transform.ProcessInput(0, pending, 0); }
+                    catch (SharpGenException) { /* the MFT is finished asking; the tail is lost */ }
+                }
                 transform.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero);
                 for (var spin = 0; spin < 2000; spin++)
                 {
-                    if (!PumpEvents())
+                    PumpEvents(out _, out var more);
+                    if (!more)
                     {
                         Thread.Sleep(1);
                         continue;
@@ -278,9 +290,10 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         }
     }
 
-    private bool PumpEvents()
+    private void PumpEvents(out bool needInput, out bool haveOutput)
     {
-        var any = false;
+        needInput = false;
+        haveOutput = false;
         for (var i = 0; i < 16; i++)
         {
             IMFMediaEvent? ev;
@@ -300,11 +313,42 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
             using (ev)
             {
-                if (ev.EventType == MediaEventTypes.TransformHaveOutput)
-                    any = true;
+                if (ev.EventType == MediaEventTypes.TransformNeedInput)
+                    needInput = true;
+                else if (ev.EventType == MediaEventTypes.TransformHaveOutput)
+                    haveOutput = true;
             }
         }
-        return any;
+    }
+
+    /// <summary>
+    /// Hands the encoder one prepared frame, if there is one waiting.
+    ///
+    /// The queue is drained only in response to METransformNeedInput, never on a timer. That is the
+    /// whole contract with an asynchronous MFT: it asks for a frame when it has room, and offering one
+    /// at any other moment is answered with MF_E_NOTACCEPTING or, on this driver, the more alarming
+    /// MF_E_UNSUPPORTED_D3D_TYPE that reads like a format problem and is not one.
+    /// </summary>
+    private void FeedOneQueuedSample()
+    {
+        if (!inputQueue.TryDequeue(out var sample))
+            return;
+
+        try
+        {
+            transform.ProcessInput(0, sample, 0);
+            Interlocked.Increment(ref captured);
+        }
+        catch (SharpGenException ex) when (ex.HResult == NotAccepting)
+        {
+            // It changed its mind between the event and this call. Put the frame back at the head of
+            // the queue rather than dropping a frame and shifting every later timestamp with it.
+            inputQueue.Enqueue(sample);
+        }
+        catch (SharpGenException ex)
+        {
+            Console.WriteLine($"[mf-video] ProcessInput refused a frame: 0x{ex.HResult:x8} {ex.Message}");
+        }
     }
 
     private void DrainOnce()
@@ -625,89 +669,12 @@ internal sealed class MfVideoEncoder : IVideoEncoder
             typeof(ID3D11Texture2D).GUID, nv12Staging, 0, false);
         Console.WriteLine($"[mf-video] MFCreateDXGISurfaceBuffer accepted; encoding {width}x{height}");
 
-        // Isolation test, run once at construction while nothing else is running.
-        //
-        // The spike encoded 30 frames on a device it created itself, in an empty process. This runs the
-        // identical sequence on the capture device, with a synthetic frame, before any real capture
-        // exists. It is a two-way switch: if it passes, the device, the manager and the encoder are
-        // sound and the fault is in what WGC hands over or in when ProcessInput is called; if it fails,
-        // the fault is in the setup and is here, in a log with nothing else moving around it.
-        RunSelfTest(transform, surfaceBuffer, width, height);
 
         return new MfVideoEncoder(
             transform, device, deviceContext, videoDevice, videoContext, processor,
             sourceView, targetView, cpuSource, nv12Target, nv12Staging, surfaceBuffer, width, height);
     }
 
-    /// <summary>
-    /// Pushes one synthetic frame through a fully configured encoder and says whether it worked.
-    ///
-    /// Everything here is the spike's sequence, unchanged, on the capture device. There is no capture
-    /// session yet and no other thread, so whatever this reports is a property of the encoder
-    /// configuration alone -- which is the point. The output of a frame the encoder will actually
-    /// receive is discarded: the drain thread has not started and the ring does not exist yet, so the
-    /// bytes go nowhere and the first real frame's access unit is the second one out of the encoder.
-    /// That costs one frame of timestamps at startup and saves guessing about a 5-byte error code.
-    /// </summary>
-    private static void RunSelfTest(IMFTransform transform, IMFMediaBuffer surfaceBuffer, int width, int height)
-    {
-        var step = "self-test: create sample";
-        try
-        {
-            using var sample = MediaFactory.MFCreateSample();
-            sample.AddBuffer(surfaceBuffer);
-            sample.SampleTime = 0;
-            sample.SampleDuration = 10_000_000L / Fps;
-
-            step = "self-test: ProcessInput";
-            transform.ProcessInput(0, sample, 0);
-            Console.WriteLine("[mf-video] SELF-TEST: synthetic NV12 frame accepted by ProcessInput.");
-            Console.WriteLine("[mf-video] => the device, the device manager and the encoder are sound. " +
-                              "Any MF_E_UNSUPPORTED_D3D_TYPE in the live path comes from the WGC texture " +
-                              "or from calling ProcessInput when the MFT is not asking for a frame.");
-
-            step = "self-test: read output";
-            var info = transform.GetOutputStreamInfo(0);
-            var provides = (info.Flags & (int)OutputStreamInfoFlags.OutputStreamProvidesSamples) != 0;
-            using var probe = MediaFactory.MFCreateSample();
-            var data = new OutputDataBuffer { StreamID = 0, Sample = provides ? null : probe };
-            if (!provides)
-                probe.AddBuffer(MediaFactory.MFCreateMemoryBuffer(4 * 1024 * 1024));
-            for (var i = 0; i < 32; i++)
-            {
-                try
-                {
-                    transform.ProcessOutput(ProcessOutputFlags.None, 1, ref data, out _).CheckError();
-                }
-                catch (SharpGenException ex) when (ex.HResult is NeedsMoreInput or NotAccepting or Unexpected)
-                {
-                    System.Threading.Thread.Sleep(5);
-                    continue;
-                }
-
-                var produced = data.Sample ?? probe;
-                if (produced is null)
-                    break;
-                using var contiguous = produced.ConvertToContiguousBuffer();
-                contiguous.Lock(out _, out _, out var length);
-                contiguous.Unlock();
-                if (length > 0)
-                {
-                    Console.WriteLine($"[mf-video] SELF-TEST: first output packet {length} bytes. " +
-                                      "The whole path works; nothing is broken in the encoder.");
-                    return;
-                }
-            }
-            Console.WriteLine("[mf-video] SELF-TEST: ProcessInput succeeded but no output arrived " +
-                              "within 32 attempts.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[mf-video] SELF-TEST FAILED at {step}: {ex.Message}");
-            Console.WriteLine("[mf-video] => the failure is in the encoder configuration itself, on the " +
-                              "capture device, with no capture running. That is where to look next.");
-        }
-    }
 
     private static IMFMediaType BuildType(Guid subtype, int width, int height)
     {
