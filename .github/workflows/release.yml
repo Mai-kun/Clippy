@@ -37,11 +37,41 @@ jobs:
       # The selftests shell out to ffprobe, and a clean windows-latest image has neither ffmpeg nor
       # ffprobe on PATH. Without this the --test-mp4 step dies with a Win32Exception about a missing
       # file, which reads like a Clippy bug and is not one.
-      - name: Setup FFmpeg and FFprobe
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        with:
-          ffmpeg-version: release
-          architecture: x64
+      #
+      # Fetched from gyan.dev's *essentials* build rather than setup-ffmpeg's "release", because the
+      # full build is ~217 MB and nearly all of it is payload Clippy never uses: it carries a dozen
+      # encoders and their tables, while the runtime path only ever reaches for h264_nvenc. Essentials
+      # has that and cuts the download to roughly a third.
+      #
+      # Both exes are unpacked, and then only ffmpeg.exe goes into publish/. ffprobe goes on PATH for
+      # the selftests on this runner and no further: Clippy never calls it at runtime, so shipping it
+      # would add tens of megabytes that no user could ever benefit from.
+      - name: Fetch FFmpeg (essentials build)
+        shell: pwsh
+        run: |
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          $work = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          $zip = Join-Path $work 'ffmpeg-essentials.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          "downloaded: {0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
+
+          Expand-Archive -Path $zip -DestinationPath $work -Force
+          $bin = Get-ChildItem $work -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
+          if (-not $bin) { throw 'ffmpeg.exe is not inside the essentials archive' }
+
+          $ffprobe = Join-Path $bin.DirectoryName 'ffprobe.exe'
+          if (-not (Test-Path $ffprobe)) { throw 'ffprobe.exe is not inside the essentials archive' }
+
+          # PATH first: the selftests below need ffprobe, and this step is now the only thing that
+          # provides it, since setup-ffmpeg is gone.
+          $binDir = $bin.DirectoryName
+          "$binDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "$binDir;$env:PATH"
+
+          "ffmpeg : {0:N1} MB" -f ((Get-Item $bin.FullName).Length / 1MB)
+          "ffprobe: {0:N1} MB (test-only, not shipped)" -f ((Get-Item $ffprobe).Length / 1MB)
 
       - name: Publish (Native AOT)
         run: >
