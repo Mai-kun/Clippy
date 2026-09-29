@@ -15,7 +15,7 @@ namespace Clippy;
 /// ponytail: WASAPI delivers 10 ms packets, so a bounded queue (default 512, ~5 s) absorbs bursts
 /// without unbounded growth. Overflow is counted, never silent.
 /// </summary>
-internal sealed class AudioEncoder : IDisposable
+internal sealed class AudioEncoder : IAudioEncoder
 {
     private readonly Process process;
     private readonly Stream stdin;

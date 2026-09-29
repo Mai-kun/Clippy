@@ -59,7 +59,7 @@ internal sealed class ScreenCapture : IDisposable
     private string fpsMode = "passthrough";
     private bool withAudio;
     private AudioCapture? audio;
-    private AudioEncoder? audioEncoder;
+    private IAudioEncoder? audioEncoder;
     private string? videoOnlyPath;
     private string? audioOnlyPath;
     private bool audioCaptureOnly;
@@ -341,7 +341,12 @@ internal sealed class ScreenCapture : IDisposable
         }
     }
 
-    private FfmpegEncoder? encoder;
+    /// <summary>
+    /// The video encoder, behind its interface. Everything downstream -- rings, timestamps, the
+    /// aligner, the muxer -- depends on this abstraction and not on ffmpeg, which is what makes
+    /// swapping the encoder a change that cannot reach the A/V alignment.
+    /// </summary>
+    private IVideoEncoder? encoder;
 
     // Phase 4: the encoders feed these in-memory rings instead of writing files, and a clip is
     // produced by slicing them. The only thing the two share is the capture clock on each packet.

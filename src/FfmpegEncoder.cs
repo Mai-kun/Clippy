@@ -10,7 +10,7 @@ namespace Clippy;
 /// Audio is NOT handled here: it runs in its own process (AudioEncoder). Two live inputs in one
 /// ffmpeg deadlocked — measured 6 audio packets read out of ~450 while video flowed fine.
 /// </summary>
-internal sealed class FfmpegEncoder : IDisposable
+internal sealed class FfmpegEncoder : IVideoEncoder
 {
     private readonly Process process;
     private readonly Stream stdin;
