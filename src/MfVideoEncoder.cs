@@ -194,6 +194,16 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     }
 
     private long queuedFrames;
+
+    // Pipeline telemetry. Every stage of the frame's journey is counted separately, because "no clip
+    // came out" is not a diagnosis: knowing that the queue filled and nothing was ever fed, or that
+    // frames were fed and no output arrived, points at completely different places.
+    private long needInputCount;
+    private long haveOutputCount;
+    private long fedCount;
+    private long refusedCount;
+    private long drainedCount;
+    private long lastStatsTick;
     public void StartDrain(RingBuffer targetBuffer)
     {
         target = targetBuffer;
@@ -240,6 +250,13 @@ internal sealed class MfVideoEncoder : IVideoEncoder
                 // MF_E_UNSUPPORTED_D3D_TYPE and MF_E_NOTACCEPTING come from.
                 if (needInput)
                     FeedOneQueuedSample();
+                else if (Interlocked.Read(ref fedCount) == 0)
+                    // KEEP THIS, and the telemetry is why. Measured with it removed: the MFT posted
+                    // METransformNeedInput zero times across 500 queued frames, so the queue only grew
+                    // -- queued=441, needInput=0, fed=0, refused=0. The encoder cannot ask for input
+                    // until it has been given some, because it has no frame count to go on. So the
+                    // first frame is offered, and from then on the events drive the loop.
+                    FeedOneQueuedSample();
                 else if (Interlocked.Read(ref captured) == 0)
                     // An unlocked asynchronous MFT may not post METransformNeedInput until it has
                     // been given something, so waiting for the request before the very first frame
@@ -252,6 +269,21 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
                 if (!needInput && !haveOutput)
                     Thread.Sleep(1);
+
+                // Telemetry every two seconds. "No clip came out" is not a diagnosis; whether the
+                // queue filled and nothing was fed, or frames were fed and nothing came back, points
+                // at opposite ends of the pipeline and looks identical in the log without this.
+                if (Environment.TickCount64 - Interlocked.Read(ref lastStatsTick) >= 2000)
+                {
+                    Interlocked.Exchange(ref lastStatsTick, Environment.TickCount64);
+                    Console.WriteLine(
+                        $"[mf-stats] queued={inputQueue.Count} " +
+                        $"needInput={Interlocked.Read(ref needInputCount)} " +
+                        $"fed={Interlocked.Read(ref fedCount)} " +
+                        $"haveOutput={Interlocked.Read(ref haveOutputCount)} " +
+                        $"drained={Interlocked.Read(ref drainedCount)} " +
+                        $"refused={Interlocked.Read(ref refusedCount)}");
+                }
             }
 
             // Shutdown: hand over whatever is still queued, ask for the rest, then take it. Without
@@ -347,6 +379,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         }
         catch (SharpGenException ex)
         {
+            Interlocked.Increment(ref refusedCount);
             Console.WriteLine($"[mf-video] ProcessInput refused a frame: 0x{ex.HResult:x8} {ex.Message}");
         }
     }
@@ -389,6 +422,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
             return;
 
         Interlocked.Increment(ref producedFrames);
+        Interlocked.Increment(ref drainedCount);
         Interlocked.Decrement(ref inFlightFrames);
         ready.Set();
 
@@ -664,6 +698,16 @@ internal sealed class MfVideoEncoder : IVideoEncoder
                 ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
                 Texture2D = new Texture2DVideoProcessorOutputView { MipSlice = 0 },
             });
+
+        // The manager was told about `device`, and the surface below is wrapped out of a texture on
+        // `device`, so they must be the same object. If they ever are not, the MFT is handed a
+        // surface belonging to a device it was never given, and it answers with
+        // MF_E_UNSUPPORTED_D3D_TYPE -- which is indistinguishable, from the log, from a format
+        // problem. Cheap to check, so it is checked.
+        if (!ReferenceEquals(nv12Staging.Device, device) &&
+            nv12Staging.Device.NativePointer != device.NativePointer)
+            throw new InvalidOperationException(
+                "the NV12 surface and the DXGI device manager are on different devices.");
 
         var surfaceBuffer = MediaFactory.MFCreateDXGISurfaceBuffer(
             typeof(ID3D11Texture2D).GUID, nv12Staging, 0, false);
