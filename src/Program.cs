@@ -63,6 +63,11 @@ if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
     return PrintUsage();
 }
 
+if (args.Contains("--test-mft-audio"))
+{
+    return MfAudioPrototype.Run();
+}
+
 if (args.Contains("--smoke"))
 {
     return Clippy.SmokeTest.Run();
@@ -196,7 +201,7 @@ static int PrintUsage()
     Console.WriteLine("  --test-parsers             H.264 / AAC parser self-test");
     Console.WriteLine("  --test-ring                ring buffer self-test");
     Console.WriteLine("  --test-mp4                 MP4 writer self-test");
-    Console.WriteLine("  --test-audio-timeline      A/V timeline self-test");
+    Console.WriteLine("  --test-mft-audio          spike: can the system AAC encoder emit ADTS?");
     Console.WriteLine();
     Console.WriteLine($"Config: {ClippyConfig.Path}");
     return 0;
