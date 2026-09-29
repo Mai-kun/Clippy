@@ -1,5 +1,8 @@
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
+using Vortice.Direct3D;
+using Vortice.Direct3D11;
+using Vortice.DXGI;
 using Vortice.MediaFoundation;
 
 namespace Clippy;
@@ -33,6 +36,7 @@ internal static class MfVideoPrototype
     private const uint Width = 1920;
     private const uint Height = 1080;
     private const uint FpsNumerator = 30;
+    private const uint FpsDenominator = 1;
 
     // MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER: the synchronous, software encoders.
     private const uint SyncAndSorted = 0x00000008 | 0x00000040;
@@ -85,6 +89,33 @@ internal static class MfVideoPrototype
 
                 // The useful question is narrower than "does an encoder exist": can one take this
                 // machine's input format and emit Annex B. Only H.264 claims are worth driving.
+                //
+                // Hardware first: the async encoders are the only ones actually alive here, and the
+                // unlock + D3D manager dance below is the whole point of this spike. The software one
+                // is still driven afterwards, to keep a record of why it cannot work.
+                if (IsAsync(activate))
+                {
+                    Console.WriteLine();
+                    Console.WriteLine($"--- unlocking async: {Describe(activate)}");
+                    try
+                    {
+                        var result = DriveAsyncHardware(activate);
+
+                        // 2 means "worked perfectly, but it is a different codec" -- a skip, not a
+                        // failure. Counting it as driven would report the H.264 finding as a rejection.
+                        if (result == 0)
+                            return 0;
+                        if (result != 2)
+                            driven++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"    rejected: {ex.Message}");
+                        driven++;
+                    }
+                    continue;
+                }
+
                 if (!ClaimsH264(activate))
                     continue;
 
@@ -227,6 +258,161 @@ internal static class MfVideoPrototype
     }
 
     /// <summary>Reports every input type, including the HRESULT that stops the walk.</summary>
+    /// <summary>
+    /// Step 8.3A: bring an async hardware MFT to the point where it will talk about types at all.
+    /// An async MFT refuses every call with MF_E_TRANSFORM_ASYNC_LOCKED until it is unlocked, and
+    /// even unlocked it will not accept a D3D manager it was not told about -- without one it has
+    /// no device to allocate its internal surfaces on, so type negotiation simply stalls.
+    /// </summary>
+    private static int DriveAsyncHardware(IMFActivate activate)
+    {
+        var step = "activate";
+        try
+        {
+            using var transform = activate.ActivateObject<IMFTransform>();
+
+            // 1. Unlock the async state machine.
+            //
+            // The instruction for this step gives the GUID as 2477308D-C502-4F75-8F67-1F0167C503E9.
+            // That is wrong. Vortice's TransformAttributeKeys.TransformAsyncUnlock resolves to
+            // E5666D6B-3422-4EB6-A421-DA7DB1F8E207, which is the real MF_TRANSFORM_ASYNC_UNLOCK;
+            // the quoted value belongs to no attribute MF reads here, and setting it would have been
+            // a silent no-op that still ends in MF_E_TRANSFORM_ASYNC_LOCKED. Using the named constant
+            // rather than a literal also means a wrong GUID cannot be introduced later.
+            step = "set MF_TRANSFORM_ASYNC_UNLOCK";
+            transform.Attributes.Set(TransformAttributeKeys.TransformAsyncUnlock, 1u);
+            Console.WriteLine($"    MF_TRANSFORM_ASYNC_UNLOCK = {TransformAttributeKeys.TransformAsyncUnlock}");
+
+            // 2. A D3D11 device. Hardware video encoders never touch system memory: they read
+            //    GPU surfaces and write GPU surfaces, so the device has to exist before the manager.
+            step = "create D3D11 device";
+            D3D11.D3D11CreateDevice(
+                IntPtr.Zero,
+                DriverType.Hardware,
+                DeviceCreationFlags.BgraSupport,
+                new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0 },
+                out var device,
+                out _,
+                out var context).CheckError();
+            using (device)
+            using (context)
+            {
+                Console.WriteLine("    D3D11 device created (BGRA support)");
+
+                // 3. The manager wraps the device and is what the MFT is told to allocate on.
+                //
+                //    The instruction spells this MFCreateDXGIDeviceManager(out uint, out IMFDXGIDeviceManager).
+                //    Vortice exposes it as a parameterless factory returning the manager, with the
+                //    token exposed as a ResetToken property and the device handed to ResetDevice.
+                //    Same COM API, different binding -- no P/Invoke shim needed for this.
+                step = "create DXGI device manager";
+                using var manager = MediaFactory.MFCreateDXGIDeviceManager();
+                manager.ResetDevice(device).CheckError();
+                Console.WriteLine($"    IMFDXGIDeviceManager created, reset token = {manager.ResetToken}");
+
+                // 4. Hand the manager to the MFT. Without this the MFT has no device and every
+                //    later call fails or returns nothing -- the single step that makes the rest work.
+                step = "MFT_MESSAGE_SET_D3D_MANAGER";
+                transform.ProcessMessage(TMessageType.MessageSetD3DManager, (UIntPtr)manager.NativePointer);
+                Console.WriteLine("    MFT_MESSAGE_SET_D3D_MANAGER accepted");
+
+                // 5. The output type is now negotiable. This is the first moment the MFT could have
+                //    been asked for input types, so the earlier TYPE_NOT_SET wall should be gone.
+                step = "SetOutputType (H.264 1920x1080@30)";
+                var output = DescribeWantedOutput();
+                try
+                {
+                    transform.SetOutputType(0, output, 0);
+                }
+                catch (SharpGenException ex) when (ex.HResult == InvalidType)
+                {
+                    // The HEVC encoder is in the same enumeration and answers this perfectly
+                    // correctly -- it is not an H.264 encoder. Reporting it as a rejected candidate
+                    // would bury the real finding under a failure that is not one.
+                    Console.WriteLine($"    (not an H.264 encoder -- it refused the H.264 output type, as expected)");
+                    return 2;
+                }
+                Console.WriteLine("    SetOutputType accepted H.264 1920x1080@30 progressive");
+
+                // 6. The actual question of the step: what does this encoder want to be fed?
+                step = "enumerate input types";
+                ReportInputs(transform);
+
+                // Type negotiation is all this step promised, so a clean exit here is success --
+                // but only once a 1080p input type actually exists to accept. Reporting success on a
+                // list of unusable types would be the kind of green that means nothing.
+                step = "pick a 1920x1080 input type";
+                var input = Pick(transform, Width, Height);
+                if (input is null)
+                    throw new InvalidOperationException("negotiation succeeded but no 1920x1080 input type was offered.");
+                Console.WriteLine($"    => async MFT unlocked; it wants {FormatName(Subtype(input))} " +
+                                  $"{Width}x{Height}. Input is a D3D11 texture, not CPU memory.");
+                Console.WriteLine("Step 8.3A result: the async H.264 MFT negotiates types once unlocked and " +
+                                  "given a D3D manager. It has NOT yet emitted a byte -- feeding it a " +
+                                  "texture and reading Annex B back is the next step, not this one.");
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"at {step}: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Builds H.264 1920x1080@30 progressive, 6 Mbit/s by hand.
+    ///
+    /// The software MFT offered an output type that declared no frame size, and SetOutputType then
+    /// failed with MF_E_ATTRIBUTENOTFOUND -- it wanted attributes the published type did not carry.
+    /// The hardware path is the reverse case: the attributes have to be supplied, because there is
+    /// no published type to copy them from. Hence every field is set explicitly.
+    /// </summary>
+    private static IMFMediaType DescribeWantedOutput()
+    {
+        // Not wrapped in `using`: the caller hands this straight to SetOutputType, and disposing it
+        // here would drop the COM refcount that call depends on.
+        var type = MediaFactory.MFCreateMediaType();
+        type.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
+        type.Set(MediaTypeAttributeKeys.Subtype, H264);
+
+        // Frame size and frame rate are UINT64 attributes carrying a pair, high half first.
+        // Writing them as a plain int would be silently truncated rather than rejected.
+        type.Set(MediaTypeAttributeKeys.FrameSize, ((ulong)Height << 32) | Width);
+        type.Set(MediaTypeAttributeKeys.FrameRate, ((ulong)FpsNumerator << 32) | FpsDenominator);
+
+        type.Set(MediaTypeAttributeKeys.AvgBitrate, 6_000_000u);
+        type.Set(MediaTypeAttributeKeys.InterlaceMode, 2u); // progressive
+        type.Set(MediaTypeAttributeKeys.Compressed, true);
+        return type;
+    }
+
+    /// <summary>
+    /// Names a video subtype. Media Foundation prints raw GUIDs, but "3231564e-0000-0010-..." is a
+    /// question the reader has to answer by hand, and the entire point of listing the input types is to
+    /// read them at a glance.
+    ///
+    /// Two families share the first DWORD and nothing marks which is which. A FourCC subtype stores
+    /// its four characters low byte first, so NV12 is 0x3231564E -- numerically indistinguishable from
+    /// a DXGI format number, which is why the test is whether the bytes are printable characters and
+    /// not whether the value is large. Get it wrong and every format looks exotic, or every format
+    /// looks like a FourCC.
+    /// </summary>
+    private static string FormatName(Guid subtype)
+    {
+        var head = subtype.ToString("N")[..8];   // the first DWORD, as MF wrote it
+        var value = uint.Parse(head, System.Globalization.NumberStyles.HexNumber);
+
+        if (value == 0)
+            return "none";
+
+        var b = new[] { (byte)value, (byte)(value >> 8), (byte)(value >> 16), (byte)(value >> 24) };
+        var printable = b.All(c => c is >= 0x20 and < 0x7f);
+        if (!printable)
+            return $"numeric 0x{value:X} (a DXGI format value, not a FourCC)";
+
+        return $"{System.Text.Encoding.ASCII.GetString(b)} (0x{value:X8})";
+    }
+
     private static void ReportInputs(IMFTransform transform)
     {
         for (var i = 0; i < 32; i++)
@@ -238,11 +424,17 @@ internal static class MfVideoPrototype
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"      in[{i}] -> {ex.Message}");
+                // Walking off the end of the list is the normal way to end, not a failure.
+                Console.WriteLine($"      in[{i}] (end of list: {ex.HResult:x8})");
                 return;
             }
 
-            Console.WriteLine($"      in[{i}] {Describe(type)}");
+            using (type)
+            {
+                var size = FrameSize(type);
+                Console.WriteLine($"      in[{i}] {FormatName(Subtype(type))} " +
+                                  $"{size.Item1}x{size.Item2}@{FrameRate(type)}");
+            }
         }
     }
 
@@ -278,6 +470,22 @@ internal static class MfVideoPrototype
             atSize ??= type;
         }
         return atSize;
+    }
+
+    /// <summary>Frame rate of a type, or "?" when it does not declare one.</summary>
+    private static string FrameRate(IMFMediaType type)
+    {
+        try
+        {
+            var v = type.GetUInt64(MediaTypeAttributeKeys.FrameRate);
+            var num = v >> 32;
+            var den = v & 0xffffffff;
+            return den == 0 ? "?" : $"{num / den:0.##}";
+        }
+        catch
+        {
+            return "?";
+        }
     }
 
     private static IMFMediaType? First(IMFTransform transform, bool output)
@@ -319,13 +527,14 @@ internal static class MfVideoPrototype
         return bytes;
     }
 
-    private static readonly Guid Nv12 = new("30313256-0000-0010-8000-00aa00389b71");
-    private static readonly Guid Bgra = new("30315841-0000-0010-8000-00aa00389b71");
-    private static readonly Guid H264 = new("34363248-0000-0010-8000-00aa00389b71");
+    private static readonly Guid Nv12 = new("3231564e-0000-0010-8000-00aa00389b71");
+    private static readonly Guid Bgra = new("41485242-0000-0010-8000-00aa00389b71"); // 'B','R','A','8'
+    private static readonly Guid H264 = new("34363248-0000-0010-8000-00aa00389b71"); // 'H','2','6','4'
 
     // Normal answers from a buffered MFT, not failures. const so they can be used in a pattern.
     private const int NeedMoreInput = unchecked((int)0xC00D6D72);  // MF_E_TRANSFORM_NEED_MORE_INPUT
     private const int NotAccepting = unchecked((int)0xC00D36B5);    // MF_E_NOTACCEPTING
+    private const int InvalidType = unchecked((int)0xC00D36BD);      // MF_E_INVALIDTYPE
 
     private static bool ClaimsH264(IMFActivate activate)
     {
