@@ -737,14 +737,27 @@ internal sealed class ScreenCapture : IDisposable
                 if (currentFrame == 1)
                     videoStartSeconds = stopwatch.Elapsed.TotalSeconds;
 
-                var videoTexture = CaptureInterop.GetTexture(frame.Surface);
-                var pixels = CopyTextureToCpu(videoTexture, out var frameVideoWidth, out var frameVideoHeight);
-                videoTexture.Dispose();
+                // The frame is already on the GPU, so reading it back into system memory is a cost with
+                // no purpose when the encoder is ours: MfVideoEncoder converts the capture texture to
+                // NV12 with the video processor, device-side, and never sees a CPU pixel. The CPU read
+                // is kept for the ffmpeg path, which has no other way in.
+                byte[]? pixels = null;
+                using (var videoTexture = CaptureInterop.GetTexture(frame.Surface))
+                {
+                    if (encoder is MfVideoEncoder mf && videoWidth > 0)
+                    {
+                        mf.PushTexture(videoTexture);
+                    }
+                    else
+                    {
+                        pixels = CopyTextureToCpu(videoTexture, out var w, out var h);
+                        videoWidth = w;
+                        videoHeight = h;
+                    }
+                }
 
                 if (encoder is null)
                 {
-                    videoWidth = frameVideoWidth;
-                    videoHeight = frameVideoHeight;
                     // Phase 4: both encoders feed in-memory rings. A clip is produced by slicing
                     // those rings, not by reading back files.
                     videoRing = new RingBuffer(RingSeconds, isVideo: true);
@@ -778,12 +791,11 @@ internal sealed class ScreenCapture : IDisposable
                             Console.WriteLine($"Audio: system loopback [{audio.Format}]");
                         }
 
-                        encoder = FfmpegVideoEncoder.StartWithFallback(
+                        encoder = StartVideoEncoder(
                             videoOnlyPath,
                             videoWidth,
                             videoHeight,
                             videoEncoder ?? config.VideoEncoder,
-                            config.VideoBitrateMbps,
                             stopwatch,
                             fpsMode,
                             logsDirectory);
@@ -792,12 +804,11 @@ internal sealed class ScreenCapture : IDisposable
                     }
                     else
                     {
-                        encoder = FfmpegVideoEncoder.StartWithFallback(
+                        encoder = StartVideoEncoder(
                             videoPath,
                             videoWidth,
                             videoHeight,
                             videoEncoder ?? config.VideoEncoder,
-                            config.VideoBitrateMbps,
                             stopwatch,
                             fpsMode,
                             logsDirectory);
@@ -836,7 +847,9 @@ internal sealed class ScreenCapture : IDisposable
                 // stopwatch origin is subtracted once and both tracks share one hardware clock.
                 var frameQpcSeconds = frame.SystemRelativeTime.Ticks / (double)System.Diagnostics.Stopwatch.Frequency;
                 encoder.EnqueueCaptureTime(frameQpcSeconds - masterZeroSeconds);
-                encoder.Write(pixels, frame.SystemRelativeTime.TotalMilliseconds);
+                if (pixels is not null)
+                    if (pixels is not null)
+                    encoder.Write(pixels, frame.SystemRelativeTime.TotalMilliseconds);
 
                 // The first write is what lets ffmpeg finish probing and open its input; only then is
                 // it meaningful to wait for readiness. Both processes are confirmed up before any
@@ -947,16 +960,51 @@ internal sealed class ScreenCapture : IDisposable
         if (!hadEncoder || videoPath is null || ring is null)
             return;
 
-        encoder = FfmpegVideoEncoder.StartWithFallback(
+        encoder = StartVideoEncoder(
             videoOnlyPath ?? videoPath,
             newWidth,
             newHeight,
             videoEncoder ?? config.VideoEncoder,
-            config.VideoBitrateMbps,
             stopwatch,
             fpsMode,
             logsDirectory);
         encoder.StartDrain(ring);
+    }
+
+    /// <summary>
+    /// Starts whichever video encoder was asked for, falling back to ffmpeg if it cannot run.
+    ///
+    /// The fallback is not a nicety. Media Foundation needs a registered hardware H.264 encoder, and a
+    /// machine without one -- an older laptop, a VM, a driver that has not been installed yet -- is a
+    /// normal thing to run Clippy on. Refusing to record there would be a worse failure than recording
+    /// through the slower path, so the choice degrades and says so, and the reason is printed rather
+    /// than swallowed: "media_foundation" silently producing an ffmpeg-encoded clip is exactly the
+    /// kind of surprise that costs an afternoon.
+    /// </summary>
+    private IVideoEncoder StartVideoEncoder(
+        string path, int width, int height, string? preferred,
+        Stopwatch clock, string fpsMode, string? logs)
+    {
+        var wanted = preferred ?? config.VideoEncoder;
+        if (!string.Equals(wanted, "media_foundation", StringComparison.OrdinalIgnoreCase))
+        {
+            return FfmpegVideoEncoder.StartWithFallback(
+                path, width, height, wanted, config.VideoBitrateMbps, clock, fpsMode, logs);
+        }
+
+        try
+        {
+            var mf = MfVideoEncoder.Create(width, height);
+            Console.WriteLine($"Video encoder: Media Foundation hardware H.264 (no ffmpeg process).");
+            return mf;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Video encoder: Media Foundation unavailable -> {ex.Message}");
+            Console.WriteLine("Video encoder: falling back to ffmpeg, which is slower and spawns a process.");
+            return FfmpegVideoEncoder.StartWithFallback(
+                path, width, height, "libx264", config.VideoBitrateMbps, clock, fpsMode, logs);
+        }
     }
 
     /// <summary>Stages a GPU texture into system RAM as tightly packed BGRA rows.</summary>
