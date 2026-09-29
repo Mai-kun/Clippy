@@ -359,6 +359,18 @@ internal static class MfVideoPrototype
                 Console.WriteLine($"    => async MFT unlocked; it wants {FormatName(Subtype(input))} " +
                                   $"{Width}x{Height}. Input is a D3D11 texture, not CPU memory.");
 
+                // The order below is the one that works, and every part of it is load-bearing: the
+                // input type first, then the D3D manager again, then the stream is declared to
+                // exist. Declaring the stream before the input type is accepted leaves the MFT
+                // answering MF_E_NOTACCEPTING to every frame that follows, and nothing anywhere
+                // says the order was wrong.
+                transform.SetInputType(0, input, 0);
+                transform.ProcessMessage(TMessageType.MessageSetD3DManager, (UIntPtr)manager.NativePointer);
+                transform.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
+                transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
+                Console.WriteLine($"    SetInputType {FormatName(Subtype(input))}; D3D manager re-sent; " +
+                                  "BEGIN_STREAMING / START_OF_STREAM sent");
+
                 step = "encode a clip";
                 var stream = transform.GetOutputStreamInfo(0);
                 var provides = (stream.Flags & (int)OutputStreamInfoFlags.OutputStreamProvidesSamples) != 0;
@@ -573,6 +585,9 @@ internal static class MfVideoPrototype
     ///
     /// WGC hands over BGRA, so BGRA is what the converter has to be fed if this is to say anything
     /// about the real capture path. Anything else would test a conversion the recorder never performs.
+    ///
+    /// RenderTarget as well as ShaderResource: the video processor writes its result into a render
+    /// target, and a source that is not bindable that way is rejected at view creation.
     /// </summary>
     private static ID3D11Texture2D MakeColourSourceTexture(ID3D11Device device, Vortice.DXGI.Format format)
     {
@@ -585,7 +600,7 @@ internal static class MfVideoPrototype
             Format = format,
             SampleDescription = new SampleDescription(1, 0),
             Usage = ResourceUsage.Default,
-            BindFlags = BindFlags.ShaderResource,
+            BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
             CPUAccessFlags = CpuAccessFlags.None,
             MiscFlags = ResourceOptionFlags.None,
         });
@@ -629,7 +644,7 @@ internal static class MfVideoPrototype
     ///
     /// Separate from MakeNv12Texture, which returns the Staging texture the encoder insists on: the
     /// scaler cannot write a staging resource, and the encoder will not take a Default one, so there
-    /// have to be two and a device-side copy between them.
+    /// have to be two and a device-side copy between them. RenderTarget is what the scaler needs.
     /// </summary>
     private static ID3D11Texture2D MakeNv12TargetTexture(ID3D11Device device, Vortice.DXGI.Format format)
     {
@@ -642,7 +657,7 @@ internal static class MfVideoPrototype
             Format = format,
             SampleDescription = new SampleDescription(1, 0),
             Usage = ResourceUsage.Default,
-            BindFlags = BindFlags.None,
+            BindFlags = BindFlags.RenderTarget,
             CPUAccessFlags = CpuAccessFlags.None,
             MiscFlags = ResourceOptionFlags.None,
         });
@@ -744,9 +759,13 @@ internal static class MfVideoPrototype
     /// </summary>
     private static int EncodeSeries(IMFTransform transform, ID3D11Device device, IMFMediaType input, bool providesSamples)
     {
-        var step = "video processor";
+        var step = "SetInputType";
         try
         {
+            // Negotiation set the output type; the input type still has to be accepted before any frame
+            // is offered. Skipping it is not a no-op -- the MFT answers MF_E_TRANSFORM_TYPE_NOT_SET on
+            // the first ProcessInput, which reads exactly like a broken encoder.
+            // The MFT is fully configured by the caller; this method owns the frames and the clock.
             // Whether the caller supplies the output sample or the MFT does is a declared property of
             // the output stream, and getting it wrong returns S_OK with an empty sample, not an error.
             var context = device.ImmediateContext;
@@ -772,7 +791,9 @@ internal static class MfVideoPrototype
             step = "CreateVideoProcessor";
             using var processor = videoDevice.CreateVideoProcessor(enumerator, 0);
 
-            // The content description says nothing about pixel formats, so the enumerator picks them,
+            // The content description carries no pixel formats at all -- the native struct is 40 bytes
+            // and has no InputFormat/OutputFormat members -- so the formats come from the textures the
+            // views are built over. That makes the enumerator's own opinion unasked for and unasked:
             // and the views are validated against its choice rather than ours. Vortice cannot report
             // that choice -- VideoProcessorCaps.InputFormatCaps is bound as an enum instead of the
             // struct it actually is, so the format pair is unreachable -- but CheckVideoProcessorFormat
@@ -812,10 +833,9 @@ internal static class MfVideoPrototype
                 source, enumerator,
                 new VideoProcessorInputViewDescription
                 {
-                    // FourCC here is the DXGI_FORMAT value cast to a DWORD, not a text code. Left at
-                    // zero the runtime cannot tell what the view is looking at and answers
-                    // E_INVALIDARG -- a confusing way to say "you did not fill this in".
-                    FourCC = (uint)(int)Vortice.DXGI.Format.B8G8R8A8_UNorm,
+                    // Strictly zero. FourCC is for compressed formats only; a non-zero value with a
+                    // plain DXGI format underneath is a confident-looking way to ask for E_INVALIDARG.
+                    FourCC = 0,
                     ViewDimension = VideoProcessorInputViewDimension.Texture2D,
                     Texture2D = new Texture2DVideoProcessorInputView { MipSlice = 0, ArraySlice = 0 },
                 });
@@ -841,6 +861,7 @@ internal static class MfVideoPrototype
             var bytes = 0;
 
             step = $"encode {Frames} frames";
+            var inFlight = new List<IMFSample>();
             for (var i = 0; i < Frames; i++)
             {
                 // Per frame: repaint the source, convert on the GPU, then hand the encoder a sample.
@@ -860,11 +881,37 @@ internal static class MfVideoPrototype
                 // Staging one. One device-side copy bridges the two, and it stays in VRAM.
                 context.CopyResource(encoderInput, converted);
 
-                using var frameSample = MediaFactory.MFCreateSample();
+                var frameSample = MediaFactory.MFCreateSample();
+                // Deliberately NOT disposed. The MFT holds a reference to the sample and to the surface
+                // behind it for as long as the frame is in flight, and disposing here drops our
+                // reference the instant ProcessInput returns -- leaving the encoder waiting on a
+                // surface nobody owns. The one-frame version of this spike could not hit this; it only
+                // appears now that frames are fed back to back.
+                inFlight.Add(frameSample);
                 frameSample.AddBuffer(surfaceBuffer);
                 frameSample.SampleTime = 10_000_000L / FpsNumerator * i;
                 frameSample.SampleDuration = 10_000_000L / FpsNumerator;
-                transform.ProcessInput(0, frameSample, 0);
+
+                // Backpressure, not a straight loop. Pushing Frames samples in regardless is answered
+                // with MF_E_NOTACCEPTING once the encoder's input queue fills, and treating that as
+                // fatal would conclude the hardware cannot keep up when in fact the caller simply
+                // stopped listening. So a full queue means drain harder and try again.
+                for (var attempt = 0; ; attempt++)
+                {
+                    try
+                    {
+                        transform.ProcessInput(0, frameSample, 0);
+                        break;
+                    }
+                    catch (SharpGenException ex) when (ex.HResult == NotAccepting)
+                    {
+                        if (attempt > 500)
+                            throw new InvalidOperationException(
+                                $"the encoder stopped accepting input after {i} frames", ex);
+                        Drain(transform, events, providesSamples, parser, Collect, ref packets, ref bytes);
+                        Thread.Sleep(1);
+                    }
+                }
 
                 Drain(transform, events, providesSamples, parser, Collect, ref packets, ref bytes);
             }
