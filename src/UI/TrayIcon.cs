@@ -197,43 +197,53 @@ public sealed partial class TrayIcon : IDisposable
     [LibraryImport("user32.dll", EntryPoint = "LoadIconW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial nint LoadIcon(nint instance, nint name);
 
-    // Extracts an icon embedded in an executable, by path. This is how the tray picks up whatever
-    // ApplicationIcon put in the csproj, so the taskbar, the Alt-Tab entry, the Explorer icon and the
-    // tray all show the same thing instead of drifting apart.
+    // Extracts the icon embedded in an executable, by path, handing back the 32x32 and the 16x16
+    // in one call. This is how the tray picks up whatever ApplicationIcon put in the csproj, so the
+    // taskbar, the Alt-Tab entry, the Explorer icon and the tray all show the same artwork instead
+    // of drifting apart.
     //
-    // hInstance is NULL on purpose: that makes the shell read the icon out of the file on disk, which
-    // is the icon as installed. Passing our own module handle would look it up in the loaded image
-    // instead, which also works but ties the result to this run rather than to the executable.
-    [LibraryImport("shell32.dll", EntryPoint = "ExtractIconW", StringMarshalling = StringMarshalling.Utf16)]
-    private static partial nint ExtractIcon(nint instance, string exePath, uint iconIndex);
+    // ExtractIconEx rather than ExtractIconW because this icon is a size set, not a single image.
+    // ExtractIconW can only ever return the largest one, and the tray draws about 16 logical pixels,
+    // so the shell would scale 128x128 down on every single repaint and it looks soft.
+    [LibraryImport("shell32.dll", EntryPoint = "ExtractIconExW", StringMarshalling = StringMarshalling.Utf16)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool ExtractIconEx(string exePath, int iconIndex, out nint large, out nint small, uint count);
+
+    // Only used to pick between the 16x16 and the 32x32 image, never for layout. GetDpiForSystem
+    // arrived in Windows 10 1607, well below the 1803 floor that Windows Graphics Capture and the
+    // NVENC bridge already impose, so there is no older machine to fall back on.
+    [LibraryImport("user32.dll", EntryPoint = "GetDpiForSystem")]
+    private static partial uint GetDpiForSystem();
 
     /// <summary>
-    /// The application's own icon, or the generic system one when it cannot be read.
+    /// Fills the icon handle of the notification data, or falls back to the system icon.
     /// </summary>
     /// <remarks>
-    /// ExtractIconW answers with the value 1, not NULL, when the index is out of range or the file
-    /// carries no icons, so both have to be treated as failure. Checking only for NULL leaves a
-    /// bogus handle in the notification data and the tray shows nothing at all -- a failure that
-    /// looks identical to "the shell ignored us".
+    /// NOTIFYICONDATA has one hIcon slot and no small-icon field -- hIconSm belongs to WNDCLASSEX,
+    /// not here -- so the size has to be chosen before handing it over rather than left to the shell.
+    /// The tray is roughly 16 logical pixels tall, which makes the 16x16 image the right one at
+    /// 100% and 150%; only from 200% up does the tray have pixels for the 32x32 to earn.
     /// <para>
     /// The handle is deliberately never destroyed. The shell does not own icons returned by
-    /// ExtractIconW and never frees them, and this one has to stay valid for the life of the tray
-    /// icon; leaking a single 32x32 handle in a process that may run for days is cheaper than
-    /// handing the shell a freed icon.
+    /// ExtractIconEx and never frees them, and it has to stay valid for as long as the tray icon
+    /// exists; leaking two handles in a process that may run for days is cheaper than handing the
+    /// shell a freed icon.
     /// </para>
     /// </remarks>
-    private static nint LoadApplicationIcon()
+    private static void LoadApplicationIcons(ref NotifyIconData nid)
     {
         var path = Environment.ProcessPath;
-        if (!string.IsNullOrEmpty(path))
+        if (!string.IsNullOrEmpty(path) &&
+            ExtractIconEx(path, 0, out var large, out var small, 1) && large != 0)
         {
-            var icon = ExtractIcon(0, path, 0);
-            if (icon != 0 && icon != 1)
-                return icon;
+            // 100% and 150% -> the 16x16, drawn verbatim. 200% and up -> the 32x32, which is the
+            // only one of the two with enough pixels for the tray to draw at that size.
+            nid.hIcon = small != 0 && GetDpiForSystem() <= 144 ? small : large;
+            return;
         }
 
         Console.WriteLine($"Tray: no embedded icon found in {path ?? "(unknown path)"}, using the system one.");
-        return LoadIcon(0, new nint(IDI_APPLICATION));
+        nid.hIcon = LoadIcon(0, new nint(IDI_APPLICATION));
     }
 
     [LibraryImport("user32.dll", EntryPoint = "CreatePopupMenu")]
@@ -419,9 +429,11 @@ public sealed partial class TrayIcon : IDisposable
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
 
-        // The icon embedded in this executable. Replaces IDI_APPLICATION, which put the generic
-        // window glyph in the tray no matter what the exe carried.
-        nid.hIcon = LoadApplicationIcon();
+        // The icon embedded in this executable. Replaces IDI_APPLICATION, which put the generic window
+        // glyph in the tray no matter what the exe carried. The size is picked here rather than left
+        // to the shell, because a single hIcon scaled down from 128x128 to the tray's 16 pixels is
+        // what makes a tray icon look soft.
+        LoadApplicationIcons(ref nid);
 
         // Copies straight into the inline UTF-16 buffer. CopyFrom stops at the NUL, so the rest of
         // the array stays zeroed as the default initialisation left it.

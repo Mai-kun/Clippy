@@ -2,7 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Clippy.csproj" />
   </Folder>
-  <PropertyGroup>
-    <ApplicationIcon>assets\app.ico</ApplicationIcon>
-  </PropertyGroup>
+  <!-- No ApplicationIcon here on purpose. The icon belongs to the project, not the solution:
+       a second copy at solution level can win the merge and silently drift from the csproj one,
+       which is how the exe ends up with no icon and nothing reports an error. -->
 </Solution>
