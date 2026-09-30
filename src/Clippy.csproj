@@ -14,7 +14,9 @@
     <TrimMode>partial</TrimMode>
 
     <!-- The icon for the executable, and the source for the taskbar, the Alt-Tab entry and the tray:
-         TrayIcon reads it back out of this binary with ExtractIconW, so all four show the same thing. -->
+         TrayIcon reads it back out of this binary with ExtractIconExW, so all four show the same
+         thing. It has to be a real size set, not one image: the tray needs the 16x16 drawn verbatim
+         rather than a 128x128 scaled down. -->
     <ApplicationIcon>assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 
