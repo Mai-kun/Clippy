@@ -397,6 +397,42 @@ internal sealed class ScreenCapture : IDisposable
     private int frameCount;
     private bool disposed;
 
+    // ---- Capture rate calibration, for the direct NVENC path only ----
+    //
+    // NVENC is told a frame rate (init.frameRateNum) and splits the requested bitrate across it. If it
+    // is told 30 while Windows.Graphics.Capture actually delivers 48, it grants each of the 48 frames
+    // per second a 30fps-sized budget and the clip comes out at 48/30 = 1.6x the number the user asked
+    // for. Measured on 2026-10-01 with a 4 Mbit/s setting: 6.49 Mbit/s written, x1.62 over, and the
+    // same x1.60 at 10 Mbit/s. Passing the real rate fixed it exactly -- 4.00 Mbit/s, x0.999.
+    //
+    // The rate cannot come from the display mode. On the machine that was measured on, the monitor
+    // reports 144 Hz through EnumDisplaySettings while WGC delivers 48 -- asking the display would have
+    // overshot by 4.8x instead of 1.6x. Only frames that actually arrived are worth anything.
+    //
+    // Which is the problem this solves: frames arrive only after StartCapture, and the encoder is
+    // deliberately built before it (see Capture, for the Media Foundation ordering). So the encoder is
+    // opened from the first frame callback instead, and only for NVENC. Media Foundation and ffmpeg
+    // keep the old eager path, because there the ordering is not optional.
+    private int rateControlFps = 30;
+    private bool rateControlFpsMeasured;
+    private bool prefersDirectNvenc;
+    private int fpsCalibrationFrames;
+    private TimeSpan fpsCalibrationStart;
+
+    /// <summary>
+    /// Frames of calibration before the NVENC session is opened.
+    /// </summary>
+    /// <remarks>
+    /// Forty frames is about eight tenths of a second at 48 Hz and two thirds at 60 Hz. Enough for the
+    /// average to be stable, short enough that a user pressing F8 moments after launch still finds the
+    /// ring already full -- the ring holds RingSeconds anyway, so these frames would have been thrown
+    /// away regardless.
+    /// </remarks>
+    private const int FpsCalibrationFrames = 40;
+
+    private const int MinRateControlFps = 1;
+    private const int MaxRateControlFps = 360;
+
     private ScreenCapture(string outputDirectory, ClippyConfig? config = null)
     {
         this.config = config ?? ClippyConfig.Load();
@@ -525,17 +561,32 @@ internal sealed class ScreenCapture : IDisposable
         {
             videoRing = new RingBuffer(RingSeconds, isVideo: true);
             audioRing = new RingBuffer(RingSeconds, isVideo: false);
-            encoder = StartVideoEncoder(
-                withAudio ? Path.ChangeExtension(videoPath, ".video.h264") : videoPath,
-                videoWidth,
-                videoHeight,
-                videoEncoder ?? config.VideoEncoder,
-                stopwatch,
-                fpsMode,
-                logsDirectory);
-            encoder.StartDrain(videoRing);
+
+            // "nvenc_direct" and "media_foundation" both mean "no ffmpeg process", but only the first
+            // can wait for the capture rate: NVENC is told a frame rate and divides the bitrate by it,
+            // and a wrong one inflates every clip by delivered/declared. It has no opinion about being
+            // created after StartCapture, so it is opened from the first frame callback instead. The
+            // Media Foundation and ffmpeg paths keep the eager order above, which is not optional there.
+            var wanted = videoEncoder ?? config.VideoEncoder;
+            prefersDirectNvenc = string.Equals(wanted, "nvenc_direct", StringComparison.OrdinalIgnoreCase) ||
+                                 string.Equals(wanted, "media_foundation", StringComparison.OrdinalIgnoreCase);
+
+            if (!prefersDirectNvenc)
+            {
+                encoder = StartVideoEncoder(
+                    withAudio ? Path.ChangeExtension(videoPath, ".video.h264") : videoPath,
+                    videoWidth,
+                    videoHeight,
+                    wanted,
+                    stopwatch,
+                    fpsMode,
+                    logsDirectory);
+                encoder.StartDrain(videoRing);
+            }
+
             Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring, " +
-                (withAudio ? "with audio" : "no audio") + $" (max {RingSeconds:F0}s), before StartCapture");
+                (withAudio ? "with audio" : "no audio") + $" (max {RingSeconds:F0}s), " +
+                (prefersDirectNvenc ? "after the capture rate is measured" : "before StartCapture"));
         }
 
             session.StartCapture();
@@ -775,6 +826,13 @@ internal sealed class ScreenCapture : IDisposable
 
             var currentFrame = ++frameCount;
             LogFrameTiming();
+
+            // The direct NVENC session waits here until the real delivery rate is known, because a
+            // wrong rate silently multiplies the bitrate by delivered/declared. Frames that arrive
+            // during the calibration are dropped rather than stored: they are the newest frames in a
+            // 180-second ring, so nobody can miss them. See the fields above for the measurements.
+            if (videoPath is not null && encoder is null && !OpenDeferredNvencEncoder(stopwatch.Elapsed))
+                return;
 
             if (videoPath is not null)
             {
@@ -1072,7 +1130,61 @@ internal sealed class ScreenCapture : IDisposable
     /// only tells the encoder how to spread the bitrate and how often to emit a keyframe, so being out
     /// of step with the display costs a denser GOP, not a wrong duration.
     /// </remarks>
-    private const int RateControlFps = 30;
+    private const int RateControlFps = 48;
+
+    /// <summary>
+    /// Opens the NVENC session once the capture rate is known, or reports that the frame is still calibration.
+    /// </summary>
+    /// <remarks>
+    /// Returns false while frames are still being counted, which tells the caller to drop the frame.
+    /// Returns true once the encoder exists, and also when there is nothing pending -- the caller may be
+    /// on the eager Media Foundation or ffmpeg path, or there may be no video -- so neither is disturbed.
+    /// </remarks>
+    private bool OpenDeferredNvencEncoder(TimeSpan now)
+    {
+        // Not ours to open: the encoder already exists, or the eager path owns this one.
+        if (rateControlFpsMeasured || !prefersDirectNvenc)
+            return true;
+
+        if (fpsCalibrationFrames == 1)
+            fpsCalibrationStart = now;
+        fpsCalibrationFrames++;
+
+        // Measured over the SECOND window only. Windows.Graphics.Capture delivers its first frames in
+        // a burst while the pool fills, and that burst drags the average: measured across both windows
+        // it read 49 fps against a steady 48 and wrote 19% under the requested bitrate. Discarding the
+        // first window costs about a second of startup and removes the burst.
+        if (fpsCalibrationFrames == FpsCalibrationFrames)
+        {
+            fpsCalibrationStart = now;
+            return false;
+        }
+
+        if (fpsCalibrationFrames < 2 * FpsCalibrationFrames)
+            return false;
+
+        var seconds = (now - fpsCalibrationStart).TotalSeconds;
+        if (seconds <= 0)
+            return false;
+
+        // Only the frames inside this window. fpsCalibrationFrames is cumulative, so dividing it by
+        // the window's own elapsed time would count the discarded window twice and report twice the
+        // rate -- which is exactly what 98 fps against a steady 48 looked like.
+        var windowFrames = fpsCalibrationFrames - FpsCalibrationFrames;
+
+        rateControlFps = Math.Clamp((int)Math.Round(windowFrames / seconds), MinRateControlFps, MaxRateControlFps);
+        rateControlFpsMeasured = true;
+        Console.WriteLine($"Capture rate measured at {rateControlFps} fps over {FpsCalibrationFrames} frames; " +
+                          $"opening NVENC for {config.VideoBitrateMbps} Mbit/s at that rate.");
+
+        // The same call Capture makes, minus the Media Foundation ordering that forced it there.
+        var target = withAudio ? Path.ChangeExtension(videoPath, ".video.h264") : videoPath;
+        encoder = StartVideoEncoder(target, videoWidth, videoHeight, videoEncoder ?? config.VideoEncoder,
+                                    stopwatch, fpsMode, logsDirectory);
+        if (encoder is not null)
+            encoder.StartDrain(videoRing!);
+        return true;
+    }
 
     /// <summary>
     /// Opens the direct NVENC session on the capture's own D3D11 device, or returns null.
@@ -1085,7 +1197,7 @@ internal sealed class ScreenCapture : IDisposable
     /// </remarks>
     private IVideoEncoder? TryCreateNvencDirect(int width, int height) =>
         NvencDirectVideoEncoder.TryCreate(
-            d3d11Device, width, height, RateControlFps, config.VideoBitrateMbps * 1_000_000);
+            d3d11Device, width, height, rateControlFps, config.VideoBitrateMbps * 1_000_000);
 
     /// <summary>Stages a GPU texture into system RAM as tightly packed BGRA rows.</summary>
     private byte[] CopyTextureToCpu(ID3D11Texture2D texture, out int width, out int height)
