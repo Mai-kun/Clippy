@@ -139,14 +139,38 @@ internal sealed class Mp4Writer
     }
 
     /// <summary>
-    /// Serialises the file: ftyp, then mdat with every video and audio sample back to back, then moov.
+    /// Serialises the file straight to disk: ftyp, then mdat with every video and audio sample back to
+    /// back, then moov.
     ///
     /// Tracks of different duration are written as they are and NOT trimmed to a common length. Video
     /// and audio are captured independently and need not end on the same CaptureClockSeconds; players
     /// handle a shorter track by holding its last frame or silence. Truncating would silently throw
     /// away real recorded data, so the difference is preserved deliberately and reported by the caller.
+    /// <para>
+    /// This is the path the running app takes. It used to build the whole clip in a MemoryStream and
+    /// return ToArray(), which for a 3-minute clip allocated the payload twice -- once for the stream
+    /// buffer, which doubles as it grows, and again for the array -- so roughly 350 MB of large arrays
+    /// passed through the large object heap on every single export. Writing to the file as the samples
+    /// go means the peak is one 64 KB buffer instead.
+    /// </para>
+    /// </remarks>
+    public void BuildToFile(string outputPath)
+    {
+        using var file = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024);
+        BuildTo(file);
+    }
+
+    /// <summary>
+    /// Serialises into an existing stream. Only the selftests and in-memory comparisons need this.
     /// </summary>
     public byte[] Build()
+    {
+        using var output = new MemoryStream();
+        BuildTo(output);
+        return output.ToArray();
+    }
+
+    private void BuildTo(Stream output)
     {
         if (samples.Count == 0 && audioSamples.Count == 0)
             throw new InvalidOperationException("Cannot build an MP4 with no samples.");
@@ -169,18 +193,13 @@ internal sealed class Mp4Writer
             running += (uint)sample.Length;
         }
 
-        var output = new MemoryStream();
-        Copy(BuildFtyp(), output);
-        // Both tracks live in the same mdat, back to back. Passing only the video samples here while
-        // sizing mdat from both made the box declare more bytes than the file contained, which is why
-        // the muxer produced "moov atom not found" for any two-track file.
+        // No MemoryStream and no ToArray: every sample goes to the file as it is handed over. The mdat
+        // header is written first with its final size, because the size is the sum of the sample
+        // lengths computed above -- so there is nothing to seek back and patch afterwards.
+        output.Write(BuildFtyp());
         WriteMdat(output, mdatPayloadSize, samples.Concat(audioSamples));
-        Copy(BuildMoov(videoOffsets, audioOffsets), output);
-        return output.ToArray();
+        output.Write(BuildMoov(videoOffsets, audioOffsets));
     }
-
-    /// <summary>MemoryStream has no CopyTo; this writes its contents to another stream.</summary>
-    private static void Copy(byte[] bytes, Stream target) => target.Write(bytes);
 
     /// <summary>
     /// Writes a full box (version + flags) and returns its complete bytes, header included.

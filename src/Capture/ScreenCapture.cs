@@ -12,7 +12,7 @@ using Vortice.DXGI;
 
 namespace Clippy;
 
-internal sealed class ScreenCapture : IDisposable
+internal sealed partial class ScreenCapture : IDisposable
 {
     private const int FrameSaveInterval = 30;
     private const int FramePoolBufferCount = 2;
@@ -296,8 +296,17 @@ internal sealed class ScreenCapture : IDisposable
         }
 
         var path = Path.Combine(outputDirectory, $"clip-{DateTime.Now:HHmmssfff}.mp4");
-        File.WriteAllBytes(path, writer.Build());
+        writer.BuildToFile(path);
         Console.WriteLine($"Export: wrote {path} ({writer.SampleCount} samples)");
+
+        // The clip bytes are on disk and nothing points at them any more, but the GC does not hand the
+        // pages back to Windows on its own: the heap stays reserved and the task manager keeps showing
+        // every earlier export still resident. Collecting and trimming here is what stops the working
+        // set from climbing one clip's worth at a time. It costs a short pause once per export, which
+        // is the right place to pay it.
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        TrimWorkingSet();
 
         // Only after the bytes are on disk: a beep before this point would tell the player the clip
         // is safe when it is not.
@@ -390,6 +399,36 @@ internal sealed class ScreenCapture : IDisposable
     private double? exportAtSeconds;
     private double? exportDurationSeconds;
 
+
+    /// <summary>
+    /// Asks Windows to drop this process's resident pages, so the task manager stops showing memory
+    /// the process is not currently using.
+    /// </summary>
+    /// <remarks>
+    /// EmptyWorkingSet decommits the pages rather than freeing them: they are faulted back in on the
+    /// next access. That makes it a reporting fix as much as a real one -- the heap is still reserved,
+    /// and the pages cost a fault each time they come back. It is called once per export, after the
+    /// bytes are already on disk and while the ring is refilling anyway, so there is nothing hot to
+    /// fault back in. Failure is ignored on purpose: it is an optimisation, and a recorder that
+    /// refuses to save a clip because the trim failed would be a worse outcome than a larger task
+    /// manager number.
+    /// </remarks>
+    private static void TrimWorkingSet()
+    {
+        try
+        {
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
+            EmptyWorkingSet(self.Handle);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Export: could not trim the working set ({ex.GetType().Name}); the clip is saved regardless.");
+        }
+    }
+
+    [System.Runtime.InteropServices.LibraryImport("psapi.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static partial bool EmptyWorkingSet(nint hProcess);
 
     private TimeSpan lastFrameTime;
     private TimeSpan lastFpsLogTime;
