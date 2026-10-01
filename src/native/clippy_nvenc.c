@@ -243,13 +243,21 @@ int Nvenc_Open(void* pD3DDevice, int width, int height, int fps, int bitrateBps,
         // averageBitRate and maxBitRate are in BITS PER SECOND, not kilobits. Dividing by 1000 here
         // asked for 6000 bits/sec, which the driver refused as impossible for 1080p -- and that
         // refusal, not something about the presets, is what the long run of UNSUPPORTED_PARAM was.
+        //
+        // maxBitRate is pinned to the same value as averageBitRate. Under CBR that is the honest
+        // reading of "4 Mbit/s": the ceiling and the target are the same number, so there is no
+        // headroom for the rate controller to spend. It used to be bitrateBps * 3 / 2, and a live
+        // run on 2026-10-01 measured what that actually costs: 4 Mbit/s produced 6.39 and
+        // 10 Mbit/s produced 16.01 -- a flat x1.60 overshoot, reproduced at both settings.
         config->rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
         config->rcParams.averageBitRate = (uint32_t)bitrateBps;
-        config->rcParams.maxBitRate = (uint32_t)(bitrateBps * 3 / 2);
-        // Half a second. Narrowing this to a single frame was tried and measured worse (10.1 Mbit/s
-        // against 8.3 for this value on the same content), so the buffer is left wide enough for the
-        // rate controller to place bits sensibly.
-        config->rcParams.vbvBufferSize = (uint32_t)(bitrateBps / 2);
+        config->rcParams.maxBitRate = (uint32_t)bitrateBps;
+        // One second of buffer, which is what the encoder expects for this mode, and matching
+        // vbvInitialDelay so the first second is not spent filling an empty buffer. The old value
+        // was bitrateBps / 2 -- half a second -- which is too tight to smooth a scene change and
+        // leaves the controller permanently chasing the ceiling it was allowed but never meant to hit.
+        config->rcParams.vbvBufferSize = (uint32_t)bitrateBps;
+        config->rcParams.vbvInitialDelay = (uint32_t)bitrateBps;
         config->rcParams.zeroReorderDelay = 1;
     }
 

@@ -510,7 +510,7 @@ internal sealed class ScreenCapture : IDisposable
         if (videoPath is not null)
         {
             Console.WriteLine($"Recording [{videoEncoder}] into an in-memory ring, max {RingSeconds:F0}s.");
-            Console.WriteLine("Nothing is written until an export happens (F9 saves 30 s, F10 saves 3 min).");
+            Console.WriteLine("Nothing is written until an export happens (F8 saves 30 s, F9 saves 3 min).");
         }
 
         try

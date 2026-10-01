@@ -3,7 +3,7 @@
 namespace Clippy;
 
 /// <summary>
-/// Global hotkeys for saving a clip while recording (phase 6). F9 saves 30 s, F10 saves 3 min.
+/// Global hotkeys for saving a clip while recording (phase 6). F8 saves 30 s, F9 saves 3 min.
 ///
 /// A low-level keyboard hook (WH_KEYBOARD_LL) calls back on the thread that installed it, and the
 /// OS gives that callback roughly a second before it silently unhooks us. So the callback does the
@@ -17,7 +17,7 @@ public sealed class HotkeyService : IDisposable
     private const int WM_KEYDOWN = 0x0100;
     private const int WM_SYSKEYDOWN = 0x0104;
 
-    // Key codes and clip lengths come from config.json, not from constants, so the F9/F10 bindings
+    // Key codes and clip lengths come from config.json, not from constants, so the F8/F9 bindings
     // and the 30 s / 3 min lengths can be changed without rebuilding. A key the user did not map
     // is simply absent from the map and is ignored.
     // Replaced wholesale, never mutated in place, so the hotkey callback can read it with a single
