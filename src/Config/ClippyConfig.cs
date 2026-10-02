@@ -55,6 +55,13 @@ public sealed class ClippyConfig
     public int VideoBitrateMbps { get; set; } = 6;
 
     /// <summary>
+    /// The bitrate range this class accepts. Named rather than inlined at the clamp so the tray's
+    /// bitrate menu can be checked against the same numbers instead of a second copy of them.
+    /// </summary>
+    public const int MinVideoBitrateMbps = 2;
+    public const int MaxVideoBitrateMbps = 50;
+
+    /// <summary>
     /// A ceiling on how much disk the clips folder may use, in gigabytes. 0 means no ceiling.
     /// </summary>
     /// <remarks>
@@ -162,7 +169,7 @@ public sealed class ClippyConfig
                 config.OutputFolder = "clips";
             if (string.IsNullOrWhiteSpace(config.LogsFolder))
                 config.LogsFolder = "logs";
-            if (config.VideoBitrateMbps is < 2 or > 50)
+            if (config.VideoBitrateMbps < MinVideoBitrateMbps || config.VideoBitrateMbps > MaxVideoBitrateMbps)
                 config.VideoBitrateMbps = 6;
 
             // At startup as well as after every save. Startup is the half that matters: it is the only

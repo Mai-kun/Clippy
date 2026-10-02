@@ -55,6 +55,8 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_TOGGLE_CONSOLE = 1003;
     private const uint IDC_CHECK_UPDATES = 1005;
     private const uint IDC_EXIT = 1004;
+    private const uint IDC_RESTART = 1006;
+    private const uint IDC_OPEN_LAST_CLIP = 1007;
 
     // One id per selectable value across the settings submenus. They are grouped by hundreds so a
     // mis-numbered id lands in an obvious neighbourhood rather than silently colliding with an
@@ -70,6 +72,12 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_RATE_6 = 1302;
     private const uint IDC_RATE_8 = 1303;
     private const uint IDC_RATE_12 = 1304;
+    private const uint IDC_RATE_2 = 1305;
+    private const uint IDC_RATE_16 = 1306;
+    private const uint IDC_RATE_20 = 1307;
+    private const uint IDC_RATE_25 = 1308;
+    private const uint IDC_RATE_30 = 1309;
+    private const uint IDC_RATE_50 = 1310;
     private const uint IDC_ENCODER_DIRECT = 1403;
     private const uint IDC_PICK_FOLDER = 1601;
     private const uint IDC_QUOTA_0 = 1610;
@@ -82,6 +90,29 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_KEYS_F8 = 1500;
     private const uint IDC_KEYS_F9 = 1501;
     private const uint IDC_KEYS_F11 = 1502;
+
+    /// <summary>
+    /// Every selectable bitrate: menu id, value written to the config, and the menu label.
+    ///
+    /// One table so the menu and the click handler cannot drift apart. The RAM figure is the ring
+    /// buffer's cost for the ~190 s it holds, extrapolated from the measured 12 Mbps -> ~450 MB
+    /// point (~37 MB per Mbps); it is the reason to pick a lower number, so it belongs next to it.
+    /// Every value has to sit inside the config's own 2-50 clamp, or the menu would write something
+    /// the next load silently replaces. --smoke asserts that, so adding a row cannot break it quietly.
+    /// </summary>
+    internal static readonly (uint Id, int Mbps, string Label)[] BitrateOptions =
+    [
+        (IDC_RATE_2, 2, "2 Mbps  (~75 MB RAM)"),
+        (IDC_RATE_4, 4, "4 Mbps  (~150 MB RAM)"),
+        (IDC_RATE_6, 6, "6 Mbps  (~225 MB RAM)"),
+        (IDC_RATE_8, 8, "8 Mbps  (~300 MB RAM)"),
+        (IDC_RATE_12, 12, "12 Mbps (~450 MB RAM)"),
+        (IDC_RATE_16, 16, "16 Mbps (~600 MB RAM)"),
+        (IDC_RATE_20, 20, "20 Mbps (~750 MB RAM)"),
+        (IDC_RATE_25, 25, "25 Mbps (~940 MB RAM)"),
+        (IDC_RATE_30, 30, "30 Mbps (~1.1 GB RAM)"),
+        (IDC_RATE_50, 50, "50 Mbps (~1.9 GB RAM)"),
+    ];
 
     private const int IDI_APPLICATION = 32512;
 
@@ -504,6 +535,7 @@ public sealed partial class TrayIcon : IDisposable
         try
         {
             AppendMenu(menu, MF_STRING, IDC_OPEN_FOLDER, "Open Clips Folder");
+            AppendMenu(menu, MF_STRING, IDC_OPEN_LAST_CLIP, "Open Last Clip");
             AppendMenu(menu, MF_STRING, IDC_PICK_FOLDER, "Select Clips Folder...");
             AppendMenu(menu, MF_STRING, IDC_OPEN_CONFIG, "Open Config");
             AppendMenu(menu, MF_SEPARATOR, 0, "");
@@ -511,6 +543,7 @@ public sealed partial class TrayIcon : IDisposable
             AppendMenu(menu, MF_SEPARATOR, 0, "");
             AppendMenu(menu, MF_STRING, IDC_TOGGLE_CONSOLE, "Show / Hide Log");
             AppendMenu(menu, MF_STRING, IDC_CHECK_UPDATES, "Check for Updates");
+            AppendMenu(menu, MF_STRING, IDC_RESTART, "Restart");
             AppendMenu(menu, MF_STRING, IDC_EXIT, "Exit");
 
             // The mandatory dismissal sequence. GetCursorPos, then SetForegroundWindow, then
@@ -520,10 +553,24 @@ public sealed partial class TrayIcon : IDisposable
             SetForegroundWindow(window);
             var id = (uint)TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, point.x, point.y, window, 0);
             PostMessage(window, WM_NULL, 0, 0);
+
+            // Bitrates are matched from the table rather than one case per value: adding a rate is
+            // then a single row above instead of a constant, a case and a menu line to keep in step.
+            var bitrate = Array.Find(BitrateOptions, o => o.Id == id);
+            if (bitrate.Mbps > 0)
+            {
+                ApplySetting("Bitrate", $"{bitrate.Mbps} Mbps",
+                    c => c.VideoBitrateMbps = bitrate.Mbps, live: false);
+                return;
+            }
+
             switch (id)
             {
                 case IDC_OPEN_FOLDER:
                     OpenOutputFolder();
+                    break;
+                case IDC_OPEN_LAST_CLIP:
+                    OpenLastClip();
                     break;
                 case IDC_OPEN_CONFIG:
                     OpenConfig();
@@ -554,18 +601,6 @@ public sealed partial class TrayIcon : IDisposable
                     break;
                 case IDC_LONG_300:
                     ApplySetting("Long clip", "5m", c => c.LongClipSeconds = 300, live: true);
-                    break;
-                case IDC_RATE_4:
-                    ApplySetting("Bitrate", "4 Mbps", c => c.VideoBitrateMbps = 4, live: false);
-                    break;
-                case IDC_RATE_6:
-                    ApplySetting("Bitrate", "6 Mbps", c => c.VideoBitrateMbps = 6, live: false);
-                    break;
-                case IDC_RATE_8:
-                    ApplySetting("Bitrate", "8 Mbps", c => c.VideoBitrateMbps = 8, live: false);
-                    break;
-                case IDC_RATE_12:
-                    ApplySetting("Bitrate", "12 Mbps", c => c.VideoBitrateMbps = 12, live: false);
                     break;
                 case IDC_ENCODER_DIRECT:
                     ApplySetting("Encoder", "nvenc_direct", c => c.VideoEncoder = "nvenc_direct", live: false);
@@ -598,6 +633,9 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_KEYS_F11:
                     ApplySetting("Hotkeys", "F11 / F12",
                         c => { c.ShortClipHotkey = "F11"; c.LongClipHotkey = "F12"; }, live: true);
+                    break;
+                case IDC_RESTART:
+                    Restart();
                     break;
                 case IDC_EXIT:
                     onExit();
@@ -674,11 +712,8 @@ public sealed partial class TrayIcon : IDisposable
             (IDC_LONG_180, "3 minutes", config.LongClipSeconds == 180),
             (IDC_LONG_300, "5 minutes", config.LongClipSeconds == 300));
 
-        var bitrate = Submenu(menu, "Video Bitrate / RAM",
-            (IDC_RATE_4, "4 Mbps  (~150 MB RAM)", config.VideoBitrateMbps == 4),
-            (IDC_RATE_6, "6 Mbps  (~220 MB RAM)", config.VideoBitrateMbps == 6),
-            (IDC_RATE_8, "8 Mbps  (~300 MB RAM)", config.VideoBitrateMbps == 8),
-            (IDC_RATE_12, "12 Mbps (~450 MB RAM)", config.VideoBitrateMbps == 12));
+        var bitrate = Submenu(menu, "Video Bitrate / RAM", [.. BitrateOptions
+            .Select(o => (o.Id, o.Label, config.VideoBitrateMbps == o.Mbps))]);
 
         var encoder = Submenu(menu, "Video Encoder",
             (IDC_ENCODER_DIRECT, "Direct NVENC (0-copy VRAM, no ffmpeg)", config.VideoEncoder == "nvenc_direct"),
@@ -721,6 +756,69 @@ public sealed partial class TrayIcon : IDisposable
     /// change them, so they take effect on the next session. Pretending otherwise would leave a
     /// check mark next to a setting that is not in force.
     /// </summary>
+    /// <summary>
+    /// Opens the most recent clip in whatever the user has associated with .mp4.
+    ///
+    /// The alternative would be picking a player, and there is no right answer: the user may well
+    /// have set VLC or DaVinci as the default, and overriding that to launch whichever one Clippy
+    /// happened to find is exactly the sort of surprise software should not spring. Handing the
+    /// shell the file and letting it resolve the association is one line, and always agrees with
+    /// double-clicking the same clip in Explorer.
+    /// </summary>
+    private void OpenLastClip()
+    {
+        var clip = FindLastClip(outputFolder);
+        if (clip is null)
+        {
+            // No clip yet is the ordinary state right after startup, not an error worth a balloon,
+            // but silence would look like a menu item that does nothing.
+            Console.WriteLine("Last clip: no *.mp4 in the clips folder yet.");
+            ShowNotification("Clippy", "No clips yet. Press F8 to save one.");
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(clip) { UseShellExecute = true });
+            Console.WriteLine($"Last clip: opened {Path.GetFileName(clip)}.");
+        }
+        catch (Exception ex) when (ex is Win32Exception or IOException)
+        {
+            Console.WriteLine($"Last clip: could not open {clip} ({ex.Message}).");
+            ShowNotification("Clippy", $"Could not open {Path.GetFileName(clip)}.");
+        }
+    }
+
+    /// <summary>The newest clip in the folder, or null when there is none.</summary>
+    /// <remarks>
+    /// LastWriteTime rather than CreationTime, because a clip copied in from elsewhere keeps its
+    /// original creation date and would otherwise sort ahead of the one the user just recorded.
+    /// TopDirectoryOnly matches what ClipsQuota counts and deletes, so "last clip" can never name a
+    /// file the quota would have removed.
+    /// </remarks>
+    internal static string? FindLastClip(string folder)
+    {
+        try
+        {
+            if (!Directory.Exists(folder))
+                return null;
+
+            return new DirectoryInfo(folder)
+                .GetFiles("*.mp4", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .Select(f => f.FullName)
+                .FirstOrDefault();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A folder we cannot list is a folder whose clips we cannot name. Log it and report
+            // "no clips": letting the exception escape through the Win32 menu callback would have
+            // the OS swallow it and take the tray thread down with it.
+            Console.WriteLine($"Last clip: could not list {folder} ({ex.Message}).");
+            return null;
+        }
+    }
+
     /// <summary>
     /// Asks for a clips folder and stores the answer.
     /// </summary>
@@ -835,6 +933,58 @@ public sealed partial class TrayIcon : IDisposable
         {
             Console.WriteLine($"Tray: could not open the config: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Starts a fresh copy of this executable with the same arguments, then quits this one.
+    ///
+    /// This is what the "applies next session" settings actually need: the tray can write a new
+    /// bitrate or encoder, but the running ffmpeg/NVENC pipeline cannot be told to change its own
+    /// arguments, so without this button the user's only route is Task Manager and a double-click.
+    ///
+    /// The new process is started BEFORE this one stops, because the alternative -- exit first,
+    /// launch second -- leaves a window where nothing is recording, and a crash between the two
+    /// would leave nothing running at all. Both instances briefly hold the screen and the encoder,
+    /// which is harmless: the ring buffer lives in each process's own memory and nothing is written
+    /// to disk until a hotkey asks for it.
+    ///
+    /// The user's own arguments are replayed verbatim, so `--record --tray` restarts as a --record
+    /// run and a bare launch restarts as a bare launch, reading StartMinimizedToTray from
+    /// config.json exactly like a double-click in Explorer would.
+    /// </summary>
+    private void Restart()
+    {
+        var exe = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exe))
+        {
+            Console.WriteLine("Tray: restart needs a real executable path, which this run does not have.");
+            ShowNotification("Clippy", "Could not restart: the running program path is unknown.");
+            return;
+        }
+
+        try
+        {
+            var startInfo = new ProcessStartInfo(exe) { UseShellExecute = false };
+
+            // Element 0 is the executable path itself; ProcessStartInfo.FileName is that. The rest
+            // are the user's own arguments, replayed through ArgumentList so a path with spaces
+            // needs no quoting here.
+            foreach (var argument in Environment.GetCommandLineArgs().Skip(1))
+                startInfo.ArgumentList.Add(argument);
+
+            Process.Start(startInfo);
+            Console.WriteLine("Tray: a new instance was started; this one is shutting down.");
+        }
+        catch (Exception ex) when (ex is Win32Exception or IOException or InvalidOperationException)
+        {
+            // Staying alive is the right answer here: quitting after a failed launch would take the
+            // recorder away over a menu item that did not work.
+            Console.WriteLine($"Tray: could not start a new instance ({ex.Message}); still running.");
+            ShowNotification("Clippy", $"Could not restart: {ex.Message}");
+            return;
+        }
+
+        onExit();
     }
 
     /// <summary>Shows or hides the console window, if this process has one.</summary>
