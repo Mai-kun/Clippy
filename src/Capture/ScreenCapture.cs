@@ -148,6 +148,7 @@ internal sealed partial class ScreenCapture : IDisposable
         if (videoPackets.Count == 0)
         {
             Console.WriteLine("Export: video slice is empty, nothing to write.");
+            ReleaseExportMemory();
             return null;
         }
 
@@ -175,6 +176,7 @@ internal sealed partial class ScreenCapture : IDisposable
         if (start < 0)
         {
             Console.WriteLine("Export: no keyframe in the requested window, refusing to write.");
+            ReleaseExportMemory();
             return null;
         }
 
@@ -312,9 +314,7 @@ internal sealed partial class ScreenCapture : IDisposable
         // every earlier export still resident. Collecting and trimming here is what stops the working
         // set from climbing one clip's worth at a time. It costs a short pause once per export, which
         // is the right place to pay it.
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        GC.WaitForPendingFinalizers();
-        TrimWorkingSet();
+        ReleaseExportMemory();
 
         // Only after the bytes are on disk: a beep before this point would tell the player the clip
         // is safe when it is not.
@@ -360,6 +360,11 @@ internal sealed partial class ScreenCapture : IDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"Export failed: {ex.GetType().Name}: {ex.Message}");
+
+            // A throw can happen with a whole clip's worth of slices still referenced by the frames
+            // that are unwinding right now. Without this the recorder keeps those buffers until the
+            // next export, so a failed F9 is exactly when the memory spike is least welcome.
+            ReleaseExportMemory();
         }
     }
 
@@ -386,9 +391,12 @@ internal sealed partial class ScreenCapture : IDisposable
     private int videoWidth;
     private int videoHeight;
 
-    // How much stays in RAM. 45 s at a typical bitrate is ~25-35 MB, which is the whole point of
-    // the hybrid split -- the old ring held RingSeconds in RAM and cost 250+ MB resident.
-    private const double RamHeadSeconds = 45;
+    // How much stays in RAM. 32 s is the shortest window that still serves a 30 s F8 clip with margin,
+    // and every second of it is paid for twice -- once in memory and once in disk writes. At 6 Mbit/s
+    // the head holds ~25 MB instead of the ~35 MB a 45 s window cost, which is most of the idle-RAM
+    // difference between the two settings. The old 190 s ring was what cost 250+ MB; this is a trim,
+    // not a redesign.
+    private const double RamHeadSeconds = 32;
 
     // Total replay depth (RAM head + disk tail), longer than any clip we export, so an export never
     // hits the end of history.
@@ -421,6 +429,23 @@ internal sealed partial class ScreenCapture : IDisposable
             return false; // too short to carry any NAL header
 
         return hevc ? HevcNal.IsVcl(HevcNal.Type(nal)) : (nal[0] & 0x1F) is >= 1 and <= 5;
+    }
+
+    /// <summary>
+    /// Hands back everything an export allocated, on EVERY path out of it.
+    ///
+    /// A 3-minute export is the largest allocation the recorder makes outside the ring itself: the
+    /// disk tail and the RAM head arrive as fresh arrays, the muxer holds them until mdat is written,
+    /// and only then does the work become garbage. Collecting on the success path alone left the two
+    /// refusal paths -- an empty slice and "no keyframe in the requested window" -- sitting on a whole
+    /// clip's worth of buffers until the next export happened to run, which is exactly the kind of
+    /// memory that only shows up when someone opens the task manager right after a failed F9.
+    /// </summary>
+    private static void ReleaseExportMemory()
+    {
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        TrimWorkingSet();
     }
 
     private static double FirstOrNaN(IReadOnlyList<double> values) => values.Count > 0 ? values[0] : double.NaN;

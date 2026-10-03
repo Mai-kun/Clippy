@@ -165,7 +165,10 @@ internal sealed class DiskSpooler : IDisposable
     /// </summary>
     public List<StoredPacket> ReadRange(double from, double to)
     {
-        var result = new List<StoredPacket>();
+        // Pre-sized to a plausible packet count rather than grown from zero: at 53 fps a 3-minute
+        // window is ~9500 packets, and growing a list to that size copies its backing array a dozen
+        // times over. A guess that is off only costs a little slack.
+        var result = new List<StoredPacket>(capacity: 8192);
         lock (gate)
         {
             foreach (var segment in segments)
@@ -247,21 +250,43 @@ internal sealed class DiskSpooler : IDisposable
         if (head.Count == 0)
             return tail;
 
-        var headSignatures = new HashSet<(double Time, int Length, bool Keyframe)>(head.Count);
-        foreach (var packet in head)
-            headSignatures.Add((packet.CaptureClockSeconds, packet.Length, packet.IsKeyframe));
-        tail.RemoveAll(p => headSignatures.Contains((p.CaptureClockSeconds, p.Length, p.IsKeyframe)));
-
-        if (tail.Count == 0)
-            return head;
-
-        // Two-pointer merge by capture time. On an exact tie the disk copy wins: it was evicted
-        // first, so it is the earlier packet of the two.
+        // ONE list, built in one pass. The earlier version built the merged list and then ran
+        // RemoveAll over the disk half with a HashSet of head signatures -- a second full pass and a
+        // second index of the same ~9000 packets, which is the sort of duplication a 3-minute export
+        // does not need: the payload arrays are shared either way, only the index is duplicated.
+        //
+        // Overlap is possible but rare -- only packets evicted between the Slice above and the Flush
+        // below can be in both -- and it shows up as EQUAL capture times, because the same packet
+        // carries the same time. So a two-pointer merge by time handles it inline: on a tie the disk
+        // copy is emitted first (it was evicted first) and the RAM copy only when the two are
+        // genuinely different packets, which keeps a duplicate access unit out of the clip without a
+        // set lookup and without a second list.
         var merged = new List<StoredPacket>(tail.Count + head.Count);
         var i = 0;
         var j = 0;
         while (i < tail.Count && j < head.Count)
-            merged.Add(tail[i].CaptureClockSeconds <= head[j].CaptureClockSeconds ? tail[i++] : head[j++]);
+        {
+            var diskTime = tail[i].CaptureClockSeconds;
+            var ramTime = head[j].CaptureClockSeconds;
+
+            if (diskTime < ramTime)
+            {
+                merged.Add(tail[i++]);
+            }
+            else if (diskTime > ramTime)
+            {
+                merged.Add(head[j++]);
+            }
+            else
+            {
+                var samePacket = tail[i].Length == head[j].Length && tail[i].IsKeyframe == head[j].IsKeyframe;
+                merged.Add(tail[i++]);
+                if (!samePacket)
+                    merged.Add(head[j]);
+                j++;
+            }
+        }
+
         while (i < tail.Count)
             merged.Add(tail[i++]);
         while (j < head.Count)

@@ -235,9 +235,9 @@ internal static class UpdateService
     /// <summary>
     /// Downloads the installer and hands the update to it, silently.
     ///
-    /// /VERYSILENT /SUPPRESSMSGBOXES /NORESTART is the standard headless update invocation, and
-    /// CloseApplications=yes in the .iss makes Windows close the running recorder for us -- which it
-    /// cannot do until this process is gone, hence the Exit the caller performs.
+    /// /VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS /NORESTART is the headless update
+    /// invocation, and it is started through a cmd that waits two seconds first -- see below for why
+    /// the wait is not optional. The caller then exits, and the installer takes over.
     /// </summary>
     private static async Task ApplyViaSetupAsync(string downloadUrl, Action<string, string>? notify)
     {
@@ -260,11 +260,27 @@ internal static class UpdateService
 
             notify?.Invoke("Clippy Update", "Installing...");
 
-            // UseShellExecute is required here: a freshly downloaded file is not executable until the
-            // shell has weighed it, and UseShellExecute=false fails on exactly that check.
-            Process.Start(new ProcessStartInfo(setupPath, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART")
+            // The installer cannot replace Clippy.exe while this process is still tearing itself
+            // down: threads are exiting and handles are being closed, and Inno Setup answers that
+            // with "the application is running". So the installer is launched by a hidden cmd that
+            // first WAITS, and /FORCECLOSEAPPLICATIONS tells it to close whatever is still holding
+            // the exe.
+            //
+            // The wait is `%SystemRoot%\System32\ping.exe -n 3`, not `timeout /t 2`, and both halves
+            // of that were measured rather than assumed on this machine:
+            //   * `timeout` is not on this PATH at all -- cmd answers "not recognized" and the delay
+            //     silently evaporates, which is the exact bug being fixed;
+            //   * even by absolute path, `timeout` refuses to wait when stdin is redirected ("Input
+            //     redirection is not supported, exiting the process immediately"), and a recorder
+            //     started from a script or a service is exactly that case.
+            // ping has neither failure mode: it is addressed by absolute path, reads no stdin, and
+            // three one-second pings make the two-second pause.
+            var cmd = $"/c \"%SystemRoot%\\System32\\ping.exe -n 3 127.0.0.1 >nul & start \"\" \"{setupPath}\" " +
+                      "/VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS /NORESTART";
+            Process.Start(new ProcessStartInfo("cmd.exe", cmd)
             {
-                UseShellExecute = true,
+                CreateNoWindow = true,
+                UseShellExecute = false,
             });
         }
         catch (Exception ex)

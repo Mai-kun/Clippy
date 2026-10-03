@@ -25,6 +25,7 @@ internal static class RingBufferSelfTest
     failures += Check("buffer: concurrent Push while slicing", ConcurrentPushAndSlice);
     failures += Check("spool: evicted packets survive on disk and rejoin the head", SpoolRoundTripsEvictedPackets);
     failures += Check("spool: segments older than the history limit are deleted", SpoolPrunesOldSegments);
+    failures += Check("spool: hybrid slice under eviction has no duplicate or gap", SpoolHybridSliceUnderEviction);
 
         Console.WriteLine(failures == 0 ? "RING SELFTEST: OK" : $"RING SELFTEST: FAILED ({failures})");
         return failures;
@@ -384,6 +385,67 @@ internal static class RingBufferSelfTest
     /// disk: too wide a window means the spool grows without bound, too narrow a window means an
     /// F9 export would silently lose its oldest seconds.
     /// </summary>
+
+    /// <summary>
+    /// A hybrid slice taken WHILE packets are being evicted is the only case where the same packet can
+    /// appear in both tiers: Slice reads the RAM head, the ring trims in between, and the flush that
+    /// follows puts the trimmed packet on disk. The merge has to drop one of the two, and the symptom
+    /// of getting that wrong is a duplicated access unit in the clip -- which decodes as a stutter
+    /// rather than as an error, so nothing else would ever notice.
+    ///
+    /// The check is strict monotonicity of capture time: a duplicated packet repeats a timestamp and
+    /// fails it, and so does a merge that emits the RAM copy before an older disk copy.
+    /// </summary>
+    private static string? SpoolHybridSliceUnderEviction()
+    {
+        var dir = TestSpoolDirectory();
+        try
+        {
+            using var spool = new DiskSpooler("concurrent", maxHistorySeconds: 190, directory: dir);
+            var ring = new RingBuffer(maxSeconds: 2, isVideo: true) { OnEvicted = spool.Evict };
+
+            string? error = null;
+            var pusher = new Thread(() =>
+            {
+                for (var i = 0; i < 6000; i++)
+                    ring.Push(Rented(64), 64, i / 60.0, isKeyframe: i % 60 == 0);
+            });
+
+            var slicer = new Thread(() =>
+            {
+                for (var round = 0; round < 40 && error is null; round++)
+                {
+                    // A window wide enough that most of it lives on disk while the head is still moving.
+                    var merged = DiskSpooler.SliceHybrid(ring, spool, from: 10.0, to: 90.0);
+                    for (var i = 1; i < merged.Count; i++)
+                    {
+                        var previous = merged[i - 1].CaptureClockSeconds;
+                        var current = merged[i].CaptureClockSeconds;
+                        if (current <= previous)
+                        {
+                            error = $"round {round}: packet {i} at {current:F4} s does not follow " +
+                                    $"{previous:F4} s (duplicate or out-of-order merge)";
+                            break;
+                        }
+                    }
+
+                    Thread.Sleep(5);
+                }
+            });
+
+            pusher.Start();
+            slicer.Start();
+            pusher.Join();
+            slicer.Join();
+            ring.Clear();
+            return error;
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
+    }
+
     private static string? SpoolPrunesOldSegments()
     {
         var dir = TestSpoolDirectory();
