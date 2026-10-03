@@ -31,7 +31,7 @@ public sealed class ClippyConfig
     /// is being developed the log is the whole point, and a process that vanishes into the tray
     /// looks identical to one that crashed on startup.
     /// </summary>
-    public bool StartMinimizedToTray { get; set; }
+    public bool StartMinimizedToTray { get; set; } = true;
 
     /// <summary>
     /// Which video encoder runs. "nvenc_direct" (the default) is the native bridge: the captured
@@ -115,7 +115,8 @@ public sealed class ClippyConfig
         return System.IO.Path.GetFullPath(
             System.IO.Path.IsPathRooted(folder)
                 ? folder
-                : System.IO.Path.Combine(AppContext.BaseDirectory, folder));
+                : System.IO.Path.Combine(AppContext.BaseDirectory, folder)
+        );
     }
 
     public int MaxClipsFolderSizeGB { get; set; }
@@ -161,17 +162,21 @@ public sealed class ClippyConfig
         {
             var fresh = new ClippyConfig();
             fresh.Save();
-            Console.WriteLine($"Config: no {path}, wrote defaults " +
-                $"({fresh.ShortClipHotkey} {fresh.ShortClipSeconds:F0}s / " +
-                $"{fresh.LongClipHotkey} {fresh.LongClipSeconds:F0}s)");
+            Console.WriteLine(
+                $"Config: no {path}, wrote defaults "
+                    + $"({fresh.ShortClipHotkey} {fresh.ShortClipSeconds:F0}s / "
+                    + $"{fresh.LongClipHotkey} {fresh.LongClipSeconds:F0}s)"
+            );
             return fresh;
         }
 
         try
         {
             var config =
-                JsonSerializer.Deserialize(File.ReadAllText(path), ClippyConfigContext.Default.ClippyConfig)
-                ?? new ClippyConfig();
+                JsonSerializer.Deserialize(
+                    File.ReadAllText(path),
+                    ClippyConfigContext.Default.ClippyConfig
+                ) ?? new ClippyConfig();
 
             // A negative clip length would make ExportClip slice an empty window, and a hotkey that
             // is not a function key can never be pressed, so both are corrected here.
@@ -189,7 +194,10 @@ public sealed class ClippyConfig
                 config.OutputFolder = "clips";
             if (string.IsNullOrWhiteSpace(config.LogsFolder))
                 config.LogsFolder = "logs";
-            if (config.VideoBitrateMbps < MinVideoBitrateMbps || config.VideoBitrateMbps > MaxVideoBitrateMbps)
+            if (
+                config.VideoBitrateMbps < MinVideoBitrateMbps
+                || config.VideoBitrateMbps > MaxVideoBitrateMbps
+            )
                 config.VideoBitrateMbps = 6;
             // A codec this build cannot produce falls back to the default rather than reaching the
             // encoder: a typo in a config file must not stop the recorder, same as everywhere else.
@@ -203,7 +211,8 @@ public sealed class ClippyConfig
 
             return config;
         }
-        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        catch (Exception ex)
+            when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
             Console.WriteLine($"Config: {path} could not be read ({ex.Message}), using defaults.");
             return new ClippyConfig();
@@ -218,7 +227,10 @@ public sealed class ClippyConfig
             // Straight through the source-generated context. JsonSerializer.Serialize(this, options)
             // is annotated RequiresUnreferencedCode/RequiresDynamicCode and is a real IL2026/IL3050
             // AOT warning; the JsonTypeInfo overload is the AOT-safe one.
-            File.WriteAllText(Path, JsonSerializer.Serialize(this, ClippyConfigContext.Default.ClippyConfig));
+            File.WriteAllText(
+                Path,
+                JsonSerializer.Serialize(this, ClippyConfigContext.Default.ClippyConfig)
+            );
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -228,8 +240,9 @@ public sealed class ClippyConfig
     }
 
     /// <summary>
-    /// "F9" -> 0x78. Only function keys are accepted, because those are the only ones the recorder
-    /// can listen for globally without stealing the game's input.
+    /// "F9" -> 0x78, "NumPad5" -> 0x65. Function keys and the numeric keypad, because those are the
+    /// blocks a game tends to leave alone -- the digit ROW is not offered on purpose, since a digit
+    /// pressed during a match is far more likely to be aimed at something else.
     /// </summary>
     public static bool TryParseHotkey(string? name, out int vk)
     {
@@ -238,6 +251,17 @@ public sealed class ClippyConfig
             return false;
 
         var key = name.Trim().ToUpperInvariant();
+
+        // The keypad is VK_NUMPAD0..9 (0x60..0x69) -- a different block from the top-row digits
+        // (0x30..0x39), and the reason a binding named "NumPad5" must never be confused with "5".
+        if (key.StartsWith("NUMPAD", StringComparison.Ordinal)
+            && key.Length == "NUMPAD0".Length
+            && key[^1] is >= '0' and <= '9')
+        {
+            vk = 0x60 + (key[^1] - '0');
+            return true;
+        }
+
         if (!key.StartsWith('F') || key.Length < 2 || !int.TryParse(key[1..], out var number))
             return false;
 
@@ -261,6 +285,7 @@ public sealed class ClippyConfig
     // Setting them on a separate JsonSerializerOptions would look right and do nothing, and the
     // commented config.example.json would then fail to load with a confusing parse error.
     ReadCommentHandling = JsonCommentHandling.Skip,
-    AllowTrailingCommas = true)]
+    AllowTrailingCommas = true
+)]
 [JsonSerializable(typeof(ClippyConfig))]
 public sealed partial class ClippyConfigContext : JsonSerializerContext;

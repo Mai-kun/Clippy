@@ -19,6 +19,7 @@ internal static class SmokeTest
         failures += Check("WASAPI: endpoints + loopback recorder", Wasapi);
         failures += Check("Media Foundation: startup/shutdown", MediaFoundation);
         failures += Check("Tray menu: bitrate options are consistent", BitrateOptions);
+    failures += Check("Tray menu: hotkey choices are unique, bindable and do not clash", HotkeyChoices);
         failures += Check("Tray menu: last clip is the newest one", LastClip);
         failures += Check("Folder picker: runs on an STA thread", FolderPickerApartment);
 
@@ -38,6 +39,65 @@ internal static class SmokeTest
         {
             Console.WriteLine($"[FAIL] {name}: {ex.GetType().Name}: {ex.Message}");
             return 1;
+        }
+    }
+
+    /// <summary>
+    /// The hotkey table has three ways to be wrong that no compiler can see and that all of them
+    /// only show up as a menu item that does nothing:
+    ///
+    ///   * two rows naming the same key, so one check mark wins and the other item is decoration;
+    ///   * two different names that parse to the SAME virtual key (which is why the keypad rows are
+    ///     checked against the parser rather than trusted), so the hook would bind one and ignore
+    ///     the other;
+    ///   * a command id that collides with another menu item -- the same failure the bitrate table
+    ///     has, where one of the two entries becomes unselectable while the other keeps its mark.
+    ///
+    /// The two id ranges are also checked against each other: the short and long menus sit in
+    /// separate blocks, and overlapping blocks would make "which clip is this key for?" a coin toss.
+    /// </summary>
+    private static void HotkeyChoices()
+    {
+        var choices = TrayIcon.HotkeyChoices;
+        if (choices.Length == 0)
+            throw new InvalidOperationException("a hotkey submenu would be empty");
+
+        var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seenVks = new HashSet<int>();
+        var ids = new HashSet<uint>();
+        var shortRange = TrayIcon.HotkeyChoices.Length;
+
+        for (var i = 0; i < choices.Length; i++)
+        {
+            var (key, label) = choices[i];
+            if (!seenKeys.Add(key))
+                throw new InvalidOperationException($"'{key}' is offered twice in the hotkey menus");
+
+            if (!ClippyConfig.TryParseHotkey(key, out var vk))
+                throw new InvalidOperationException($"'{key}' is in the menu but the config cannot parse it");
+
+            if (!seenVks.Add(vk))
+                throw new InvalidOperationException($"'{key}' maps to virtual key 0x{vk:X2}, which another choice already uses");
+
+            foreach (var id in new[] { TrayIcon.HotkeyShortBase + (uint)i, TrayIcon.HotkeyLongBase + (uint)i })
+            {
+                if (!ids.Add(id))
+                    throw new InvalidOperationException($"menu id {id} is used twice");
+                if (id >= TrayIcon.HotkeyShortBase && id < TrayIcon.HotkeyShortBase + choices.Length
+                    && id >= TrayIcon.HotkeyLongBase && id < TrayIcon.HotkeyLongBase + choices.Length)
+                    throw new InvalidOperationException($"menu id {id} falls into both hotkey ranges");
+            }
+        }
+
+        // The ranges must also stay clear of every id the rest of the menu already uses, or a
+        // hotkey row would quietly steal another menu's click.
+        foreach (var option in TrayIcon.BitrateOptions)
+        {
+            foreach (var id in new[] { TrayIcon.HotkeyShortBase, TrayIcon.HotkeyLongBase })
+            {
+                if (id <= option.Id && option.Id < id + (uint)shortRange)
+                    throw new InvalidOperationException($"hotkey range starting at {id} covers bitrate id {option.Id}");
+            }
         }
     }
 

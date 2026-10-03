@@ -89,9 +89,34 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_ENCODER_X264 = 1402;
     private const uint IDC_CODEC_HEVC = 1404;
     private const uint IDC_CODEC_H264 = 1405;
-    private const uint IDC_KEYS_F8 = 1500;
-    private const uint IDC_KEYS_F9 = 1501;
-    private const uint IDC_KEYS_F11 = 1502;
+    // Two contiguous command-id ranges, one per clip, and one table of choices. The id is the range's
+    // base plus the index in the table, so adding a key is a new table row and nothing else -- there
+    // is no per-key constant to declare, no case to add, and no way for the menu and the handler to
+    // disagree about what a command means. The old fixed presets ("F8/F9", "F9/F10", "F11/F12") are
+    // gone: they could only ever set the two bindings together, and the pairs people wanted (F9 for
+    // the long clip with something else on the short one) were not among them.
+    internal const uint HotkeyShortBase = 3000;
+    internal const uint HotkeyLongBase = 4000;
+
+    /// <summary>
+    /// The keys both hotkey menus offer, in menu order: F1-F12, then the numeric keypad. The keypad
+    /// is there because it is the one block of keys a game leaves free -- F-keys are usually taken,
+    /// and on a laptop the numpad doubles as the arrow cluster, so a binding there is not always
+    /// reachable either. That is the user's call, not ours, which is why both are offered.
+    /// </summary>
+    internal static readonly (string Key, string Label)[] HotkeyChoices =
+    [
+        ("F1", "F1"), ("F2", "F2"), ("F3", "F3"), ("F4", "F4"),
+        ("F5", "F5"), ("F6", "F6"), ("F7", "F7"), ("F8", "F8"),
+        ("F9", "F9"), ("F10", "F10"), ("F11", "F11"), ("F12", "F12"),
+        ("NumPad0", "NumPad 0"), ("NumPad1", "NumPad 1"), ("NumPad2", "NumPad 2"),
+        ("NumPad3", "NumPad 3"), ("NumPad4", "NumPad 4"), ("NumPad5", "NumPad 5"),
+        ("NumPad6", "NumPad 6"), ("NumPad7", "NumPad 7"), ("NumPad8", "NumPad 8"),
+        ("NumPad9", "NumPad 9"),
+    ];
+
+    /// <summary>Index of the first keypad row, and the place the separator goes.</summary>
+    private const int HotkeySeparatorAfter = 12;
 
     /// <summary>
     /// Every selectable bitrate: menu id, value written to the config, and the menu label.
@@ -566,6 +591,20 @@ public sealed partial class TrayIcon : IDisposable
                 return;
             }
 
+            // Hotkey ids are ranges rather than cases, so the whole menu is handled before the switch: two
+            // contiguous blocks, one per clip, each the range's base plus a row index.
+            if (id >= HotkeyShortBase && id - HotkeyShortBase < HotkeyChoices.Length)
+            {
+                ApplyHotkeyChoice((int)(id - HotkeyShortBase), isShort: true);
+                return;
+            }
+
+            if (id >= HotkeyLongBase && id - HotkeyLongBase < HotkeyChoices.Length)
+            {
+                ApplyHotkeyChoice((int)(id - HotkeyLongBase), isShort: false);
+                return;
+            }
+
             switch (id)
             {
                 case IDC_OPEN_FOLDER:
@@ -622,13 +661,6 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_CODEC_H264:
                     ApplySetting("Codec", "H.264", c => c.VideoCodec = "h264", live: false);
                     break;
-                case IDC_KEYS_F8:
-                    ApplySetting("Hotkeys", "F8 / F9", c =>
-                    {
-                        c.ShortClipHotkey = "F8";
-                        c.LongClipHotkey = "F9";
-                    }, live: true);
-                    break;
                 case IDC_PICK_FOLDER:
                     PickClipsFolder();
                     break;
@@ -637,14 +669,6 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_QUOTA_20: ApplyQuota(20); break;
                 case IDC_QUOTA_30: ApplyQuota(30); break;
                 case IDC_QUOTA_50: ApplyQuota(50); break;
-                case IDC_KEYS_F9:
-                    ApplySetting("Hotkeys", "F9 / F10",
-                        c => { c.ShortClipHotkey = "F9"; c.LongClipHotkey = "F10"; }, live: true);
-                    break;
-                case IDC_KEYS_F11:
-                    ApplySetting("Hotkeys", "F11 / F12",
-                        c => { c.ShortClipHotkey = "F11"; c.LongClipHotkey = "F12"; }, live: true);
-                    break;
                 case IDC_RESTART:
                     Restart();
                     break;
@@ -739,10 +763,12 @@ public sealed partial class TrayIcon : IDisposable
             (IDC_CODEC_HEVC, "HEVC / H.265  (sharper at the same bitrate)", config.UseHevc),
             (IDC_CODEC_H264, "H.264  (wider compatibility)", !config.UseHevc));
 
-        var keys = Submenu(menu, "Hotkeys",
-            (IDC_KEYS_F8, "F8 / F9  (default)", config.ShortClipHotkey == "F8"),
-            (IDC_KEYS_F9, "F9 / F10", config.ShortClipHotkey == "F9"),
-            (IDC_KEYS_F11, "F11 / F12", config.ShortClipHotkey == "F11"));
+        // Two independent submenus instead of three presets. The binding currently in force is named in
+        // the title and carries the check mark, so the answer to "what is F9 doing right now?" is on
+        // screen without opening anything -- which the old preset list could not do, since it showed
+        // which PAIR was picked rather than what either key was actually bound to.
+        var shortKey = AppendHotkeySubmenu(menu, "Short Clip Hotkey", isShort: true);
+        var longKey = AppendHotkeySubmenu(menu, "Long Clip Hotkey", isShort: false);
 
         var quota = Submenu(menu, "Clips Storage Limit",
             (IDC_QUOTA_0, "Unlimited", config.MaxClipsFolderSizeGB == 0),
@@ -753,7 +779,84 @@ public sealed partial class TrayIcon : IDisposable
 
         // Keep the handles alive until after the parent menu is shown; the OS reads them during
         // TrackPopupMenuEx, not during AppendMenu.
-        _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = codec; _ = keys; _ = quota;
+        _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = codec;
+        _ = shortKey; _ = longKey; _ = quota;
+    }
+
+    /// <summary>
+    /// One hotkey submenu: every key in <see cref="HotkeyChoices"/>, a separator before the keypad,
+    /// and a check mark on the key currently bound. The title names that key too.
+    ///
+    /// Built here rather than through <see cref="Submenu"/> because that helper takes a flat list of
+    /// items and cannot express the separator, and because the id of every row is derived from its
+    /// index -- see <see cref="HotkeyShortBase"/>.
+    /// </summary>
+    private nint AppendHotkeySubmenu(nint parent, string title, bool isShort)
+    {
+        var current = isShort ? config.ShortClipHotkey : config.LongClipHotkey;
+        var idBase = isShort ? HotkeyShortBase : HotkeyLongBase;
+
+        var sub = CreatePopupMenu();
+        for (var i = 0; i < HotkeyChoices.Length; i++)
+        {
+            if (i == HotkeySeparatorAfter)
+                AppendMenu(sub, MF_SEPARATOR, 0, "");
+
+            var (key, label) = HotkeyChoices[i];
+            var isCurrent = string.Equals(key, current, StringComparison.OrdinalIgnoreCase);
+            AppendMenu(sub, MF_STRING | (isCurrent ? MF_CHECKED : 0), idBase + (uint)i, label);
+        }
+
+        AppendMenu(parent, MF_POPUP, (nuint)sub, $"{title} (now {current})");
+        return sub;
+    }
+
+    /// <summary>
+    /// Applies one key chosen from either hotkey menu: reject a clash with the other binding, then
+    /// save, rebind live and say so.
+    ///
+    /// The clash check is not politeness. The hook reads its map on every keypress, and one key can
+    /// only mean one thing, so binding F9 to both clips would silently leave the short clip with no
+    /// hotkey at all -- the user would press it and get a 3-minute clip, or nothing, with no error
+    /// anywhere to notice.
+    /// </summary>
+    private void ApplyHotkeyChoice(int index, bool isShort)
+    {
+        if (index < 0 || index >= HotkeyChoices.Length)
+            return;
+
+        var (key, label) = HotkeyChoices[index];
+
+        // Refuse anything the config cannot parse back: a binding written to the file that the
+        // loader then rejects is a dead hotkey that looks configured in the menu.
+        if (!ClippyConfig.TryParseHotkey(key, out _))
+        {
+            Console.WriteLine($"Settings: '{key}' is not a bindable hotkey; ignored.");
+            ShowNotification("Clippy", $"'{key}' cannot be used as a hotkey");
+            return;
+        }
+
+        var other = isShort ? config.LongClipHotkey : config.ShortClipHotkey;
+        if (string.Equals(key, other, StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"Settings: {key} is already bound to the other clip; ignored.");
+            ShowNotification("Clippy", "Hotkeys cannot be identical");
+            return;
+        }
+
+        var action = isShort ? "Short clip" : "Long clip";
+        ApplySetting(
+            $"{action} hotkey",
+            key,
+            c =>
+            {
+                if (isShort)
+                    c.ShortClipHotkey = key;
+                else
+                    c.LongClipHotkey = key;
+            },
+            live: true,
+            notification: $"{action} hotkey set to {label}");
     }
 
     private nint Submenu(nint parent, string title, params (uint Id, string Text, bool Checked)[] items)
@@ -892,12 +995,12 @@ public sealed partial class TrayIcon : IDisposable
         if (deleted > 0)
             Console.WriteLine($"Quota: {deleted} clip(s) removed immediately.");
     }
-    private void ApplySetting(string name, string value, Action<ClippyConfig> mutate, bool live)
+    private void ApplySetting(string name, string value, Action<ClippyConfig> mutate, bool live, string? notification = null)
     {
         mutate(config);
         config.Save();
         Console.WriteLine($"Settings: {name} = {value}{(live ? "" : " (applies next session)")}");
-        ShowNotification("Clippy", $"Settings updated: {name} = {value}");
+        ShowNotification("Clippy", notification ?? $"Settings updated: {name} = {value}");
 
         if (live)
             RebindHotkeys();
