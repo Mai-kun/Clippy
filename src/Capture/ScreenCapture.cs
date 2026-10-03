@@ -179,19 +179,25 @@ internal sealed partial class ScreenCapture : IDisposable
         }
 
         var writer = new Mp4Writer();
-        writer.SetParameterSets(encoder.Sps, encoder.Pps);
+        writer.SetParameterSets(encoder.Sps, encoder.Pps, encoder.Vps);
         writer.SetDimensions(videoWidth, videoHeight);
 
         // ONE shared zero for both tracks, not a per-track origin. See TrackAligner for why, and for
         // why neither track is privileged: whichever starts later defines t=0 and the other is cut.
+        // NAL classification, and it has to follow the CODEC. H.264 puts the type in the low 5 bits of
+        // a one-byte header and numbers its picture NALs 1..5; HEVC uses a two-byte header, numbers them
+        // 0..31, and marks its key pictures 19/20. Reading HEVC as H.264 makes an IDR (19) look like a
+        // non-picture, so it is buffered as "pending" and then glued onto the next P picture -- one
+        // sample carrying two pictures, and every clip full of "Could not find ref with POC 0".
+        // The encoder tells us which rule applies: it has a VPS exactly when it is producing HEVC.
+        var hevc = encoder.Vps is not null;
+
         var videoTimes = new List<double>();
         foreach (var packet in videoPackets.Skip(start))
         {
-            var nalType = packet.Span[0] & 0x1F;
-            if (nalType is >= 1 and <= 5)
-            {
-                videoTimes.Add(packet.CaptureClockSeconds);
-            }
+            if (!IsPictureNal(packet, hevc))
+                continue;
+            videoTimes.Add(packet.CaptureClockSeconds);
         }
 
         var alignment = TrackAligner.Align(videoTimes, audioPackets.Select(p => p.CaptureClockSeconds).ToList());
@@ -223,8 +229,7 @@ internal sealed partial class ScreenCapture : IDisposable
         var timeIndex = 0;
         foreach (var packet in videoPackets.Skip(start))
         {
-            var nalType = packet.Span[0] & 0x1F;
-            var isVcl = nalType is >= 1 and <= 5;
+            var isVcl = IsPictureNal(packet, hevc);
             pending.Add(packet.Data.AsMemory(0, packet.Length));
 
             if (isVcl && timeIndex < alignment.VideoTimes.Count)
@@ -402,6 +407,21 @@ internal sealed partial class ScreenCapture : IDisposable
     /// scale, so subtracting this once puts every timestamp onto the shared Stopwatch.
     /// </summary>
     private double? stopwatchZeroQpcSeconds;
+
+    /// <summary>
+    /// True when this NAL unit is a picture -- the only kind that ends an access unit and consumes a
+    /// capture time. Codec-dependent, and both branches live here so the timeline, the sample writer
+    /// and the encoder cannot drift apart: they all mean "one picture", and for HEVC that is every
+    /// type up to 31 (IRAP included), not the H.264 range 1-5.
+    /// </summary>
+    private static bool IsPictureNal(StoredPacket packet, bool hevc)
+    {
+        var nal = packet.Span;
+        if (nal.Length < 2)
+            return false; // too short to carry any NAL header
+
+        return hevc ? HevcNal.IsVcl(HevcNal.Type(nal)) : (nal[0] & 0x1F) is >= 1 and <= 5;
+    }
 
     private static double FirstOrNaN(IReadOnlyList<double> values) => values.Count > 0 ? values[0] : double.NaN;
 
@@ -650,6 +670,7 @@ internal sealed partial class ScreenCapture : IDisposable
 
             Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring, " +
                 (withAudio ? "with audio" : "no audio") + $" (RAM {RamHeadSeconds:F0}s, disk to {RingSeconds:F0}s), " +
+                $"codec {(config.UseHevc ? "HEVC" : "H.264")}, " +
                 (prefersDirectNvenc ? "after the capture rate is measured" : "before StartCapture"));
         }
 
@@ -1274,7 +1295,7 @@ internal sealed partial class ScreenCapture : IDisposable
     /// </remarks>
     private IVideoEncoder? TryCreateNvencDirect(int width, int height) =>
         NvencDirectVideoEncoder.TryCreate(
-            d3d11Device, width, height, rateControlFps, config.VideoBitrateMbps * 1_000_000);
+            d3d11Device, width, height, rateControlFps, config.VideoBitrateMbps * 1_000_000, config.UseHevc);
 
     /// <summary>Stages a GPU texture into system RAM as tightly packed BGRA rows.</summary>
     private byte[] CopyTextureToCpu(ID3D11Texture2D texture, out int width, out int height)

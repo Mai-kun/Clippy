@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 
@@ -22,7 +22,8 @@ internal static unsafe partial class NvencNative
     private const string Library = "clippy_nvenc.dll";
 
     [LibraryImport(Library)]
-    private static partial int Nvenc_Open(void* device, int width, int height, int fps, int bitrate, void** context);
+    private static partial int Nvenc_Open(void* device, int width, int height, int fps, int bitrate,
+                                         int hevc, void** context);
 
     [LibraryImport(Library)]
     private static partial int Nvenc_EncodeTexture(void* context, void* texture, long timestamp100ns,
@@ -49,8 +50,8 @@ internal static unsafe partial class NvencNative
 
     internal static string ErrorText => LastError();
 
-    internal static int Open(void* device, int width, int height, int fps, int bitrate, void** context)
-        => Nvenc_Open(device, width, height, fps, bitrate, context);
+    internal static int Open(void* device, int width, int height, int fps, int bitrate, bool hevc, void** context)
+        => Nvenc_Open(device, width, height, fps, bitrate, hevc ? 1 : 0, context);
 
     internal static int Encode(void* context, void* texture, long timestamp100ns,
                                byte* output, int maxOutSize, int* isKeyframe)
@@ -59,7 +60,8 @@ internal static unsafe partial class NvencNative
     internal static void Close(void* context) => Nvenc_Close(context);
 
     /// <summary>
-    /// The SPS and PPS, in Annex B, as the driver holds them.
+    /// The parameter sets, in Annex B, as the driver holds them: SPS and PPS for H.264, VPS+SPS+PPS
+    /// for HEVC, which arrives as one block in both cases.
     /// </summary>
     /// <remarks>
     /// Returned separately because NVENC does not put them in the bitstream: the observed stream
@@ -118,7 +120,7 @@ internal static unsafe class NvencNativeSpike
         Console.WriteLine("[ok] BGRA texture created");
 
         void* ctx = null;
-        int rc = NvencNative.Open((void*)device.NativePointer, Width, Height, Fps, Bitrate, &ctx);
+        int rc = NvencNative.Open((void*)device.NativePointer, Width, Height, Fps, Bitrate, hevc: false, &ctx);
         if (rc != 0)
         {
             Console.WriteLine($"[FAIL] Nvenc_Open returned {rc}: {NvencNative.ErrorText}");
@@ -131,7 +133,7 @@ internal static unsafe class NvencNativeSpike
 
         // Reused across frames: a per-frame allocation here would put GC pauses in the middle of the
         // timing the encoder is being measured on.
-        var parser = new H264AnnexBParser();
+        var parser = new AnnexBParser();
         int nalCount = 0, sliceNalCount = 0;
         int capturedBytes = 0;
 
@@ -196,7 +198,7 @@ internal static unsafe class NvencNativeSpike
         Console.WriteLine();
         bool pass = framesOut == Frames && nalCount > 0 && sliceNalCount > 0 && keyframes >= 1;
         Console.WriteLine(pass
-            ? $"[PASS] {framesOut}/{Frames} frames encoded, {nalCount} NAL units parsed by H264AnnexBParser"
+            ? $"[PASS] {framesOut}/{Frames} frames encoded, {nalCount} NAL units parsed by AnnexBParser"
             : "[FAIL] see the counts above");
         return pass ? 0 : 1;
     }

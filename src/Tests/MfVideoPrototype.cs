@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using SharpGen.Runtime;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -307,15 +307,15 @@ internal static class MfVideoPrototype
             }
 
             // A byte pattern is not the contract; the parser is.
-            step = "H264AnnexBParser";
+            step = "AnnexBParser";
             var nals = new List<(int Length, bool Keyframe)>();
             void Collect(byte[] data, int length, bool keyframe, double _) => nals.Add((length, keyframe));
 
-            var parser = new H264AnnexBParser();
+            var parser = new AnnexBParser();
             parser.Append(encoded, 0.0, Collect);
             parser.Flush(0.0, Collect);
 
-            Console.WriteLine($"    H264AnnexBParser extracted {nals.Count} NAL unit(s): " +
+            Console.WriteLine($"    AnnexBParser extracted {nals.Count} NAL unit(s): " +
                               string.Join(", ", nals.Select((n, i) => $"#{i} len={n.Length} key={n.Keyframe}")));
             if (nals.Count == 0)
             {
@@ -324,7 +324,7 @@ internal static class MfVideoPrototype
             }
 
             Console.WriteLine("MFT Video Prototype: SUCCESS -- the system H.264 encoder emitted Annex B that " +
-                              "H264AnnexBParser framed without help. The video path can drop ffmpeg too.");
+                              "AnnexBParser framed without help. The video path can drop ffmpeg too.");
             return 0;
         }
         catch (Exception ex)
@@ -615,17 +615,17 @@ internal static class MfVideoPrototype
             var nals = new List<(int Length, bool Keyframe)>();
             void Collect(byte[] data, int length, bool keyframe, double _) => nals.Add((length, keyframe));
 
-            var parser = new H264AnnexBParser();
+            var parser = new AnnexBParser();
             parser.Append(encoded, 0.0, Collect);
             parser.Flush(0.0, Collect);
 
-            Console.WriteLine($"    H264AnnexBParser extracted {nals.Count} NAL unit(s): " +
+            Console.WriteLine($"    AnnexBParser extracted {nals.Count} NAL unit(s): " +
                               string.Join(", ", nals.Select((n, i) => $"#{i} len={n.Length} key={n.Keyframe}")));
             if (nals.Count == 0)
                 throw new InvalidOperationException("the production parser found no NAL units in the output.");
 
             Console.WriteLine($"MFT Video Prototype: SUCCESS, emitted {encoded.Length} bytes of H.264 Annex-B " +
-                              $"({nals.Count} NAL unit(s) framed by H264AnnexBParser). The video path can drop ffmpeg.");
+                              $"({nals.Count} NAL unit(s) framed by AnnexBParser). The video path can drop ffmpeg.");
             return 0;
         }
         catch (Exception ex)
@@ -923,7 +923,7 @@ internal static class MfVideoPrototype
             var nals = new List<(int Length, bool Keyframe)>();
             void Collect(byte[] data, int length, bool keyframe, double _) => nals.Add((length, keyframe));
 
-            var parser = new H264AnnexBParser();
+            var parser = new AnnexBParser();
             var packets = 0;
             var bytes = 0;
 
@@ -1005,18 +1005,18 @@ internal static class MfVideoPrototype
             if (packets == 0)
                 throw new InvalidOperationException("the encoder produced no output across the whole clip.");
             if (nals.Count == 0)
-                throw new InvalidOperationException("H264AnnexBParser found no NAL units in the bitstream.");
+                throw new InvalidOperationException("AnnexBParser found no NAL units in the bitstream.");
 
             var keyframes = nals.Count(n => n.Keyframe);
             Console.WriteLine($"    bitstream: {bytes} bytes in {packets} packet(s)");
-            Console.WriteLine($"    H264AnnexBParser framed {nals.Count} NAL unit(s), {keyframes} keyframe(s): " +
+            Console.WriteLine($"    AnnexBParser framed {nals.Count} NAL unit(s), {keyframes} keyframe(s): " +
                               $"sizes {string.Join(", ", nals.Select(n => n.Length))}");
             if (keyframes == 0)
                 throw new InvalidOperationException("no keyframe in the bitstream, so it could not be seeked.");
 
             Console.WriteLine($"MFT Video Prototype: SUCCESS, {Frames} frames of GPU-converted BGRA->NV12 " +
                               $"became {bytes} bytes of H.264 Annex-B in {packets} packet(s), framed by " +
-                              "H264AnnexBParser. The video path can drop ffmpeg.");
+                              "AnnexBParser. The video path can drop ffmpeg.");
             return 0;
         }
         catch (Exception ex)
@@ -1027,7 +1027,7 @@ internal static class MfVideoPrototype
 
     /// <summary>Reads whatever output is ready and pushes it through the production parser.</summary>
     private static void Drain(IMFTransform transform, IMFMediaEventGenerator events, bool providesSamples,
-                              H264AnnexBParser parser, Action<byte[], int, bool, double> collect,
+                              AnnexBParser parser, Action<byte[], int, bool, double> collect,
                               ref int packets, ref int bytes)
     {
         for (var i = 0; i < 16; i++)

@@ -15,6 +15,9 @@ internal static class ParserSelfTest
         failures += Check("H264: escaped start code inside payload", H264EscapedStartCode);
         failures += Check("H264: split across chunk boundary", H264ChunkBoundary);
         failures += Check("H264: split inside a 4-byte start code", H264SplitInsideStartCode);
+        failures += Check("HEVC: NAL type from the 2-byte header, IRAP = keyframe", HevcNalTypes);
+        failures += Check("HEVC: parameter sets are not pictures", HevcParameterSets);
+        failures += Check("HEVC: split across chunk boundary", HevcChunkBoundary);
         failures += Check("ADTS: frame split and lengths", AdtsSplitAndLengths);
         failures += Check("ADTS: frame split across chunk boundary", AdtsChunkBoundary);
         failures += Check("ADTS: false sync inside payload ignored", AdtsFalseSync);
@@ -59,7 +62,7 @@ internal static class ParserSelfTest
     private static List<(byte[] Data, bool IsIdr)> ParseH264(byte[] stream)
     {
         var packets = new List<(byte[], bool)>();
-        var parser = new H264AnnexBParser();
+        var parser = new AnnexBParser();
         parser.Append(stream, 1.25, (data, _, isIdr, _) => packets.Add((data, isIdr)));
         parser.Flush(1.25, (data, _, isIdr, _) => packets.Add((data, isIdr)));
         return packets;
@@ -125,7 +128,7 @@ internal static class ParserSelfTest
 
         // One byte at a time: every NAL is necessarily cut by a chunk boundary.
         var packets = new List<(byte[] Data, bool IsIdr)>();
-        var parser = new H264AnnexBParser();
+        var parser = new AnnexBParser();
         for (var i = 0; i < bytes.Length; i++)
             parser.Append(bytes.AsSpan(i, 1), 1.5, (d, _, k, _) => packets.Add((d, k)));
         parser.Flush(1.5, (d, _, k, _) => packets.Add((d, k)));
@@ -153,7 +156,7 @@ internal static class ParserSelfTest
         var bytes = stream.ToArray();
 
         var packets = new List<(byte[] Data, bool IsIdr)>();
-        var parser = new H264AnnexBParser();
+        var parser = new AnnexBParser();
         for (var i = 0; i < bytes.Length; i++)
             parser.Append(bytes.AsSpan(i, 1), 2.0, (d, _, k, _) => packets.Add((d, k)));
         parser.Flush(2.0, (d, _, k, _) => packets.Add((d, k)));
@@ -250,6 +253,123 @@ internal static class ParserSelfTest
 
         if (got[0].Length != 300 || got[1].Length != 200)
             return $"lengths wrong: {got[0].Length}, {got[1].Length}";
+
+        return null;
+    }
+
+    /// <summary>
+    /// Builds one HEVC NAL unit. The header is two bytes, unlike H.264's single one:
+    ///   forbidden_zero_bit(1) | nal_unit_type(6) | nuh_layer_id(6) | nuh_temporal_id_plus1(3)
+    /// so nal_unit_type lives in bits 1-6 of the FIRST byte, and reading it as H.264 does
+    /// ((byte & 0x1F), bits 0-4) shifts every type by one and would report the VPS as an
+    /// "IDR picture" -- the clip would then start on a parameter set and decode to garbage.
+    /// </summary>
+    private static byte[] HevcNalUnit(int type, params byte[] body)
+    {
+        var header = new byte[] { (byte)(type << 1), 0x01 }; // layer id 0, temporal id plus1 = 1
+        var result = new byte[header.Length + body.Length];
+        header.CopyTo(result, 0);
+        body.CopyTo(result.AsSpan(header.Length));
+        return result;
+    }
+
+    private static List<(byte[] Data, bool IsKeyframe)> ParseHevc(byte[] stream)
+    {
+        var packets = new List<(byte[], bool)>();
+        var parser = new AnnexBParser(hevc: true);
+        parser.Append(stream, 1.25, (data, _, isKeyframe, _) => packets.Add((data, isKeyframe)));
+        parser.Flush(1.25, (data, _, isKeyframe, _) => packets.Add((data, isKeyframe)));
+        return packets;
+    }
+
+    private static string? HevcNalTypes()
+    {
+        var types = new[] { 32, 33, 34, 19, 1, 21 }; // VPS, SPS, PPS, IDR_W_RADL, TRAIL_R, CRA_NUT
+        var stream = new List<byte>();
+        foreach (var type in types)
+        {
+            stream.AddRange(Sc4);
+            stream.AddRange(HevcNalUnit(type, 0xAA, 0xBB));
+        }
+
+        var got = ParseHevc([.. stream]);
+        if (got.Count != types.Length)
+            return $"expected {types.Length} NALs, got {got.Count}";
+
+        for (var i = 0; i < types.Length; i++)
+        {
+            var actual = HevcNal.Type(got[i].Data);
+            if (actual != types[i])
+                return $"NAL {i}: type {actual}, expected {types[i]}";
+        }
+
+        // Only the IRAP pictures (16..21) are random access points; VPS/SPS/PPS are not.
+        var expectedKeys = new[] { false, false, false, true, false, true };
+        for (var i = 0; i < types.Length; i++)
+        {
+            if (got[i].IsKeyframe != expectedKeys[i])
+                return $"NAL type {types[i]}: isKeyframe {got[i].IsKeyframe}, expected {expectedKeys[i]}";
+        }
+
+        return null;
+    }
+
+    private static string? HevcParameterSets()
+    {
+        // The muxer must find exactly these three, and none of them may be mistaken for a picture:
+        // a VCL NAL is the only one that consumes a capture time and ends an access unit.
+        foreach (var (type, expectedName) in new[]
+        {
+            (HevcNal.Vps, "VPS"), (HevcNal.Sps, "SPS"), (HevcNal.Pps, "PPS"),
+        })
+        {
+            if (HevcNal.IsVcl(type))
+                return $"{expectedName} (type {type}) is classified as a picture";
+        }
+
+        foreach (var type in new[] { 0, 1, 19, 20, 21 })
+        {
+            if (!HevcNal.IsVcl(type))
+                return $"slice type {type} is not classified as a picture";
+        }
+
+        // Keyframe = IRAP (16..21); CRA and IDR both open a GOP a decoder can start from.
+        foreach (var type in new[] { 16, 17, 18, 19, 20, 21 })
+        {
+            if (!HevcNal.IsKeyframe(type))
+                return $"IRAP type {type} is not a keyframe";
+        }
+
+        foreach (var type in new[] { 0, 1, 2, 15, 22, 32, 33, 34, 39, 40 })
+        {
+            if (HevcNal.IsKeyframe(type))
+                return $"type {type} was treated as a keyframe";
+        }
+
+        return null;
+    }
+
+    private static string? HevcChunkBoundary()
+    {
+        var stream = new List<byte>();
+        foreach (var type in new[] { 32, 19, 1 })
+        {
+            stream.AddRange(Sc4);
+            stream.AddRange(HevcNalUnit(type, 0x11, 0x22, 0x33, 0x44));
+        }
+
+        var got = ParseHevc(stream.ToArray());
+        if (got.Count != 3)
+            return $"expected 3 NALs, got {got.Count} (frame lost or duplicated)";
+
+        var types = new[] { 32, 19, 1 };
+        for (var i = 0; i < types.Length; i++)
+        {
+            if (HevcNal.Type(got[i].Data) != types[i])
+                return $"NAL {i}: type {HevcNal.Type(got[i].Data)}, expected {types[i]}";
+            if (got[i].Data.Length != 6)
+                return $"NAL {i}: {got[i].Data.Length} bytes, expected 6";
+        }
 
         return null;
     }

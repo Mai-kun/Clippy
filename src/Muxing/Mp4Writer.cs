@@ -21,6 +21,9 @@ internal sealed class Mp4Writer
     private readonly List<ulong> timesMicroseconds = [];
     private readonly List<byte[]> parameterSets = [];
 
+    /// <summary>True once a VPS has been supplied: HEVC writes hvc1/hvcC, H.264 writes avc1/avcC.</summary>
+    private bool hevc;
+
     private readonly List<byte[]> audioSamples = [];
     private readonly List<ulong> audioTimes = [];
     private byte[]? audioSpecificConfig;
@@ -110,10 +113,20 @@ internal sealed class Mp4Writer
         return payload;
     }
 
-    /// <summary>Records the SPS/PPS used to build the avcC box.</summary>
-    public void SetParameterSets(byte[] sps, byte[] pps)
+    /// <summary>Records the parameter sets used to build the avcC / hvcC box.</summary>
+    /// <param name="sps">SPS, the sequence parameter set.</param>
+    /// <param name="pps">PPS, the picture parameter set.</param>
+    /// <param name="vps">
+    /// HEVC only: the video parameter set that precedes them. Its PRESENCE is what selects HEVC,
+    /// because there is no H.264 equivalent -- an HEVC track is described by all three, and a file
+    /// whose hvcC lacks the VPS is one many players refuse outright. Pass null for H.264.
+    /// </param>
+    public void SetParameterSets(byte[] sps, byte[] pps, byte[]? vps = null)
     {
+        hevc = vps is not null;
         parameterSets.Clear();
+        if (vps is not null)
+            parameterSets.Add(vps);
         parameterSets.Add(sps);
         parameterSets.Add(pps);
     }
@@ -237,14 +250,19 @@ internal sealed class Mp4Writer
         s.Write(b);
     }
 
-    private static byte[] BuildFtyp()
+    private byte[] BuildFtyp()
     {
         using var ms = new MemoryStream();
         WriteBox(ms, "ftyp", body =>
         {
             body.Write("isom"u8);
             W32(body, 0x200);
-            foreach (var brand in new[] { "isom", "iso2", "avc1", "mp41" })
+            // The brand list has to name the sample entry the file actually uses: a player that
+            // finds "avc1" here and an hvc1 track inside decides the header is lying about the file.
+            var brands = hevc
+                ? new[] { "isom", "iso2", "hvc1", "mp41" }
+                : new[] { "isom", "iso2", "avc1", "mp41" };
+            foreach (var brand in brands)
                 body.Write(System.Text.Encoding.ASCII.GetBytes(brand));
         });
         return ms.ToArray();
@@ -478,7 +496,50 @@ internal sealed class Mp4Writer
 
     private byte[] BuildStsd()
     {
-        using var avcC = new MemoryStream();
+        using var config = new MemoryStream();
+        if (hevc)
+            WriteHvcC(config);
+        else
+            WriteAvcC(config);
+
+        // VisualSampleEntry carries the same 78 bytes of fixed fields for avc1 and for hvc1 --
+        // reserved, data_reference_index, pre_defined/reserved, width, height, dpi, frame_count,
+        // compressorname, depth, pre_defined. Only the entry name and the configuration box nested
+        // inside it differ, so they are written once here and named by the codec.
+        using var entry = new MemoryStream();
+        entry.Write(new byte[6]);                            // reserved[6]
+        W16(entry, 1);                                       // data_reference_index
+        entry.Write(new byte[16]);                           // pre_defined / reserved
+        W16(entry, (ushort)Width);
+        W16(entry, (ushort)Height);
+        W32(entry, 0x00480000);                              // 72 dpi horizontal
+        W32(entry, 0x00480000);                              // 72 dpi vertical
+        W32(entry, 0);                                       // reserved
+        W16(entry, 1);                                       // frame_count
+        entry.Write(new byte[32]);                           // compressorname
+        W16(entry, 0x0018);                                  // depth
+        WI16(entry, -1);                                     // pre_defined
+
+        // avc1/hvc1 is a plain box wrapping the visual sample entry, and the configuration record
+        // rides inside it. Writing the entry fields straight into the stream, with no box header, is
+        // what left ffmpeg reporting "invalid size 0 in stsd".
+        using var entryBox = new MemoryStream();
+        WriteBox(entryBox, hevc ? "hvc1" : "avc1", body =>
+        {
+            body.Write(entry.GetBuffer(), 0, (int)entry.Length);
+            WriteBox(body, hevc ? "hvcC" : "avcC", inner => inner.Write(config.ToArray()));
+        });
+
+        // stsd is a full box: version/flags, entry count, then the sample entries.
+        return FullBox("stsd", 0, 0, stsd =>
+        {
+            W32(stsd, 1);     // entry count
+            stsd.Write(entryBox.GetBuffer(), 0, (int)entryBox.Length);
+        });
+    }
+
+    private void WriteAvcC(Stream avcC)
+    {
         avcC.WriteByte(1);                                  // configurationVersion
         avcC.WriteByte(parameterSets[0][1]);                // AVCProfileIndication (from SPS)
         avcC.WriteByte(parameterSets[0][2]);                // profile_compatibility
@@ -494,38 +555,70 @@ internal sealed class Mp4Writer
         avcC.WriteByte((byte)(pps.Length >> 8));
         avcC.WriteByte((byte)(pps.Length & 0xFF));
         avcC.Write(pps);
+    }
 
-        using var avc1 = new MemoryStream();
-        avc1.Write(new byte[6]);                            // reserved
-        W16(avc1, 1);     // data_reference_index
-        avc1.Write(new byte[16]);                           // pre_defined / reserved
-        W16(avc1, (ushort)Width);
-        W16(avc1, (ushort)Height);
-        W32(avc1, 0x00480000); // 72 dpi horizontal
-        W32(avc1, 0x00480000); // 72 dpi vertical
-        W32(avc1, 0);     // reserved
-        W16(avc1, 1);     // frame_count
-        avc1.Write(new byte[32]);                           // compressorname
-        W16(avc1, 0x0018); // depth
-        WI16(avc1, -1);     // pre_defined
+    /// <summary>
+    /// HEVCDecoderConfigurationRecord, ISO/IEC 14496-15 §8.3.3.1: 23 fixed bytes, then one array per
+    /// parameter set, each tagged with its own nal_unit_type.
+    ///
+    /// The profile and level are copied out of the SPS rather than invented. They sit at fixed
+    /// offsets inside the SPS's profile_tier_level -- counting the 2-byte NAL header, byte 3 carries
+    /// space/tier/idc, bytes 4-7 the compatibility flags, bytes 9-14 the constraint flags, byte 15
+    /// the level -- and a container advertising a level the stream does not carry is the first thing
+    /// a strict player checks. The short-SPS fallback exists only so malformed input cannot throw
+    /// halfway through an export.
+    /// </summary>
+    private void WriteHvcC(Stream hvcC)
+    {
+        var vps = parameterSets[0];
+        var sps = parameterSets[1];
+        var pps = parameterSets[2];
 
-        // avc1 is a plain box wrapping the visual sample entry, and the avcC configuration rides
-        // inside it. Writing the entry fields straight into the stream, with no 'avc1' header, is
-        // what left ffmpeg reporting "invalid size 0 in stsd".
-        using var avc1Box = new MemoryStream();
-        WriteBox(avc1Box, "avc1", entry =>
+        // The first byte of profile_tier_level sits at a fixed offset: after the two-byte NAL header come
+        // sps_video_parameter_set_id, sps_max_sub_layers_minus1 and sps_temporal_id_nesting_flag --
+        // one byte in total -- and then the profile_space/tier/profile_idc byte itself. That one is
+        // worth carrying across, because it is what a player shows as "Main".
+        //
+        // The four compatibility flags, six constraint flags and general_level_idc after it are
+        // deliberately left UNSPECIFIED (zero) rather than copied at guessed offsets. A first version
+        // copied bytes 4-15 wholesale and produced a container advertising level 0x03 for a stream
+        // encoded at level 0x3C -- a small lie that no test caught until ffprobe was made the oracle.
+        // Every demuxer re-parses the SPS out of the arrays below, which are shipped byte for byte,
+        // so an honest "not stated here" costs nothing and cannot be wrong.
+        hvcC.WriteByte(1);                                                  // configurationVersion
+        hvcC.WriteByte(sps.Length >= 4 ? sps[3] : (byte)0);                 // profile_space/tier/idc
+        W32(hvcC, 0);                                                       // compatibility flags
+        hvcC.Write(new byte[6]);                                            // constraint flags
+        hvcC.WriteByte(0);                                                  // general_level_idc
+
+        // The 23 fixed bytes, counted from the spec rather than from habit: version 1, profile byte 1,
+// compatibility 4, constraint 6, level 1, min_spatial_segmentation_idc 2 (4 bits reserved +
+        // 12 bits value -- writing this one as a single byte shifts everything after it by one and
+        // lands numOfArrays on the first array's header), parallelismType 1, chromaFormat 1,
+        // bitDepthLuma 1, bitDepthChroma 1, avgFrameRate 2, the packed flags 1, numOfArrays 1.
+        hvcC.WriteByte(0xF0);       // reserved '1111' + min_spatial_segmentation_idc (high 8 bits)
+        hvcC.WriteByte(0x00);       // min_spatial_segmentation_idc (low 8 bits)
+        hvcC.WriteByte(0xFC);       // 6 bits reserved + parallelismType
+        hvcC.WriteByte(0xFD);       // 6 bits reserved + chromaFormat 1 (4:2:0)
+        hvcC.WriteByte(0xF8);       // 5 bits reserved + bitDepthLumaMinus8 = 0
+        hvcC.WriteByte(0xF8);       // 5 bits reserved + bitDepthChromaMinus8 = 0
+        W16(hvcC, 0);              // avgFrameRate: unspecified
+        // constantFrameRate 0 | numTemporalLayers 1 | temporalIdNested 1 | lengthSizeMinusOne 3
+        hvcC.WriteByte(0x0F);
+        hvcC.WriteByte(3);         // numOfArrays: VPS, SPS, PPS
+
+        foreach (var (type, nal) in new[] { (HevcNal.Vps, vps), (HevcNal.Sps, sps), (HevcNal.Pps, pps) })
         {
-            entry.Write(avc1.GetBuffer(), 0, (int)avc1.Length);
-            WriteBox(entry, "avcC", body => body.Write(avcC.ToArray()));
-        });
-
-        // stsd is a full box: version/flags, entry count, then the sample entries.
-        var stsd = FullBox("stsd", 0, 0, stsd =>
-        {
-            W32(stsd, 1);     // entry count
-            stsd.Write(avc1Box.GetBuffer(), 0, (int)avc1Box.Length);
-        });
-        return stsd;
+            hvcC.WriteByte((byte)type);   // array_completeness = 0, reserved = 0, NAL_unit_type
+            // numNalus is 16 bits, NOT one byte. Writing it as a single 0x01 makes a reader take the
+            // first length byte as its high half, read 0x0100 = 256 NAL units, run off the record and
+            // give up with "Invalid NAL unit size in extradata" -- which is precisely what ffprobe
+            // said about the first version of this code.
+            hvcC.WriteByte(0);
+            hvcC.WriteByte(1);
+            W16(hvcC, (ushort)nal.Length);
+            hvcC.Write(nal);               // start code stripped, emulation prevention kept
+        }
     }
 
     /// <summary>

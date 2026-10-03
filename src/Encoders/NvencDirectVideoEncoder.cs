@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using Vortice.Direct3D11;
 
 namespace Clippy;
@@ -26,13 +26,15 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
     private const int MaxFrameBytes = 16 * 1024 * 1024;
 
     private void* context;
-    private readonly H264AnnexBParser parser = new();
+    private readonly bool hevc;
+    private readonly AnnexBParser parser;
     private readonly Queue<double> captureTimes = new();
     private readonly object stateLock = new();
 
     private RingBuffer? ring;
     private byte[]? sps;
     private byte[]? pps;
+    private byte[]? vps;
     private byte[]? parameterSets;          // SPS and PPS, prepended to the first keyframe
     private bool parametersPrepended;      // so they go in once, not on every IDR
     private int captureTimeCount;
@@ -43,9 +45,13 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
     // on, and so that a 4K frame does not allocate 16 MB sixty times a second.
     private readonly byte[] frameBytes = new byte[MaxFrameBytes];
 
-    private NvencDirectVideoEncoder(void* ctx)
+    private NvencDirectVideoEncoder(void* ctx, bool hevc)
     {
         context = ctx;
+        this.hevc = hevc;
+        // The parser needs the codec up front: H.264 and HEVC frame the stream identically and
+        // differ only in the NAL header, so one flag here decides how every later byte is read.
+        parser = new AnnexBParser(hevc);
     }
 
     /// <summary>
@@ -62,8 +68,9 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
     /// pixels back through system memory and give up the entire point of this class.
     /// </para>
     /// </remarks>
+    /// <param name="hevc">True to encode H.265 instead of H.264.</param>
     public static NvencDirectVideoEncoder? TryCreate(
-        ID3D11Device device, int width, int height, int fps, int bitrateBps)
+        ID3D11Device device, int width, int height, int fps, int bitrateBps, bool hevc = false)
     {
         if (width <= 0 || height <= 0 || fps <= 0 || bitrateBps <= 0)
         {
@@ -75,7 +82,7 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
         int rc;
         try
         {
-            rc = NvencNative.Open((void*)device.NativePointer, width, height, fps, bitrateBps, &ctx);
+            rc = NvencNative.Open((void*)device.NativePointer, width, height, fps, bitrateBps, hevc, &ctx);
         }
         catch (DllNotFoundException)
         {
@@ -94,10 +101,11 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
             return null;
         }
 
-        var encoder = new NvencDirectVideoEncoder(ctx);
+        var encoder = new NvencDirectVideoEncoder(ctx, hevc);
         encoder.ReadParameterSets();
         Console.WriteLine($"[nvenc-direct] NVENC session open at {width}x{height} @ {fps}fps, " +
-                          $"{bitrateBps / 1_000_000} Mbit/s. No ffmpeg process will be started.");
+                          $"{bitrateBps / 1_000_000} Mbit/s, codec {(hevc ? "HEVC (H.265)" : "H.264")}. " +
+                          "No ffmpeg process will be started.");
         return encoder;
     }
 
@@ -122,26 +130,51 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
         }
 
         parameterSets = raw;
-        var parser = new H264AnnexBParser();
-        parser.Append(raw, 0.0, (nal, length, _, _) =>
-        {
-            var type = nal[0] & 0x1F;
-            if (type == 7 && sps is null) sps = nal;
-            else if (type == 8 && pps is null) pps = nal;
-        });
+        var parser = new AnnexBParser(hevc);
+        parser.Append(raw, 0.0, CaptureParameterSet);
         // Flush, not just Append: the parser holds the final NAL back until something follows it or
-        // the stream ends. The PPS is the last unit in this buffer, so without the flush it is never
-        // emitted and the muxer gets a half-filled avcC record.
-        parser.Flush(0.0, (nal, _, _, _) =>
-        {
-            var type = nal[0] & 0x1F;
-            if (type == 7 && sps is null) sps = nal;
-            else if (type == 8 && pps is null) pps = nal;
-        });
+        // the stream ends. The last parameter set is the final unit in this buffer, so without the
+        // flush it is never emitted and the muxer gets an hvcC record with a missing array.
+        parser.Flush(0.0, CaptureParameterSet);
         Console.WriteLine($"[params] NVENC sequence parameters: {raw.Length} bytes, " +
+                          $"{(hevc ? $"VPS {(vps is null ? "missing" : vps.Length.ToString())} B, " : "")}" +
                           $"SPS {(sps is null ? "missing" : sps.Length.ToString())} B, " +
                           $"PPS {(pps is null ? "missing" : pps.Length.ToString())} B");
     }
+
+    /// <summary>
+    /// Files one parameter set, by NAL type, for whichever codec this session is running. H.264 uses
+    /// 7 and 8; HEVC uses 32, 33 and 34, and all three are needed -- a container missing the VPS is
+    /// one players reject.
+    /// </summary>
+    private void CaptureParameterSet(byte[] nal, int length, bool _, double __)
+    {
+        var type = NalType(nal);
+        if (hevc)
+        {
+            if (type == HevcNal.Vps && vps is null)
+                vps = nal;
+            else if (type == HevcNal.Sps && sps is null)
+                sps = nal;
+            else if (type == HevcNal.Pps && pps is null)
+                pps = nal;
+        }
+        else if (type == 7 && sps is null)
+        {
+            sps = nal;
+        }
+        else if (type == 8 && pps is null)
+        {
+            pps = nal;
+        }
+    }
+
+    /// <summary>nal_unit_type for this session's codec, from the right header layout.</summary>
+    private int NalType(ReadOnlySpan<byte> nal) =>
+        hevc ? HevcNal.Type(nal) : nal[0] & 0x1F;
+
+    /// <summary>True when this NAL is a picture: types 1-5 for H.264, 0-31 (VCL) for HEVC.</summary>
+    private bool IsPicture(int type) => hevc ? HevcNal.IsVcl(type) : type is >= 1 and <= 5;
 
     /// <summary>
     /// Encodes one capture texture and pushes the resulting access unit into the ring.
@@ -214,28 +247,14 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
     /// <summary>One NAL unit leaving the parser.</summary>
     private void Push(byte[] data, int length, bool isIdr, double parserTime)
     {
-        var type = data[0] & 0x1F;
-        if (type == 7)
-        {
-            if (sps is null)
-            {
-                sps = data;
-                Console.WriteLine($"[params] first SPS from NVENC ({length} bytes)");
-            }
-        }
-        else if (type == 8)
-        {
-            if (pps is null)
-            {
-                pps = data;
-                Console.WriteLine($"[params] first PPS from NVENC ({length} bytes)");
-            }
-        }
+        var type = NalType(data);
+        CaptureParameterSet(data, length, isIdr, parserTime);
 
-        // Only a VCL NAL is a picture, so only a VCL NAL consumes a capture time. Parameter sets and
-        // SEI travel with whatever picture follows them and must not shift the timeline -- the same
-        // rule the ffmpeg drain applies, and for the same reason.
-        var isVcl = type is >= 1 and <= 5;
+        // Only a picture NAL is a picture, so only a picture NAL consumes a capture time. Parameter
+        // sets and SEI travel with whatever picture follows them and must not shift the timeline --
+        // the same rule the ffmpeg drain applies, and for the same reason. The test differs by codec:
+        // H.264 slices are types 1-5, HEVC slices are every VCL type from 0 to 31.
+        var isVcl = IsPicture(type);
         // A non-VCL NAL carries the time the parser saw it, exactly as the ffmpeg drain does. It must
         // not be stamped 0: RingBuffer.Slice selects by capture time, and a parameter set sitting
         // at zero falls outside every export window, so the clipped stream loses its own avcC data.
@@ -277,6 +296,9 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
 
     public byte[]? Sps => sps;
     public byte[]? Pps => pps;
+
+    /// <summary>HEVC only; null in an H.264 session, which is what makes the muxer write avc1.</summary>
+    public byte[]? Vps => vps;
 
     /// <summary>
     /// Nothing to wait for.

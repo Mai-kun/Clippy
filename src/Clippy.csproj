@@ -40,6 +40,11 @@
          Without this copied, the mp4 test fails on a published binary with FileNotFoundException. -->
     <None Include="Tests\mp4-selftest-frames.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Include="Tests\mp4-selftest-audio.aac" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+<!-- The HEVC counterpart of the fixture above: a real VPS/SPS/PPS and twelve real pictures from
+         libx265. Synthetic parameter sets were tried first and ffprobe refused the resulting track,
+         because it parses the SPS out of hvcC before it will name a stream, so this container test
+         needs the real thing for the same reason the H.264 one does. -->
+    <None Include="Tests\mp4-selftest-hevc.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- The native NVENC bridge, built by src\native\build.cmd. -->
@@ -55,10 +60,10 @@
     <Copy SourceFiles="$(MSBuildProjectDirectory)\native\clippy_nvenc.dll"
           DestinationFolder="$(PublishDir)"
           Condition="Exists('$(MSBuildProjectDirectory)\native\clippy_nvenc.dll') AND '$(PublishDir)' != ''" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\Tests\mp4-selftest-frames.bin;$(MSBuildProjectDirectory)\Tests\mp4-selftest-audio.aac"
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\Tests\mp4-selftest-frames.bin;$(MSBuildProjectDirectory)\Tests\mp4-selftest-audio.aac;$(MSBuildProjectDirectory)\Tests\mp4-selftest-hevc.bin"
           DestinationFolder="$(OutDir)"
           Condition="'$(OutDir)' != ''" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\Tests\mp4-selftest-frames.bin;$(MSBuildProjectDirectory)\Tests\mp4-selftest-audio.aac"
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\Tests\mp4-selftest-frames.bin;$(MSBuildProjectDirectory)\Tests\mp4-selftest-audio.aac;$(MSBuildProjectDirectory)\Tests\mp4-selftest-hevc.bin"
           DestinationFolder="$(PublishDir)"
           Condition="'$(PublishDir)' != ''" />
   </Target>

@@ -30,6 +30,8 @@ internal static class Mp4WriterSelfTest
     failures += Check("mp4: both tracks share one zero when video starts late", SharedZeroVideoLate, always: true);
     failures += Check("mp4: both tracks share one zero when audio starts late", SharedZeroAudioLate, always: true);
     failures += Check("mp4: mutation check (no shared zero must fail)", SharedZeroMutationIsCaught, always: true);
+    failures += Check("mp4: HEVC writes hvc1 with a complete hvcC record", HevcSampleEntryAndConfig, always: true);
+    failures += Check("mp4: ffprobe reads the HEVC track back as hevc", HevcProbeReadsHevc);
         return failures;
     }
 
@@ -439,6 +441,178 @@ internal static class Mp4WriterSelfTest
         return Mp4BoxWalker.Check(data);
     }
 
+    /// <summary>
+    /// Builds a file from the real HEVC fixture: a VPS, SPS and PPS and a dozen genuine pictures,
+    /// parsed by the project's own AnnexBParser in HEVC mode -- the same code the NVENC bridge runs
+    /// on a live stream.
+    ///
+    /// A real fixture rather than invented parameter sets, for the same reason the H.264 tests use
+    /// one: ffprobe parses the SPS out of hvcC before it will name a stream, so a container built on
+    /// made-up bytes is rejected outright and proves nothing about a real recording.
+    /// </summary>
+    private static byte[] BuildHevcFile()
+    {
+        var source = Path.Combine(AppContext.BaseDirectory, "mp4-selftest-hevc.bin");
+        if (!File.Exists(source))
+            throw new FileNotFoundException($"test fixture not found: {source}", source);
+
+        byte[]? vps = null, sps = null, pps = null;
+        var pictures = new List<byte[]>();
+        var parser = new AnnexBParser(hevc: true);
+        parser.Append(File.ReadAllBytes(source), 0.0, (nal, _, _, _) =>
+        {
+            var type = HevcNal.Type(nal);
+            if (type == HevcNal.Vps && vps is null)
+                vps = nal;
+            else if (type == HevcNal.Sps && sps is null)
+                sps = nal;
+            else if (type == HevcNal.Pps && pps is null)
+                pps = nal;
+            else if (HevcNal.IsVcl(type))
+                pictures.Add(nal);
+        });
+
+        if (vps is null || sps is null || pps is null)
+            throw new InvalidOperationException("the HEVC fixture has no complete VPS/SPS/PPS triple");
+        Console.WriteLine($"       hevc: VPS {vps.Length}B SPS {sps.Length}B PPS {pps.Length}B, {pictures.Count} pictures");
+
+        var writer = new Mp4Writer();
+        // The VPS is what makes this HEVC and not H.264: it is the first of the three arrays the hvcC
+        // record must carry, and a container without it is one many players reject outright.
+        writer.SetParameterSets(sps, pps, vps);
+        writer.SetDimensions(320, 240);
+        for (var i = 0; i < pictures.Count; i++)
+            writer.AddVideoSample(pictures[i], i / 30.0);
+
+        return writer.Build();
+    }
+
+    /// <summary>
+    /// Offset of a box by its four-character type, found in the BYTES.
+    ///
+    /// Decoding the file to a string and calling IndexOf is wrong here: the mdat holds encoded video in
+    /// which a byte sequence can decode as one replacement character or as a multi-byte UTF-8
+    /// character, and every such byte shifts the character index away from the byte offset the box
+    /// header actually sits at. The declared size is validated too, so a chance occurrence of the
+    /// four letters inside payload data does not pass for a box.
+    /// </summary>
+    private static int IndexOfBox(byte[] data, string type)
+    {
+        var t = System.Text.Encoding.ASCII.GetBytes(type);
+        for (var i = 4; i + 4 <= data.Length; i++)
+        {
+            if (data[i] != t[0] || data[i + 1] != t[1] || data[i + 2] != t[2] || data[i + 3] != t[3])
+                continue;
+
+            var start = i - 4;
+            var size = (data[start] << 24) | (data[start + 1] << 16) | (data[start + 2] << 8) | data[start + 3];
+            if (size >= 8 && start + size <= data.Length)
+                return start;
+        }
+
+        return -1;
+    }
+
+    private static string? HevcSampleEntryAndConfig()
+    {
+        var data = BuildHevcFile();
+        var structure = Mp4BoxWalker.Check(data);
+        if (structure is not null)
+            return structure;
+
+        if (IndexOfBox(data, "hvc1") < 0)
+            return "the video sample entry is not hvc1";
+        if (IndexOfBox(data, "avc1") >= 0 || IndexOfBox(data, "avcC") >= 0)
+            return "an H.264 box leaked into the HEVC file";
+
+        // Walk the configuration record itself rather than trusting the box name: an
+        // HEVCDecoderConfigurationRecord is 23 fixed bytes, then numOfArrays and one array per
+        // parameter set. Counting those 23 from the spec is the whole point: one byte out and
+        // numOfArrays lands on the first array's header instead.
+        var box = IndexOfBox(data, "hvcC");
+        if (box < 0)
+            return "the hvcC configuration record is missing";
+
+        var arrays = data[box + 8 + 22];
+        if (arrays != 3)
+            return $"hvcC declares {arrays} arrays, expected 3 (VPS, SPS, PPS)";
+
+        var offset = box + 8 + 23;
+        var stored = new Dictionary<int, byte[]>();
+        for (var i = 0; i < arrays; i++)
+        {
+            var type = data[offset] & 0x3F;
+            var nals = (data[offset + 1] << 8) | data[offset + 2];
+            offset += 3;
+            for (var k = 0; k < nals; k++)
+            {
+                var length = (data[offset] << 8) | data[offset + 1];
+                offset += 2;
+                var payload = new byte[length];
+                Buffer.BlockCopy(data, offset, payload, 0, length);
+                offset += length;
+                stored[type] = payload;
+            }
+        }
+
+        // The walk has to land exactly on the end of the box. Without that, a chance occurrence of
+        // the four letters "hvcC" inside the encoded mdat passes every check below and the test is
+        // really only testing itself.
+        var boxSize = (data[box] << 24) + (data[box + 1] << 16) + (data[box + 2] << 8) + data[box + 3];
+        var boxEnd = box + boxSize; // the size field already counts the 8-byte header
+        if (offset != boxEnd)
+            return $"the parameter-set walk ended at {offset - box} of {boxEnd - box} bytes -- " +
+                   "this is not the configuration record of this file";
+
+        var fixture = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "mp4-selftest-hevc.bin"));
+        var real = new Dictionary<int, byte[]>();
+        new AnnexBParser(hevc: true).Append(fixture, 0.0, (nal, _, _, _) =>
+        {
+            var type = HevcNal.Type(nal);
+            if (!real.ContainsKey(type))
+                real[type] = nal;
+        });
+
+        // The parameter sets must survive the trip byte for byte: hvcC stores them without start codes,
+        // and one dropped or duplicated byte here only shows up as a file that will not decode.
+        foreach (var type in new[] { HevcNal.Vps, HevcNal.Sps, HevcNal.Pps })
+        {
+            if (!stored.ContainsKey(type))
+                return $"hvcC carries no array for NAL type {type}";
+            if (!stored[type].AsSpan().SequenceEqual(real[type]))
+                return $"hvcC's copy of NAL {type} differs from the fixture's " +
+                       $"({stored[type].Length} vs {real[type].Length} bytes)";
+        }
+
+        return null;
+    }
+
+    private static string? HevcProbeReadsHevc()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "clippy-mp4-hevc.mp4");
+        File.WriteAllBytes(path, BuildHevcFile());
+
+        var probe = RunProbe(["-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=codec_name,codec_tag_string,profile,width,height", "-of", "default=nw=1", path]);
+        if (probe is null)
+            return "ffprobe could not be started";
+
+        var text = probe.Trim().Replace('\n', ' ');
+        if (!text.Contains("codec_name=hevc"))
+            return $"ffprobe did not see an HEVC track: '{text}'";
+
+        // ffprobe reads the profile out of the SPS carried by hvcC, so "Main" appearing here is also
+        // proof that the parameter set survived the container intact rather than merely being present.
+        foreach (var expected in new[] { "codec_tag_string=hvc1", "profile=Main" })
+        {
+            if (!text.Contains(expected))
+                return $"ffprobe reported '{text}', expected it to contain {expected}";
+        }
+
+        Console.WriteLine($"       {text}");
+        return null;
+    }
+
     private static string? PtsMatchCaptureClock()
     {
         var (sps, pps, samples) = SplitStream(File.ReadAllBytes(
@@ -521,7 +695,7 @@ internal static class Mp4WriterSelfTest
     /// <summary>Splits an Annex B stream into per-access-unit NAL groups with their times.</summary>
     private static (byte[] Sps, byte[] Pps, List<(List<ReadOnlyMemory<byte>> Nals, double T)> Samples) SplitStream(byte[] data)
     {
-        var parser = new H264AnnexBParser();
+        var parser = new AnnexBParser();
         byte[] sps = [], pps = [];
         var samples = new List<(List<ReadOnlyMemory<byte>>, double)>();
         List<ReadOnlyMemory<byte>>? current = null;

@@ -1,8 +1,25 @@
-namespace Clippy;
+﻿namespace Clippy;
 
-/// <summary>Splits a raw H.264 Annex B byte stream into individual NAL units.</summary>
-internal sealed class H264AnnexBParser
+/// <summary>
+/// Splits a raw Annex B byte stream into individual NAL units.
+///
+/// The framing is identical for H.264 and HEVC -- the same 3- and 4-byte start codes, the same
+/// emulation-prevention rule, the same "the NAL ends where the next delimiter BEGINS" bookkeeping --
+/// so there is one implementation of all of that. Only the NAL HEADER differs: H.264's is one byte
+/// with the type in the low 5 bits, HEVC's is two bytes with the type in bits 1-6. That difference
+/// is confined to <see cref="hevc"/> and one line in <see cref="EmitNal"/>; everything else here is
+/// codec-agnostic by design, so a third codec would not need a second parser.
+/// </summary>
+internal sealed class AnnexBParser
 {
+    /// <summary>
+    /// True when the stream is HEVC and the two-byte NAL header applies. Left false for H.264,
+    /// which is every path except the NVENC bridge in HEVC mode.
+    /// </summary>
+    private readonly bool hevc;
+
+    public AnnexBParser(bool hevc = false) => this.hevc = hevc;
+
     private readonly record struct StartCode(int Index, int PayloadOffset);
 
     private byte[] pending = new byte[1 << 16];
@@ -111,8 +128,20 @@ internal sealed class H264AnnexBParser
         if (length <= 0)
             return;
 
-        // nal_unit_type is the low 5 bits of the first payload byte; 5 marks an IDR.
-        var isIdr = (pending[payloadStart] & 0x1F) == 5;
+        // Which NAL types are pictures, and which of those open a GOP, is the one codec-specific
+        // decision in this class:
+        //   H.264 -- 1-byte header, nal_unit_type = low 5 bits; type 5 is IDR.
+        //   HEVC  -- 2-byte header, nal_unit_type = bits 1-6; types 16..21 are IRAP (keyframe).
+        bool isIdr;
+        if (hevc)
+        {
+            isIdr = HevcNal.IsKeyframe(HevcNal.Type(pending.AsSpan(payloadStart, length)));
+        }
+        else
+        {
+            isIdr = (pending[payloadStart] & 0x1F) == 5;
+        }
+
         var copy = new byte[length];
         Buffer.BlockCopy(pending, payloadStart, copy, 0, length);
         emit(copy, length, isIdr, captureSeconds);

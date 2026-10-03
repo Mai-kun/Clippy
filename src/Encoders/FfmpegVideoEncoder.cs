@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Diagnostics;
 
 namespace Clippy;
@@ -8,7 +8,7 @@ namespace Clippy;
 /// No ring buffer: the caller serialises writes, and a slow encoder simply drops capture pace.
 ///
 /// Audio is NOT handled here: it runs in its own process (FfmpegAudioEncoder). Two live inputs in one
-/// ffmpeg deadlocked — measured 6 audio packets read out of ~450 while video flowed fine.
+/// ffmpeg deadlocked вЂ” measured 6 audio packets read out of ~450 while video flowed fine.
 /// </summary>
 internal sealed class FfmpegVideoEncoder : IVideoEncoder
 {
@@ -297,7 +297,7 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
     {
         ring = target;
         var stdout = process.StandardOutput.BaseStream;
-        var parser = new H264AnnexBParser();
+        var parser = new AnnexBParser();
         var buffer = new byte[64 * 1024];
         var clock = stopwatch;
 

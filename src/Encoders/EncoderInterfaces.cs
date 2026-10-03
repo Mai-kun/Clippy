@@ -23,6 +23,13 @@ internal interface IVideoEncoder : IDisposable
     byte[]? Pps { get; }
 
     /// <summary>
+    /// HEVC only: the VPS NAL, the parameter set that has no H.264 counterpart. Null for every
+    /// H.264 encoder, and that null is exactly what selects avc1 over hvc1 in the muxer, so this is
+    /// the single place the codec choice becomes visible downstream.
+    /// </summary>
+    byte[]? Vps => null;
+
+    /// <summary>
     /// Frames handed in versus access units that came out. A gap larger than the pipeline's
     /// in-flight tolerance means the encoder lost or reordered frames and every timestamp in a clip
     /// cut from that stretch is untrustworthy.

@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
 using Vortice.Direct3D;
@@ -18,7 +18,7 @@ namespace Clippy;
 /// system memory is avoidable.
 ///
 /// Pipeline: WGC BGRA texture -> video processor converts to NV12 inside VRAM -> hardware MFT encodes
-/// -> Annex B bytes -> H264AnnexBParser -> the ring. The CPU touches the encoded bytes and nothing else.
+/// -> Annex B bytes -> AnnexBParser -> the ring. The CPU touches the encoded bytes and nothing else.
 ///
 /// Every non-obvious detail here was established by the --test-mft-video spike rather than assumed, and
 /// the three most expensive to learn all fail silently when wrong: the output sample is allocated by
@@ -55,7 +55,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     private readonly List<IMFSample> inFlight = [];   // the MFT holds each one until it is encoded
     private readonly ConcurrentQueue<IMFSample> inputQueue = new();
 
-    private readonly H264AnnexBParser parser = new();
+    private readonly AnnexBParser parser = new();
     private readonly object parserGate = new();
     private readonly ManualResetEventSlim ready = new(false);
     private readonly ManualResetEventSlim drained = new(false);

@@ -87,6 +87,8 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_QUOTA_50 = 1614;
     private const uint IDC_ENCODER_NVENC = 1401;
     private const uint IDC_ENCODER_X264 = 1402;
+    private const uint IDC_CODEC_HEVC = 1404;
+    private const uint IDC_CODEC_H264 = 1405;
     private const uint IDC_KEYS_F8 = 1500;
     private const uint IDC_KEYS_F9 = 1501;
     private const uint IDC_KEYS_F11 = 1502;
@@ -611,6 +613,15 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_ENCODER_X264:
                     ApplySetting("Encoder", "libx264", c => c.VideoEncoder = "libx264", live: false);
                     break;
+                case IDC_CODEC_HEVC:
+                    // The codec reaches NVENC through the native bridge, which is opened once per
+                    // session, so this takes effect on the next start for the same reason the encoder
+                    // choice does.
+                    ApplySetting("Codec", "HEVC (H.265)", c => c.VideoCodec = "hevc", live: false);
+                    break;
+                case IDC_CODEC_H264:
+                    ApplySetting("Codec", "H.264", c => c.VideoCodec = "h264", live: false);
+                    break;
                 case IDC_KEYS_F8:
                     ApplySetting("Hotkeys", "F8 / F9", c =>
                     {
@@ -720,6 +731,14 @@ public sealed partial class TrayIcon : IDisposable
             (IDC_ENCODER_NVENC, "NVIDIA NVENC via ffmpeg (h264_nvenc)", config.VideoEncoder == "h264_nvenc"),
             (IDC_ENCODER_X264, "CPU x264 (libx264)", config.VideoEncoder == "libx264"));
 
+        // The codec is a separate question from the encoder: NVENC speaks both, and only the direct
+        // bridge can be told which one to open. HEVC carries about twice the detail per bit, so the
+        // same picture survives roughly half the bitrate -- which is what halves the RAM head and the
+        // clip size. The encoder submenu above says nothing about this, so the two stay separate.
+        var codec = Submenu(menu, "Video Codec",
+            (IDC_CODEC_HEVC, "HEVC / H.265  (sharper at the same bitrate)", config.UseHevc),
+            (IDC_CODEC_H264, "H.264  (wider compatibility)", !config.UseHevc));
+
         var keys = Submenu(menu, "Hotkeys",
             (IDC_KEYS_F8, "F8 / F9  (default)", config.ShortClipHotkey == "F8"),
             (IDC_KEYS_F9, "F9 / F10", config.ShortClipHotkey == "F9"),
@@ -734,7 +753,7 @@ public sealed partial class TrayIcon : IDisposable
 
         // Keep the handles alive until after the parent menu is shown; the OS reads them during
         // TrackPopupMenuEx, not during AppendMenu.
-        _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = keys; _ = quota;
+        _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = codec; _ = keys; _ = quota;
     }
 
     private nint Submenu(nint parent, string title, params (uint Id, string Text, bool Checked)[] items)

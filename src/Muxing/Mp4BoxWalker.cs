@@ -20,8 +20,9 @@ internal static class Mp4BoxWalker
         ["minf"] = ["vmhd", "smhd", "dinf", "stbl"],
         ["dinf"] = ["dref"],
         ["stbl"] = ["stsd", "stts", "stsc", "stsz", "stco"],
-        // Full boxes carrying a 4-byte entry count before their children.
-        ["stsd"] = ["avc1", "mp4a"],
+        // Full boxes carrying a 4-byte entry count before their children. The video sample entry is
+        // avc1 for H.264 and hvc1 for HEVC; they carry identical fields, so only the name differs.
+        ["stsd"] = ["avc1", "hvc1", "mp4a"],
         ["dref"] = ["url "],
     };
 
@@ -35,6 +36,8 @@ internal static class Mp4BoxWalker
     private static readonly Dictionary<string, int> SampleEntryChildOffset = new()
     {
         ["avc1"] = 8 + 78,
+        // hvc1 is the same VisualSampleEntry field-for-field, so the same 78-byte prefix applies.
+        ["hvc1"] = 8 + 78,
         // 8 header + 28 field bytes, so the child box starts at 36. Verified against a real
         // ffmpeg-produced m4a (mp4a box size 90 = 8 + 28 + esds 54).
         ["mp4a"] = 8 + 28,

@@ -46,6 +46,26 @@ public sealed class ClippyConfig
     public string VideoEncoder { get; set; } = "nvenc_direct";
 
     /// <summary>
+    /// Which video codec the encoder produces: "hevc" (H.265, the default) or "h264".
+    ///
+    /// Only the direct NVENC bridge honours it -- it is the path that talks to the encoder without
+    /// an ffmpeg process in between, so it is also the one that can ask for NV_ENC_CODEC_HEVC_GUID.
+    /// The ffmpeg-backed encoders keep producing H.264 whatever this says, and the muxer follows the
+    /// bytes rather than this setting: a file is written as hvc1 only when the encoder actually
+    /// handed over a VPS. So a fallback to ffmpeg yields a correct H.264 clip, never a broken HEVC one.
+    ///
+    /// HEVC buys roughly twice the detail per bit, so the same picture survives a bitrate about
+    /// half the size: at 3 Mbit/s it matches what H.264 needed 6 Mbit/s for.
+    /// </summary>
+    public string VideoCodec { get; set; } = "hevc";
+
+    /// <summary>The only codec values this class accepts; anything else falls back to the default.</summary>
+    public static readonly string[] SupportedVideoCodecs = ["hevc", "h264"];
+
+    /// <summary>True when the config asks for HEVC, which is the only codec the NVENC bridge can switch.</summary>
+    public bool UseHevc => string.Equals(VideoCodec, "hevc", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Video bitrate in Mbps, used by the hardware (NVENC) rate control. The ring buffer holds
     /// ENCODED NAL units, so this value is close to a direct multiplier on its memory use:
     /// The figures quoted in the tray menu are the ones to go by. Clamped to 2-50, because below 2
@@ -171,6 +191,10 @@ public sealed class ClippyConfig
                 config.LogsFolder = "logs";
             if (config.VideoBitrateMbps < MinVideoBitrateMbps || config.VideoBitrateMbps > MaxVideoBitrateMbps)
                 config.VideoBitrateMbps = 6;
+            // A codec this build cannot produce falls back to the default rather than reaching the
+            // encoder: a typo in a config file must not stop the recorder, same as everywhere else.
+            if (!SupportedVideoCodecs.Contains(config.VideoCodec, StringComparer.OrdinalIgnoreCase))
+                config.VideoCodec = "hevc";
 
             // At startup as well as after every save. Startup is the half that matters: it is the only
             // moment the user is not actively recording, so it is the safe time to reclaim a few hundred
