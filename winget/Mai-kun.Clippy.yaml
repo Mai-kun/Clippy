@@ -5,7 +5,7 @@
 # manifest whose hash does not match the asset, and a wrong hash is worse than no manifest.
 #
 # To produce it:
-#   1. publish the v1.2.0 release so Clippy-Setup.exe exists on the release page
+#   1. publish the v1.3.0 release so Clippy-Setup.exe exists on the release page
 #   2. download it
 #   3. Get-FileHash .\Clippy-Setup.exe -Algorithm SHA256
 #   4. paste the value into InstallerSha256 and bump PackageVersion for the next release
@@ -14,7 +14,7 @@
 #   winget create --manifest-packageidentifier Mai-kun.Clippy ^
 #                  --manifest-path .\winget\Mai-kun.Clippy.yaml
 PackageIdentifier: Mai-kun.Clippy
-PackageVersion: 1.2.0
+PackageVersion: 1.3.0
 PackageName: Clippy
 Publisher: Mai-kun
 PublisherUrl: https://github.com/Mai-kun/Clippy
@@ -57,11 +57,11 @@ Installers:
     UpgradeBehavior: install
     # PLACEHOLDER -- replace with: Get-FileHash .\Clippy-Setup.exe -Algorithm SHA256
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
-    ReleaseUrl: https://github.com/Mai-kun/Clippy/releases/download/v1.2.0/Clippy-Setup.exe
-    DisplayName: Clippy 1.2.0
+    ReleaseUrl: https://github.com/Mai-kun/Clippy/releases/download/v1.3.0/Clippy-Setup.exe
+    DisplayName: Clippy 1.3.0
     AppsAndFeaturesEntries:
       - DisplayName: Clippy
-        DisplayVersion: 1.2.0
+        DisplayVersion: 1.3.0
         Publisher: Clippy Authors
         ProductCode: Clippy
         UpgradeCode: {7C4B1D2E-9F3A-4A5B-8C6D-1E2F3A4B5C6D}
