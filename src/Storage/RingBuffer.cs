@@ -20,6 +20,17 @@ internal sealed class RingBuffer
     /// <summary>Set by the self-test to prove the trim assertions can actually fail.</summary>
     internal bool TrimDisabledForTest;
 
+    /// <summary>
+    /// Where trimmed packets go instead of back to the ArrayPool. The hybrid buffer wires this to
+    /// <see cref="DiskSpooler.Evict"/> so the tail survives past the RAM head.
+    ///
+    /// Invoked while this ring's own lock is held, which is the point: a packet must be handed to
+    /// the sink in the same critical section that removes it from the list, otherwise an export
+    /// slicing between the removal and the hand-off would find the packet in neither tier.
+    /// While set, ownership of the evicted packet transfers to the sink (it must release it).
+    /// </summary>
+    public Action<StoredPacket>? OnEvicted;
+
     public RingBuffer(double maxSeconds, bool isVideo)
     {
         this.maxSeconds = maxSeconds;
@@ -70,21 +81,32 @@ internal sealed class RingBuffer
             var span = packets[^1].CaptureClockSeconds - packets[head].CaptureClockSeconds;
             if (span <= maxSeconds)
                 break;
-            packets[head].Release();
-            head++;
+            EvictHead();
         }
 
         // A slice must start on a keyframe, otherwise it decodes from garbage until the next I-frame.
         if (isVideo)
         {
             while (Count > 1 && !packets[head].IsKeyframe)
-            {
-                packets[head].Release();
-                head++;
-            }
+                EvictHead();
         }
 
         Compact();
+    }
+
+    /// <summary>
+    /// Removes the oldest packet. With <see cref="OnEvicted"/> wired it is handed over (still under
+    /// the ring's lock); otherwise it goes back to the pool, which is the pure-RAM behaviour the
+    /// self-tests exercise.
+    /// </summary>
+    private void EvictHead()
+    {
+        var packet = packets[head];
+        head++;
+        if (OnEvicted is { } sink)
+            sink(packet);
+        else
+            packet.Release();
     }
 
     /// <summary>

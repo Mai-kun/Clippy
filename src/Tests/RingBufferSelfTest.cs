@@ -23,6 +23,8 @@ internal static class RingBufferSelfTest
         failures += Check("slice: honours the requested range", SliceRespectsRange);
         failures += Check("buffer: padding past Length never leaks", PaddingDoesNotLeak);
     failures += Check("buffer: concurrent Push while slicing", ConcurrentPushAndSlice);
+    failures += Check("spool: evicted packets survive on disk and rejoin the head", SpoolRoundTripsEvictedPackets);
+    failures += Check("spool: segments older than the history limit are deleted", SpoolPrunesOldSegments);
 
         Console.WriteLine(failures == 0 ? "RING SELFTEST: OK" : $"RING SELFTEST: FAILED ({failures})");
         return failures;
@@ -314,5 +316,110 @@ internal static class RingBufferSelfTest
         }
 
         return null;
+    }
+
+    private static string TestSpoolDirectory() =>
+        Path.Combine(Path.GetTempPath(), "Clippy", "spool-test-" + Guid.NewGuid().ToString("N"));
+
+    private static void TryDelete(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+                Directory.Delete(directory, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A leftover test folder is not worth failing a green test run over.
+        }
+    }
+
+    /// <summary>
+    /// Tier 1 (RAM head) + Tier 2 (disk spool) round trip: 10 s of packets pushed through a 3 s RAM
+    /// head must all come back from the hybrid slice exactly once, in order, payload intact. The
+    /// evicted packets are precisely the ones the old Trim threw away, so a lost or duplicated
+    /// packet here means a gap or a repeated access unit in an exported clip.
+    /// </summary>
+    private static string? SpoolRoundTripsEvictedPackets()
+    {
+        var dir = TestSpoolDirectory();
+        try
+        {
+            using var spool = new DiskSpooler("roundtrip", maxHistorySeconds: 190, directory: dir);
+            var ring = new RingBuffer(maxSeconds: 3, isVideo: true) { OnEvicted = spool.Evict };
+            const int total = (int)(10 * Fps);
+
+            for (var i = 0; i < total; i++)
+            {
+                var data = Rented(32);
+                data[0] = (byte)(i % 251);
+                ring.Push(data, 32, i / Fps, i % 30 == 0);
+            }
+
+            var merged = DiskSpooler.SliceHybrid(ring, spool, 0, 1000);
+            ring.Clear();
+
+            if (merged.Count != total)
+                return $"merged {merged.Count} packets, expected {total} (gap or duplicate at the RAM/disk boundary)";
+
+            for (var i = 0; i < merged.Count; i++)
+            {
+                var expected = i / Fps;
+                if (Math.Abs(merged[i].CaptureClockSeconds - expected) > 1e-9)
+                    return $"packet {i} sits at {merged[i].CaptureClockSeconds:F4}s, expected {expected:F4}s";
+                if (merged[i].Span[0] != (byte)(i % 251))
+                    return $"payload corrupted at packet {i}: {merged[i].Span[0]} instead of {i % 251}";
+            }
+
+            return null;
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
+    }
+
+    /// <summary>
+    /// With 1 s segments and a 3 s history, 20 s of pushes must leave only the last few seconds on
+    /// disk: too wide a window means the spool grows without bound, too narrow a window means an
+    /// F9 export would silently lose its oldest seconds.
+    /// </summary>
+    private static string? SpoolPrunesOldSegments()
+    {
+        var dir = TestSpoolDirectory();
+        try
+        {
+            using var spool = new DiskSpooler("prune", maxHistorySeconds: 3, directory: dir, segmentSeconds: 1);
+            var ring = new RingBuffer(maxSeconds: 1, isVideo: false) { OnEvicted = spool.Evict };
+            const int total = (int)(20 * Fps);
+
+            for (var i = 0; i < total; i++)
+                ring.Push(Rented(16), 16, i / Fps, isKeyframe: true);
+
+            spool.Flush();
+            var tail = spool.ReadRange(0, 1000);
+            ring.Clear();
+
+            if (tail.Count == 0)
+                return "spool is empty after 20 s of pushes";
+
+            var newest = tail[^1].CaptureClockSeconds;
+            var oldestKept = tail[0].CaptureClockSeconds;
+
+            // 3 s of history plus at most one segment of granularity: reaching back 6 s or more
+            // means the old segments were never deleted.
+            if (oldestKept <= newest - 6)
+                return $"old segments not deleted: the disk tail still reaches back to {oldestKept:F1}s (newest {newest:F1}s)";
+
+            // The tail must still hold the last few seconds, not almost nothing.
+            if (oldestKept >= newest - 2)
+                return $"only {newest - oldestKept:F1}s left on disk; the tail was pruned too aggressively";
+
+            return null;
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
     }
 }

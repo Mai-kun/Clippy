@@ -121,8 +121,11 @@ internal sealed partial class ScreenCapture : IDisposable
             Console.WriteLine($"Export: free-space check skipped ({ex.GetType().Name}: {ex.Message}).");
         }
 
-        var videoPackets = videoRing.Slice(from, to);
-        var audioPackets = audioRing.Slice(from, to);
+        // Both tiers: the RAM head first, then (for a clip longer than RamHeadSeconds) the disk
+        // tail spliced on. See DiskSpooler.SliceHybrid for why this order cannot lose or duplicate
+        // a packet that was evicted mid-export.
+        var videoPackets = DiskSpooler.SliceHybrid(videoRing, videoSpool, from, to);
+        var audioPackets = DiskSpooler.SliceHybrid(audioRing, audioSpool, from, to);
 
         // Raw ring data first, so a bad slice is visible here and not as an ffprobe error later.
         var (captured, accessUnits) = encoder.TimingCounts;
@@ -366,12 +369,24 @@ internal sealed partial class ScreenCapture : IDisposable
 
     // Phase 4: the encoders feed these in-memory rings instead of writing files, and a clip is
     // produced by slicing them. The only thing the two share is the capture clock on each packet.
+    // Since the hybrid-storage stage the rings are only the RAM HEAD: they hold the freshest
+    // RamHeadSeconds, and everything they trim is handed to the DiskSpooler instead of being lost,
+    // so the exportable history still spans RingSeconds in total (RAM + disk).
     private RingBuffer? videoRing;
     private RingBuffer? audioRing;
+
+    /// <summary>Tier 2 for each stream; created together with its ring and disposed with the run.</summary>
+    private DiskSpooler? videoSpool;
+    private DiskSpooler? audioSpool;
     private int videoWidth;
     private int videoHeight;
 
-    // Ring capacity: longer than any clip we export, so an export never hits the trim.
+    // How much stays in RAM. 45 s at a typical bitrate is ~25-35 MB, which is the whole point of
+    // the hybrid split -- the old ring held RingSeconds in RAM and cost 250+ MB resident.
+    private const double RamHeadSeconds = 45;
+
+    // Total replay depth (RAM head + disk tail), longer than any clip we export, so an export never
+    // hits the end of history.
     private const double RingSeconds = 190;
 
     // Phase 7 safety limits. A capture that has not produced a frame for this long is broken, and
@@ -584,7 +599,8 @@ internal sealed partial class ScreenCapture : IDisposable
 
         if (videoPath is not null)
         {
-            Console.WriteLine($"Recording [{videoEncoder}] into an in-memory ring, max {RingSeconds:F0}s.");
+            Console.WriteLine($"Recording [{videoEncoder}] into a hybrid ring: {RamHeadSeconds:F0}s RAM head + " +
+                              $"disk spool up to {RingSeconds:F0}s total.");
             Console.WriteLine("Nothing is written until an export happens (F8 saves 30 s, F9 saves 3 min).");
         }
 
@@ -598,8 +614,17 @@ internal sealed partial class ScreenCapture : IDisposable
         // a guess and nothing has to wait for a frame.
         if (videoPath is not null && encoder is null)
         {
-            videoRing = new RingBuffer(RingSeconds, isVideo: true);
-            audioRing = new RingBuffer(RingSeconds, isVideo: false);
+            // Tier 2 first: the ring needs its eviction sink at construction time, because the very
+            // first trim can happen on the first Push after the head fills.
+            //
+            // The spool's limit is a DISK SPAN, not the total history: its cutoff runs on evicted
+            // packet time, which already sits RamHeadSeconds behind the wall clock (the RAM head
+            // holds everything newer). 145 s of disk + 45 s of RAM = the same 190 s total replay
+            // depth the old all-RAM ring had, give or take one 45 s segment of granularity.
+            videoSpool = new DiskSpooler("video", RingSeconds - RamHeadSeconds);
+            audioSpool = new DiskSpooler("audio", RingSeconds - RamHeadSeconds);
+            videoRing = new RingBuffer(RamHeadSeconds, isVideo: true) { OnEvicted = videoSpool.Evict };
+            audioRing = new RingBuffer(RamHeadSeconds, isVideo: false) { OnEvicted = audioSpool.Evict };
 
             // "nvenc_direct" and "media_foundation" both mean "no ffmpeg process", but only the first
             // can wait for the capture rate: NVENC is told a frame rate and divides the bitrate by it,
@@ -624,7 +649,7 @@ internal sealed partial class ScreenCapture : IDisposable
             }
 
             Console.WriteLine($"Encoding {videoWidth}x{videoHeight} into ring, " +
-                (withAudio ? "with audio" : "no audio") + $" (max {RingSeconds:F0}s), " +
+                (withAudio ? "with audio" : "no audio") + $" (RAM {RamHeadSeconds:F0}s, disk to {RingSeconds:F0}s), " +
                 (prefersDirectNvenc ? "after the capture rate is measured" : "before StartCapture"));
         }
 
@@ -709,6 +734,14 @@ internal sealed partial class ScreenCapture : IDisposable
                 encoder?.Dispose();
                 encoder = null;
             }
+
+            // The final export (in the try above) has already read both tiers; now the disk tail
+            // can close its files. Spoolers go last on purpose: an export still in flight on the
+            // hotkey thread must find them usable for as long as the encoders could still push.
+            videoSpool?.Dispose();
+            videoSpool = null;
+            audioSpool?.Dispose();
+            audioSpool = null;
 
             if (withAudio && videoOnlyPath is not null && audioOnlyPath is not null)
                 MuxVideoAndAudio(videoOnlyPath, audioOnlyPath, videoPath!);
@@ -1070,6 +1103,11 @@ internal sealed partial class ScreenCapture : IDisposable
             // drain thread reads from that ring, so clearing it under a live reader would race.
             encoder.Dispose();
             encoder = null;
+
+            // The disk tail holds the same old-resolution packets the ring does, and it survives
+            // ring.Clear() -- so it has to be dropped explicitly, for the same reason: a clip muxed
+            // with the new SPS/PPS cannot contain frames encoded at the old size.
+            videoSpool?.Reset(ring.NewestSeconds);
             ring.Clear();
         }
 

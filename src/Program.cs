@@ -18,6 +18,13 @@ TaskScheduler.UnobservedTaskException += (_, e) =>
     e.SetObserved();
 };
 
+// Hybrid-buffer housekeeping. The disk spool under %TEMP%\Clippy\spool is a cache, never user data:
+// startup clears whatever a previous crash left behind, and a normal exit clears this run's segments.
+// Cleanup never throws, so neither path can take the process down. (Known ceiling: two instances
+// share the folder, so a second startup wipes the first instance's tail -- one recorder at a time.)
+AppDomain.CurrentDomain.ProcessExit += (_, _) => DiskSpooler.Cleanup();
+DiskSpooler.Cleanup();
+
 // No arguments is the normal case and must not be a usage screen: the user double-clicked the exe
 // because they want it recording, not because they want to read a help text. Everything the run
 // needs comes from config.json, so the default path is the same one --record builds by hand.
