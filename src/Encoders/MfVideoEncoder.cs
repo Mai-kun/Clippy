@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
 using Vortice.Direct3D;
@@ -198,9 +198,11 @@ internal sealed class MfVideoEncoder : IVideoEncoder
     // Pipeline telemetry. Every stage of the frame's journey is counted separately, because "no clip
     // came out" is not a diagnosis: knowing that the queue filled and nothing was ever fed, or that
     // frames were fed and no output arrived, points at completely different places.
+#pragma warning disable CS0649
     private long needInputCount;
     private long haveOutputCount;
     private long fedCount;
+#pragma warning restore CS0649
     private long refusedCount;
     private long drainedCount;
     private long lastStatsTick;

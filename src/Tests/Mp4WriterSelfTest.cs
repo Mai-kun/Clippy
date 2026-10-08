@@ -698,14 +698,6 @@ internal static class Mp4WriterSelfTest
         var parser = new AnnexBParser();
         byte[] sps = [], pps = [];
         var samples = new List<(List<ReadOnlyMemory<byte>>, double)>();
-        List<ReadOnlyMemory<byte>>? current = null;
-
-        void Finish(double t)
-        {
-            if (current is { Count: > 0 })
-                samples.Add((current, t));
-            current = null;
-        }
 
         // Times are derived from the sample index at a deliberately uneven rate, so a writer that
         // quietly assumes a constant fps cannot pass.

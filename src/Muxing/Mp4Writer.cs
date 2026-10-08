@@ -1,4 +1,4 @@
-﻿using System.Buffers.Binary;
+using System.Buffers.Binary;
 
 namespace Clippy;
 
@@ -95,9 +95,9 @@ internal sealed class Mp4Writer
     public void AddVideoSample(IEnumerable<ReadOnlyMemory<byte>> nalUnits, double captureSeconds)
     {
         var payload = new List<byte>();
+        Span<byte> length = stackalloc byte[4];
         foreach (var nal in nalUnits)
         {
-            Span<byte> length = stackalloc byte[4];
             BinaryPrimitives.WriteInt32BigEndian(length, nal.Length);
             payload.AddRange(length.ToArray());
             payload.AddRange(nal.ToArray());

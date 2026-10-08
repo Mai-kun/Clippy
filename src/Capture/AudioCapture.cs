@@ -40,7 +40,6 @@ internal sealed class AudioCapture : IDisposable
         set => sink = value;
     }
 
-    private readonly StreamWriter? timingLog;
     private readonly CaptureDataAvailableHandler handler;
 
     // Written on the WASAPI callback thread, read on the recording thread in Dispose, so these need
@@ -78,7 +77,6 @@ internal sealed class AudioCapture : IDisposable
     {
         this.stopwatch = stopwatch;
         this.videoStartSeconds = videoStartSeconds;
-        this.timingLog = null;
 
         handler = (buffer, flags, devicePosition, qpcPosition) => OnDataAvailable(buffer, qpcPosition);
         capture = CreateRecorder(handler);

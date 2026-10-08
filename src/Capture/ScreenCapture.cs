@@ -618,7 +618,7 @@ internal sealed partial class ScreenCapture : IDisposable
 
             // Fire and forget, deliberately. This is a network call on the way to recording, and a
             // user whose network hangs must still get their recorder running now, not in ten seconds.
-            if (config.CheckForUpdates)
+            if (config?.CheckForUpdates == true)
                 _ = Task.Run(() => trayIcon.RunUpdateCheck(userInitiated: false));
         }
 
@@ -999,6 +999,7 @@ internal sealed partial class ScreenCapture : IDisposable
                         {
                             audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
                             audio = new AudioCapture(stopwatch, videoStartSeconds);
+                            ArgumentNullException.ThrowIfNull(audioRing);
                             audioEncoder = StartAudioEncoder(config, audio, audioOnlyPath, stopwatch, audioRing, masterZeroSeconds, logsDirectory);
                             audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
                             audioEncoder.WaitForReady(TimeSpan.FromSeconds(15));
@@ -1032,6 +1033,9 @@ internal sealed partial class ScreenCapture : IDisposable
                 // the GPU copy took, and that lands directly on the A/V offset. SystemRelativeTime is
                 // 100 ns units from boot, the same 10 MHz scale as the audio's qpcPosition, so the
                 // stopwatch origin is subtracted once and both tracks share one hardware clock.
+                if (encoder is null)
+                    return;
+
                 var frameQpcSeconds = frame.SystemRelativeTime.Ticks / (double)System.Diagnostics.Stopwatch.Frequency;
                 encoder.EnqueueCaptureTime(frameQpcSeconds - masterZeroSeconds);
 
@@ -1146,7 +1150,7 @@ internal sealed partial class ScreenCapture : IDisposable
         {
             // The old encoder is stopped and its process reaped BEFORE the ring is cleared: the
             // drain thread reads from that ring, so clearing it under a live reader would race.
-            encoder.Dispose();
+            encoder?.Dispose();
             encoder = null;
 
             // The disk tail holds the same old-resolution packets the ring does, and it survives
@@ -1300,7 +1304,9 @@ internal sealed partial class ScreenCapture : IDisposable
                           $"opening NVENC for {config.VideoBitrateMbps} Mbit/s at that rate.");
 
         // The same call Capture makes, minus the Media Foundation ordering that forced it there.
-        var target = withAudio ? Path.ChangeExtension(videoPath, ".video.h264") : videoPath;
+        var target = (withAudio ? Path.ChangeExtension(videoPath, ".video.h264") : videoPath) ?? videoPath;
+        if (target is null)
+            return false;
         encoder = StartVideoEncoder(target, videoWidth, videoHeight, videoEncoder ?? config.VideoEncoder,
                                     stopwatch, fpsMode, logsDirectory);
         if (encoder is not null)
