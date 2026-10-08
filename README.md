@@ -252,7 +252,7 @@ dotnet publish src/Clippy.csproj -c Release -r win-x64 -p:PublishAot=true -o pub
 
 ## Релизы
 
-Текущая версия — **1.3.1**.
+Текущая версия — **1.3.2**.
 
 Манифест для Winget лежит в [`winget/Mai-kun.Clippy.yaml`](winget/Mai-kun.Clippy.yaml). Это шаблон:
 перед отправкой в `microsoft/winget-pkgs` нужно подставить настоящий SHA256 сборки
