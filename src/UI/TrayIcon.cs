@@ -46,13 +46,9 @@ public sealed partial class TrayIcon : IDisposable
     private const uint TPM_RIGHTBUTTON = 0x0002;
     private const uint TPM_RETURNCMD = 0x0100;
 
-    private const int SW_HIDE = 0;
-    private const int SW_SHOW = 5;
-    private const int SW_RESTORE = 9;
-
     private const uint IDC_OPEN_FOLDER = 1001;
     private const uint IDC_OPEN_CONFIG = 1002;
-    private const uint IDC_TOGGLE_CONSOLE = 1003;
+    private const uint IDC_OPEN_LOGS = 1003;
     private const uint IDC_CHECK_UPDATES = 1005;
     private const uint IDC_EXIT = 1004;
     private const uint IDC_RESTART = 1006;
@@ -325,19 +321,6 @@ public sealed partial class TrayIcon : IDisposable
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool SetForegroundWindow(nint hWnd);
 
-    // GetConsoleWindow is exported by kernel32, not user32. Getting that wrong throws
-    // EntryPointNotFoundException at the first call, which is what hid the console toggle.
-    [LibraryImport("kernel32.dll", EntryPoint = "GetConsoleWindow")]
-    private static partial nint GetConsoleWindow();
-
-    [LibraryImport("user32.dll", EntryPoint = "ShowWindow")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool ShowWindow(nint hWnd, int command);
-
-    [LibraryImport("user32.dll", EntryPoint = "IsWindowVisible")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool IsWindowVisible(nint hWnd);
-
     [LibraryImport("user32.dll", EntryPoint = "GetCursorPos")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetCursorPos(out Point point);
@@ -359,13 +342,12 @@ public sealed partial class TrayIcon : IDisposable
     private nint window;
     private volatile bool disposed;
 
-    /// <summary>True only once Shell_NotifyIcon(NIM_ADD) succeeded, so the console is hidden only
-    /// when there is an icon to bring it back from.</summary>
+    /// <summary>True only once Shell_NotifyIcon(NIM_ADD) succeeded, so notifications are only
+    /// sent when there is an icon to deliver them through.</summary>
     public bool iconAdded;
 
     // Start() returns as soon as the thread begins, but the icon only exists once NIM_ADD has
-    // returned. Without this gate HideConsole() would read iconAdded before the tray thread set it,
-    // and the console would stay visible even though there was an icon to restore it from.
+    // returned. Without this gate callers would read iconAdded before the tray thread set it.
     private readonly ManualResetEventSlim iconSettled = new(false);
 
     public TrayIcon(ClippyConfig config, string outputFolder, Action onExit)
@@ -519,7 +501,7 @@ public sealed partial class TrayIcon : IDisposable
         }
 
         iconAdded = true;
-        Console.WriteLine("Tray: icon added. Right-click for the menu, double-click to toggle the log.");
+        Console.WriteLine("Tray: icon added. Right-click for the menu, double-click to open the logs folder.");
 
         // Only now is the outcome known, so release the caller.
         iconSettled.Set();
@@ -539,7 +521,7 @@ public sealed partial class TrayIcon : IDisposable
             if (mouseMessage is WM_RBUTTONUP or WM_CONTEXTMENU)
                 ShowContextMenu();
             else if (mouseMessage == WM_LBUTTONDBLCLK)
-                ToggleConsole();
+                OpenLogsFolder();
 
             return 0;
         }
@@ -568,7 +550,7 @@ public sealed partial class TrayIcon : IDisposable
             AppendMenu(menu, MF_SEPARATOR, 0, "");
             AppendSettingsMenus(menu);
             AppendMenu(menu, MF_SEPARATOR, 0, "");
-            AppendMenu(menu, MF_STRING, IDC_TOGGLE_CONSOLE, "Show / Hide Log");
+            AppendMenu(menu, MF_STRING, IDC_OPEN_LOGS, "📄 Open Logs Folder");
             AppendMenu(menu, MF_STRING, IDC_CHECK_UPDATES, "Check for Updates");
             AppendMenu(menu, MF_STRING, IDC_RESTART, "Restart");
             AppendMenu(menu, MF_STRING, IDC_EXIT, "Exit");
@@ -616,8 +598,8 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_OPEN_CONFIG:
                     OpenConfig();
                     break;
-                case IDC_TOGGLE_CONSOLE:
-                    ToggleConsole();
+                case IDC_OPEN_LOGS:
+                    OpenLogsFolder();
                     break;
                 case IDC_CHECK_UPDATES:
                     CheckForUpdates();
@@ -1025,15 +1007,26 @@ public sealed partial class TrayIcon : IDisposable
         rebindHotkeys(config);
     }
 
+    public static void OpenFolder(string folderPath)
+    {
+        string fullPath = Path.GetFullPath(folderPath);
+        if (!Directory.Exists(fullPath))
+        {
+            Directory.CreateDirectory(fullPath);
+        }
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = fullPath,
+            UseShellExecute = true
+        });
+    }
+
     private void OpenOutputFolder()
     {
         try
         {
-            Directory.CreateDirectory(outputFolder);
-            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{Path.GetFullPath(outputFolder)}\"")
-            {
-                UseShellExecute = true,
-            });
+            OpenFolder(outputFolder);
         }
         catch (Exception ex) when (ex is Win32Exception or IOException)
         {
@@ -1109,47 +1102,23 @@ public sealed partial class TrayIcon : IDisposable
         onExit();
     }
 
-    /// <summary>Shows or hides the console window, if this process has one.</summary>
-    public void ToggleConsole()
-    {
-        var console = GetConsoleWindow();
-        if (console == 0)
-        {
-            // A GUI-subsystem build has no console at all; say so rather than pretend it worked.
-            Console.WriteLine("Tray: this build has no console window to show or hide.");
-            return;
-        }
-
-        if (IsWindowVisible(console))
-        {
-            ShowWindow(console, SW_HIDE);
-            Console.WriteLine("Tray: log hidden.");
-        }
-        else
-        {
-            ShowWindow(console, SW_RESTORE);
-            ShowWindow(console, SW_SHOW);
-            SetForegroundWindow(console);
-            Console.WriteLine("Tray: log shown.");
-        }
-    }
-
     /// <summary>
-    /// Hides the console at startup, for --tray / StartMinimizedToTray. Does nothing unless the icon
-    /// actually appeared: hiding the only window when there is no tray icon to restore it from would
-    /// leave the process running invisibly with no way back.
+    /// Opens the log folder using the system's default file manager.
+    ///
+    /// This replaces the old "Show / Hide Log" console toggle: the build is WinExe now, so there is
+    /// no console window to show -- the log files on disk ARE the diagnostics, and the menu hands
+    /// the user the folder itself.
     /// </summary>
-    public void HideConsole()
+    private void OpenLogsFolder()
     {
-        if (!iconAdded)
+        try
         {
-            Console.WriteLine("Tray: no icon was added, so the log stays visible.");
-            return;
+            OpenFolder(LogPaths.ResolveDirectory(config));
         }
-
-        var console = GetConsoleWindow();
-        if (console != 0)
-            ShowWindow(console, SW_HIDE);
+        catch (Exception ex) when (ex is Win32Exception or IOException)
+        {
+            Console.WriteLine($"Tray: could not open the logs folder: {ex.Message}");
+        }
     }
 
     public unsafe void Dispose()

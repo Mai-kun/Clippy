@@ -540,7 +540,7 @@ internal sealed partial class ScreenCapture : IDisposable
 
         // Beside the clips, not inside them, and rotated before anything writes: a user who leaves
         // Clippy running for months should not have to know what a .timing.csv is.
-        logsDirectory = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, this.config.LogsFolder));
+        logsDirectory = LogPaths.ResolveDirectory(this.config);
         Directory.CreateDirectory(logsDirectory);
         LogPaths.Rotate(logsDirectory);
 
@@ -611,7 +611,6 @@ internal sealed partial class ScreenCapture : IDisposable
         // stopping from the menu would leave the ffmpeg pipes and the ring buffer unwritten.
         using var trayIcon = tray ? new TrayIcon(capture.Config, Path.GetDirectoryName(videoPath)!, capture.RequestStop) : null;
         trayIcon?.Start();
-        trayIcon?.HideConsole();
         if (trayIcon is not null)
         {
             capture.notify = trayIcon.ShowNotification;

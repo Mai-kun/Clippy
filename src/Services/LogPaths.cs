@@ -13,6 +13,15 @@ internal static class LogPaths
     public const int KeepFiles = 10;
 
     /// <summary>
+    /// The absolute log directory for a config: beside the exe, never the working directory.
+    ///
+    /// One definition, used by both the recorder and the tray's "Open Logs Folder": two separate
+    /// computations of "where are the logs" would eventually disagree and open an empty folder.
+    /// </summary>
+    public static string ResolveDirectory(ClippyConfig config) =>
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, config.LogsFolder));
+
+    /// <summary>
     /// Places a session's log file, named after the media it belongs to so a video and its log still
     /// look like a pair. logDirectory null means "beside the media", which is what the one-shot
     /// diagnostic modes use.

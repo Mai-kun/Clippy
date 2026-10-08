@@ -1,11 +1,34 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Clippy;
 
-// Installed before anything else can fail. In tray mode the console is hidden, so a crash leaves the
-// user with a vanished tray icon and no explanation at all -- and no way to report it. This writes
-// the reason to a file next to the exe where it can actually be found, and puts the same line on
-// screen for the case where the console happens to be visible.
+// The build is WinExe: on a normal start Windows creates no console window at all, which is the
+// whole point -- under Windows 11 the default terminal is Windows Terminal, so the old
+// ShowWindow(GetConsoleWindow(), SW_HIDE) trick only left its icon parked on the taskbar. Every
+// Console.WriteLine below therefore goes nowhere unless a developer asks for a console with
+// --console / --debug, and that request has to be honoured before the first such write.
+if (args.Contains("--console", StringComparer.OrdinalIgnoreCase) ||
+    args.Contains("--debug", StringComparer.OrdinalIgnoreCase))
+{
+    // Attach to the launching terminal when it has one -- "Clippy.exe --console --test-mp4" from
+    // PowerShell should print there -- and allocate a fresh console only when there is none to
+    // attach to (double-click with the flag).
+    if (!NativeConsole.AttachConsole(NativeConsole.AttachParentProcess))
+        NativeConsole.AllocConsole();
+
+    // Console.Out is a writer cached before the console existed, so both streams are re-pointed at
+    // the handles the calls above just produced. One writer for both: same screen buffer, and two
+    // separate ones would interleave out of order.
+    var consoleOut = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+    Console.SetOut(consoleOut);
+    Console.SetError(consoleOut);
+}
+
+// Installed before anything else can fail. In tray mode there is no console at all, so a crash
+// leaves the user with a vanished tray icon and no explanation on screen -- and no way to report
+// it. This writes the reason to a file next to the exe where it can actually be found, and puts
+// the same line on the console for the case where one was allocated.
 AppDomain.CurrentDomain.UnhandledException += (_, e) =>
 {
     var ex = e.ExceptionObject as Exception;
@@ -197,6 +220,7 @@ static int PrintUsage()
     Console.WriteLine();
     Console.WriteLine("  --help, -h, --usage        this text");
     Console.WriteLine("  --self-update             check for and install an update, then exit");
+    Console.WriteLine("  --console, --debug        allocate a console for this run (the build is windowed)");
     Console.WriteLine();
     Console.WriteLine("Modes:");
     Console.WriteLine("  --record [seconds]         record to a file for a fixed time (default 60s)");
@@ -224,4 +248,22 @@ static int PrintUsage()
     Console.WriteLine();
     Console.WriteLine($"Config: {ClippyConfig.Path}");
     return 0;
+}
+
+/// <summary>
+/// The kernel32 entry points behind --console. A separate type because top-level statements leave
+/// no class of their own to hang a LibraryImport on.
+/// </summary>
+internal static partial class NativeConsole
+{
+    /// <summary>ATTACH_PARENT_PROCESS: the console of whatever started us, when it has one.</summary>
+    internal const int AttachParentProcess = -1;
+
+    [LibraryImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool AttachConsole(int processId);
+
+    [LibraryImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool AllocConsole();
 }
