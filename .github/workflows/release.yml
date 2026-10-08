@@ -120,8 +120,10 @@ jobs:
           if (-not (Test-Path $nvenc)) { throw "clippy_nvenc.dll is missing from the publish directory!" }
           "ok  clippy_nvenc.dll ({0:N0} bytes)" -f (Get-Item $nvenc).Length
 
+          # The binary is WinExe (GUI subsystem), so PowerShell does not wait for it or set
+          # $LASTEXITCODE unless piped. Pipelining to Out-Host forces synchronous execution and captures exit code.
           foreach ($t in '--test-parsers', '--test-ring', '--test-mp4', '--test-audio-timeline') {
-            & $exe $t
+            & $exe $t | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "$t failed with exit $LASTEXITCODE" }
             "ok  $t"
           }
