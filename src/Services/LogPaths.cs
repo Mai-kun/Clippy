@@ -18,6 +18,9 @@ internal static class LogPaths
     /// One definition, used by both the recorder and the tray's "Open Logs Folder": two separate
     /// computations of "where are the logs" would eventually disagree and open an empty folder.
     /// </summary>
+    public static string LogsDirectory =>
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "logs"));
+
     public static string ResolveDirectory(ClippyConfig config) =>
         Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, config.LogsFolder));
 

@@ -88,6 +88,11 @@ if (args.Contains("--self-update"))
     return 0;
 }
 
+if (args.Contains("--test-update"))
+{
+    return await UpdateService.RunSelfTest();
+}
+
 if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
 {
     return PrintUsage();

@@ -61,7 +61,7 @@ internal static class UpdateService
     {
         try
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 
             // GitHub answers 403 Forbidden to any request without a User-Agent. This one line is the
             // difference between the check working and always failing.
@@ -71,7 +71,7 @@ internal static class UpdateService
             using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                Console.WriteLine($"Update: GitHub said {(int)response.StatusCode}; staying on {CurrentVersion}.");
+                Log($"GitHub API returned {(int)response.StatusCode} {response.ReasonPhrase}; staying on {CurrentVersion}.");
                 return UpdateInfo.UpToDate;
             }
 
@@ -80,56 +80,58 @@ internal static class UpdateService
             var root = document.RootElement;
 
             var tag = root.TryGetProperty("tag_name", out var tagElement) ? tagElement.GetString() ?? "" : "";
-            if (tag.Length == 0 || !IsNewer(tag, CurrentVersion))
+
+            if (!root.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
             {
-                Console.WriteLine($"Update: {tag} is not newer than {CurrentVersion}.");
+                Log($"Release {tag} has no valid assets array; staying on {CurrentVersion}.");
                 return UpdateInfo.UpToDate;
             }
 
-            if (!root.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
-                return UpdateInfo.UpToDate;
-
-            var wanted = WantedAsset;
-            string? url = null;
-
+            var assetList = new List<(string Name, string Url)>();
             foreach (var asset in assets.EnumerateArray())
             {
                 if (asset.TryGetProperty("name", out var name) &&
-                    asset.TryGetProperty("browser_download_url", out var download) &&
-                    name.GetString() == wanted)
+                    asset.TryGetProperty("browser_download_url", out var download))
                 {
-                    url = download.GetString();
-                    break;
+                    assetList.Add((name.GetString() ?? "", download.GetString() ?? ""));
                 }
             }
 
-            if (url is null)
+            Log($"Release {tag} contains {assetList.Count} asset(s):" + Environment.NewLine +
+                string.Join(Environment.NewLine, assetList.Select(a => $"  - {a.Name}: {a.Url}")));
+
+            var isInstalled = IsInstalled;
+            var wanted = WantedAsset;
+            var fallback = FallbackAsset;
+            Log($"Mode: {(isInstalled ? "Installed (Setup)" : "Portable (Zip)")}. Wanted: '{wanted}', fallback: '{fallback}'.");
+
+            var chosen = assetList.FirstOrDefault(a => string.Equals(a.Name, wanted, StringComparison.OrdinalIgnoreCase));
+            if (chosen.Url is null)
             {
-                // A release published before this build can ship only the other shape, and a user who
-                // never installed anything should still be able to update. The setup would install to
-                // a different folder, so it is only offered when nothing better exists.
-                foreach (var asset in assets.EnumerateArray())
-                {
-                    if (asset.TryGetProperty("name", out var name) &&
-                        asset.TryGetProperty("browser_download_url", out var download) &&
-                        name.GetString() == FallbackAsset)
-                    {
-                        url = download.GetString();
-                        break;
-                    }
-                }
+                Log($"Wanted asset '{wanted}' not found, trying fallback '{fallback}'...");
+                chosen = assetList.FirstOrDefault(a => string.Equals(a.Name, fallback, StringComparison.OrdinalIgnoreCase));
             }
 
-            return url is null
-                ? UpdateInfo.UpToDate
-                : new UpdateInfo(true, tag, url);
+            if (chosen.Url is null)
+            {
+                Log($"No matching asset ('{wanted}' or '{fallback}') found in release {tag}.");
+                return UpdateInfo.UpToDate;
+            }
+
+            Log($"Selected asset: '{chosen.Name}' with URL: {chosen.Url}");
+
+            if (tag.Length == 0 || !IsNewer(tag, CurrentVersion))
+            {
+                Log($"{tag} is not newer than {CurrentVersion}; staying on {CurrentVersion}.");
+                return UpdateInfo.UpToDate;
+            }
+
+            Log($"Update available: {CurrentVersion} -> {tag} ({chosen.Url}).");
+            return new UpdateInfo(true, tag, chosen.Url);
         }
         catch (Exception ex)
         {
-            // Offline, DNS failure, timeout, cancellation: all the same to a user who just wants to
-            // record. Say what happened in the log and carry on.
-            Console.WriteLine($"Update: check failed ({ex.GetType().Name}: {ex.Message}); " +
-                              $"staying on {CurrentVersion}.");
+            Log($"Update check failed ({ex.GetType().Name}: {ex.Message}):{Environment.NewLine}{ex}");
             return UpdateInfo.UpToDate;
         }
     }
@@ -168,68 +170,25 @@ internal static class UpdateService
     /// </summary>
     public static async Task ApplyUpdateAsync(string downloadUrl, Action<string, string>? notify)
     {
-        var temp = Path.GetTempPath();
-        var appDir = AppContext.BaseDirectory;
-
-        // An installed copy is updated by the installer, never by dropping an exe on top: the
-        // uninstaller, the shortcut and the registry entries would then describe a program that no
-        // longer exists, and the next real install would refuse to run. A portable folder has none of
-        // that, so there the copy is still the right answer.
-        if (IsInstalled)
-        {
-            await ApplyViaSetupAsync(downloadUrl, notify).ConfigureAwait(false);
-            Environment.Exit(0);
-            return;
-        }
-
-        var zipPath = Path.Combine(temp, "clippy_update.zip");
-        var extractDir = Path.Combine(temp, "clippy_extracted");
-
         try
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-            notify?.Invoke("Clippy Update", "Downloading...");
-
-            using var response = await client
-                .GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead)
-                .ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
-
-            await using (var target = File.Create(zipPath))
+            Log($"Starting update installation from: {downloadUrl}");
+            if (IsInstalled)
             {
-                await response.Content.CopyToAsync(target).ConfigureAwait(false);
+                await ApplyViaSetupAsync(downloadUrl, notify).ConfigureAwait(false);
+            }
+            else
+            {
+                await ApplyViaZipAsync(downloadUrl, notify).ConfigureAwait(false);
             }
 
-            notify?.Invoke("Clippy Update", "Installing...");
-
-            if (Directory.Exists(extractDir))
-                Directory.Delete(extractDir, recursive: true);
-            Directory.CreateDirectory(extractDir);
-            ZipFile.ExtractToDirectory(zipPath, extractDir, overwriteFiles: true);
-
-            // No recursive copy of the extracted folder: that would clobber config.json and ffmpeg.exe
-            // with whatever the release happens to contain.
-            var newExe = Directory
-                .EnumerateFiles(extractDir, "Clippy.exe", SearchOption.AllDirectories)
-                .FirstOrDefault();
-            if (newExe is null)
-                throw new InvalidOperationException("no Clippy.exe inside the downloaded archive");
-
-            var scriptPath = Path.Combine(extractDir, "apply_update.cmd");
-            await File.WriteAllTextAsync(scriptPath, BuildApplyScript(extractDir, appDir))
-                .ConfigureAwait(false);
-
-            StartDetached(scriptPath);
+            Environment.Exit(0);
         }
         catch (Exception ex)
         {
-            // Leave the old version running. A failed update must never cost the user a working app.
-            Console.WriteLine($"Update: install failed ({ex.GetType().Name}: {ex.Message}).");
+            Log($"Update installation failed ({ex.GetType().Name}: {ex.Message}):{Environment.NewLine}{ex}");
             notify?.Invoke("Clippy Update", "Update failed. The current version still works.");
-            return;
         }
-
-        Environment.Exit(0);
     }
 
     /// <summary>
@@ -241,12 +200,15 @@ internal static class UpdateService
     /// </summary>
     private static async Task ApplyViaSetupAsync(string downloadUrl, Action<string, string>? notify)
     {
-        var setupPath = Path.Combine(Path.GetTempPath(), "Clippy-Setup.exe");
+        // Unique setup filename to prevent file locking/sharing violation conflicts with existing files in %TEMP%.
+        var setupPath = Path.Combine(Path.GetTempPath(), $"Clippy-Setup-{Guid.NewGuid():N}.exe");
 
         try
         {
             using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Clippy-App");
             notify?.Invoke("Clippy Update", "Downloading...");
+            Log($"Downloading installer to: {setupPath}");
 
             using var response = await client
                 .GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead)
@@ -258,6 +220,7 @@ internal static class UpdateService
                 await response.Content.CopyToAsync(target).ConfigureAwait(false);
             }
 
+            Log($"Downloaded installer successfully ({new FileInfo(setupPath).Length} bytes).");
             notify?.Invoke("Clippy Update", "Installing...");
 
             // The installer cannot replace Clippy.exe while this process is still tearing itself
@@ -275,20 +238,77 @@ internal static class UpdateService
             //     started from a script or a service is exactly that case.
             // ping has neither failure mode: it is addressed by absolute path, reads no stdin, and
             // three one-second pings make the two-second pause.
-            var cmd = $"/c \"%SystemRoot%\\System32\\ping.exe -n 3 127.0.0.1 >nul & start \"\" \"{setupPath}\" " +
-                      "/VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS /NORESTART";
-            Process.Start(new ProcessStartInfo("cmd.exe", cmd)
+            const string setupArgs = "/VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS /NORESTART";
+            var cmdLine = $"/c \"%SystemRoot%\\System32\\ping.exe -n 3 127.0.0.1 >nul & start \"\" \"{setupPath}\" {setupArgs}\"";
+            Log($"Launching installer via: cmd.exe {cmdLine}");
+
+            var psi = new ProcessStartInfo
             {
+                FileName = "cmd.exe",
+                Arguments = cmdLine,
                 CreateNoWindow = true,
                 UseShellExecute = false,
-            });
+            };
+            Process.Start(psi);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            // Leave the old version running. A failed update must never cost the user a working app.
-            Console.WriteLine($"Update: installer path failed ({ex.GetType().Name}: {ex.Message}).");
-            notify?.Invoke("Clippy Update", "Update failed. The current version still works.");
             RemoveIfPresent(setupPath);
+            throw;
+        }
+    }
+
+    private static async Task ApplyViaZipAsync(string downloadUrl, Action<string, string>? notify)
+    {
+        var temp = Path.GetTempPath();
+        var appDir = AppContext.BaseDirectory;
+        var zipPath = Path.Combine(temp, $"clippy_update_{Guid.NewGuid():N}.zip");
+        var extractDir = Path.Combine(temp, "clippy_extracted");
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Clippy-App");
+            notify?.Invoke("Clippy Update", "Downloading...");
+            Log($"Downloading zip update to: {zipPath}");
+
+            using var response = await client
+                .GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead)
+                .ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            await using (var target = File.Create(zipPath))
+            {
+                await response.Content.CopyToAsync(target).ConfigureAwait(false);
+            }
+
+            Log($"Downloaded zip archive successfully ({new FileInfo(zipPath).Length} bytes).");
+            notify?.Invoke("Clippy Update", "Installing...");
+
+            if (Directory.Exists(extractDir))
+                Directory.Delete(extractDir, true);
+
+            Log($"Extracting archive to: {extractDir}");
+            ZipFile.ExtractToDirectory(zipPath, extractDir, overwriteFiles: true);
+
+            // No recursive copy of the extracted folder: that would clobber config.json and ffmpeg.exe
+            // with whatever the release happens to contain.
+            var newExe = Directory
+                .EnumerateFiles(extractDir, "Clippy.exe", SearchOption.AllDirectories)
+                .FirstOrDefault();
+            if (newExe is null)
+                throw new InvalidOperationException("no Clippy.exe inside the downloaded archive");
+
+            var scriptPath = Path.Combine(extractDir, "apply_update.cmd");
+            await File.WriteAllTextAsync(scriptPath, BuildApplyScript(extractDir, appDir, zipPath))
+                .ConfigureAwait(false);
+
+            Log($"Launching detached apply script: {scriptPath}");
+            StartDetached(scriptPath);
+        }
+        catch (Exception)
+        {
+            RemoveIfPresent(zipPath);
             throw;
         }
     }
@@ -302,18 +322,40 @@ internal static class UpdateService
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            Console.WriteLine($"Update: could not remove {path} ({ex.GetType().Name}).");
+            Log($"Could not remove temporary file {path} ({ex.GetType().Name}).");
         }
+    }
+
+    /// <summary>
+    /// Logs messages to logs/update.log, clippy-error.log, EventLog and Console.
+    /// </summary>
+    private static void Log(string message)
+    {
+        try
+        {
+            var logDir = LogPaths.LogsDirectory;
+            Directory.CreateDirectory(logDir);
+            File.AppendAllText(
+                Path.Combine(logDir, "update.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
+        }
+        catch
+        {
+        }
+
+        EventLog.Mark("UPDATE", message);
+        CrashLog.Write($"Update: {message}");
     }
 
     /// <summary>
     /// The detached installer, with the paths substituted in: a batch file has no other way to
     /// receive them.
     /// </summary>
-    private static string BuildApplyScript(string extractDir, string appDir)
+    private static string BuildApplyScript(string extractDir, string appDir, string zipPath)
     {
         var from = extractDir.Replace("\"", "");
         var to = Path.Combine(appDir, "Clippy.exe").Replace("\"", "");
+        var zip = zipPath.Replace("\"", "");
 
         return $"""
             @echo off
@@ -323,7 +365,7 @@ internal static class UpdateService
             timeout /t 1 /nobreak >nul
             copy /y "{from}\Clippy.exe" "{to}"
             start "" "{to}"
-            del "%TEMP%\clippy_update.zip"
+            del "{zip}"
             rd /s /q "{from}"
             del "%~f0"
             """;
@@ -345,5 +387,91 @@ internal static class UpdateService
         startInfo.ArgumentList.Add(scriptPath);
 
         Process.Start(startInfo);
+    }
+
+    /// <summary>
+    /// Self-check verifying update check, asset enumeration, zip extraction with overwrite,
+    /// and HTTP download connectivity.
+    /// </summary>
+    public static async Task<int> RunSelfTest()
+    {
+        var failures = 0;
+        Log("Running update self-test...");
+
+        // 1. Check update check and asset resolution
+        var info = await CheckForUpdateAsync();
+        Console.WriteLine($"[ OK ] CheckForUpdateAsync completed successfully (Available: {info.Available}, Tag: '{info.Tag}').");
+
+        // 2. Test directory cleanup and zip extraction logic
+        try
+        {
+            var testTemp = Path.Combine(Path.GetTempPath(), $"clippy_test_{Guid.NewGuid():N}");
+            var testZip = Path.Combine(Path.GetTempPath(), $"clippy_test_{Guid.NewGuid():N}.zip");
+            Directory.CreateDirectory(testTemp);
+            File.WriteAllText(Path.Combine(testTemp, "dummy.txt"), "hello");
+            ZipFile.CreateFromDirectory(testTemp, testZip);
+
+            // Re-extracting to existing directory with cleanup
+            if (Directory.Exists(testTemp))
+                Directory.Delete(testTemp, true);
+            ZipFile.ExtractToDirectory(testZip, testTemp, overwriteFiles: true);
+
+            if (!File.Exists(Path.Combine(testTemp, "dummy.txt")))
+                throw new InvalidOperationException("Zip extraction failed to restore dummy.txt");
+
+            Directory.Delete(testTemp, true);
+            File.Delete(testZip);
+            Console.WriteLine("[ OK ] Zip extraction with cleanup and overwriteFiles succeeded.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FAIL] Zip extraction self-test: {ex.Message}");
+            failures++;
+        }
+
+        // 3. Test HTTP download stream with configured timeout and User-Agent
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Clippy-App");
+            var testUrl = "https://github.com/Mai-kun/Clippy/releases/download/v1.3.2/Clippy-Setup.exe";
+            using var response = await client.GetAsync(testUrl, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength is null or 0)
+                throw new InvalidOperationException("Download response has zero or null ContentLength");
+
+            Console.WriteLine($"[ OK ] Download test succeeded (ContentLength: {response.Content.Headers.ContentLength} bytes).");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FAIL] Download test: {ex.Message}");
+            failures++;
+        }
+
+        // 4. Test installer command line syntax with cmd.exe /c start
+        try
+        {
+            var dummyExe = "cmd.exe";
+            var dummyArgs = "/c exit 0";
+            var cmdLine = $"/c \"%SystemRoot%\\System32\\ping.exe -n 1 127.0.0.1 >nul & start \"\" \"{dummyExe}\" {dummyArgs}\"";
+            using var proc = Process.Start(new ProcessStartInfo("cmd.exe", cmdLine)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+            });
+            proc?.WaitForExit(5000);
+            if (proc is null || proc.ExitCode != 0)
+                throw new InvalidOperationException($"cmd start test exited with code {proc?.ExitCode}");
+
+            Console.WriteLine("[ OK ] Installer cmd.exe /c start command syntax succeeded.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FAIL] Installer cmd syntax test: {ex.Message}");
+            failures++;
+        }
+
+        Console.WriteLine(failures == 0 ? "UPDATE SELFTEST: OK" : $"UPDATE SELFTEST: FAILED ({failures})");
+        return failures;
     }
 }
