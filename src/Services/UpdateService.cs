@@ -25,7 +25,7 @@ internal readonly record struct UpdateInfo(bool Available, string Tag, string Do
 /// </summary>
 internal static class UpdateService
 {
-    private const string CurrentVersion = "v1.3.4";
+    public const string CurrentVersion = "v1.3.5";
     private const string ApiUrl = "https://api.github.com/repos/Mai-kun/Clippy/releases/latest";
 
     /// <summary>Installer, used when the running copy was installed by the setup.</summary>
@@ -200,6 +200,7 @@ internal static class UpdateService
     /// </summary>
     private static async Task ApplyViaSetupAsync(string downloadUrl, Action<string, string>? notify)
     {
+        var appDir = AppContext.BaseDirectory;
         // Unique setup filename to prevent file locking/sharing violation conflicts with existing files in %TEMP%.
         var setupPath = Path.Combine(Path.GetTempPath(), $"Clippy-Setup-{Guid.NewGuid():N}.exe");
 
@@ -223,23 +224,8 @@ internal static class UpdateService
             Log($"Downloaded installer successfully ({new FileInfo(setupPath).Length} bytes).");
             notify?.Invoke("Clippy Update", "Installing...");
 
-            // The installer cannot replace Clippy.exe while this process is still tearing itself
-            // down: threads are exiting and handles are being closed, and Inno Setup answers that
-            // with "the application is running". So the installer is launched by a hidden cmd that
-            // first WAITS, and /FORCECLOSEAPPLICATIONS tells it to close whatever is still holding
-            // the exe.
-            //
-            // The wait is `%SystemRoot%\System32\ping.exe -n 3`, not `timeout /t 2`, and both halves
-            // of that were measured rather than assumed on this machine:
-            //   * `timeout` is not on this PATH at all -- cmd answers "not recognized" and the delay
-            //     silently evaporates, which is the exact bug being fixed;
-            //   * even by absolute path, `timeout` refuses to wait when stdin is redirected ("Input
-            //     redirection is not supported, exiting the process immediately"), and a recorder
-            //     started from a script or a service is exactly that case.
-            // ping has neither failure mode: it is addressed by absolute path, reads no stdin, and
-            // three one-second pings make the two-second pause.
-            const string setupArgs = "/VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS /NORESTART";
-            var cmdLine = $"/c \"%SystemRoot%\\System32\\ping.exe -n 3 127.0.0.1 >nul & start \"\" \"{setupPath}\" {setupArgs}\"";
+            // В цепочке cmd.exe запускаем установщик, ждём завершения (&) и стартуем обновлённый Clippy с флагом --updated:
+            string cmdLine = $"/c \"%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul & \"{setupPath}\" /VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS /NORESTART & start \"\" \"{Path.Combine(appDir, "Clippy.exe")}\" --updated\"";
             Log($"Launching installer via: cmd.exe {cmdLine}");
 
             var psi = new ProcessStartInfo
@@ -327,7 +313,7 @@ internal static class UpdateService
     }
 
     /// <summary>
-    /// Logs messages to logs/update.log, clippy-error.log, EventLog and Console.
+    /// Logs messages to logs/update.log, logs/clippy-error.log, EventLog and Console.
     /// </summary>
     private static void Log(string message)
     {
@@ -364,7 +350,7 @@ internal static class UpdateService
             rem and ffmpeg.exe belong to the user, not to the release.
             timeout /t 1 /nobreak >nul
             copy /y "{from}\Clippy.exe" "{to}"
-            start "" "{to}"
+            start "" "{to}" --updated
             del "{zip}"
             rd /s /q "{from}"
             del "%~f0"

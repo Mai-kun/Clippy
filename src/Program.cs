@@ -48,10 +48,17 @@ TaskScheduler.UnobservedTaskException += (_, e) =>
 AppDomain.CurrentDomain.ProcessExit += (_, _) => DiskSpooler.Cleanup();
 DiskSpooler.Cleanup();
 
+var isUpdated = args.Contains("--updated", StringComparer.OrdinalIgnoreCase);
+
 // No arguments is the normal case and must not be a usage screen: the user double-clicked the exe
 // because they want it recording, not because they want to read a help text. Everything the run
 // needs comes from config.json, so the default path is the same one --record builds by hand.
-if (args.Length == 0)
+// If --updated was passed, start normally into the tray and show the update notification.
+var nonOptionArgs = args.Where(a => !a.Equals("--updated", StringComparison.OrdinalIgnoreCase) &&
+                                    !a.Equals("--console", StringComparison.OrdinalIgnoreCase) &&
+                                    !a.Equals("--debug", StringComparison.OrdinalIgnoreCase)).ToArray();
+
+if (nonOptionArgs.Length == 0)
 {
     var defaults = ClippyConfig.Load();
     return Clippy.ScreenCapture.RunVideo(
@@ -69,7 +76,8 @@ if (args.Length == 0)
         config: defaults,
         // The tray owns the process lifetime. Without an icon there would be no way back to this
         // window and no way to quit except killing it from Task Manager.
-        tray: true);
+        tray: true,
+        updated: isUpdated);
 }
 
 if (args.Contains("--self-update"))
@@ -194,7 +202,8 @@ if (args.FirstOrDefault() == "--record")
     return Clippy.ScreenCapture.RunVideo(
         TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode, withAudio || audioCaptureOnly, audioCaptureOnly,
         args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration, config,
-        trayRequested);
+        trayRequested,
+        updated: isUpdated);
 }
 
 if (args.FirstOrDefault() == "--test-audio-timeline")
@@ -225,6 +234,7 @@ static int PrintUsage()
     Console.WriteLine();
     Console.WriteLine("  --help, -h, --usage        this text");
     Console.WriteLine("  --self-update             check for and install an update, then exit");
+    Console.WriteLine("  --updated                 launched after update; shows update notification");
     Console.WriteLine("  --console, --debug        allocate a console for this run (the build is windowed)");
     Console.WriteLine();
     Console.WriteLine("Modes:");

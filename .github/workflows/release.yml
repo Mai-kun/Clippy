@@ -128,39 +128,28 @@ jobs:
             "ok  $t"
           }
 
-      # 26 MB of symbols that no end user can do anything with. Uploading them to a separate
-      # asset would let a crash reporter symbolicate later, which is worth doing when there is
-      # actually a crash reporter; today it is just a slow download.
-      - name: Drop debug symbols
+      # Clean test artifacts, debug symbols, and unneeded files so end users receive
+      # a clean directory: only Clippy.exe, clippy_nvenc.dll, config.example.json.
+      # ffmpeg is NOT bundled: Direct NVENC and Media Foundation work out of the box (~7-8 MB release).
+      - name: Clean release distribution
         shell: pwsh
         run: |
-          $pdb = 'publish/Clippy.pdb'
-          if (Test-Path $pdb) {
-            Remove-Item $pdb
-            "removed $pdb"
-          } else {
-            "no Clippy.pdb produced"
+          Get-ChildItem -Path publish -Filter 'mp4-selftest-*' | Remove-Item -Force
+          Get-ChildItem -Path publish -Filter '*.pdb' | Remove-Item -Force
+          if (Test-Path 'publish/Tests') {
+            Remove-Item 'publish/Tests' -Recurse -Force
           }
-
-      - name: Stage user files
-        shell: pwsh
-        run: |
-          Copy-Item README.md publish/README.md
-          Copy-Item config.example.json publish/config.example.json
-
-      # Ship ffmpeg inside the archive. It is not committed to the repo, so the repository does not
-      # grow by ~80 MB, and the user gets a folder that works with no setup at all. FfmpegLocator
-      # prefers a bundled ffmpeg.exe over PATH, so dropping it next to Clippy.exe is enough.
-      #
-      # ffprobe is deliberately NOT shipped. Clippy never calls it at runtime -- only the selftests
-      # do, and those run here on the runner -- so bundling it would add ~200 MB of nothing to a
-      # download. Its absence costs a user nothing beyond being unable to re-run --test-mp4 locally.
-      - name: Bundle ffmpeg
-        shell: pwsh
-        run: |
-          $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source
-          Copy-Item $ffmpeg publish/ffmpeg.exe
-          Get-Item publish/ffmpeg.exe | Select-Object Name, Length
+          if (Test-Path 'publish/README.md') {
+            Remove-Item 'publish/README.md' -Force
+          }
+          if (Test-Path 'publish/ffmpeg.exe') {
+            Remove-Item 'publish/ffmpeg.exe' -Force
+          }
+          if (-not (Test-Path 'publish/config.example.json')) {
+            Copy-Item config.example.json publish/config.example.json
+          }
+          "Clean publish folder contents:"
+          Get-ChildItem publish | Select-Object Name, Length
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -251,7 +240,7 @@ jobs:
             **`Clippy-win-x64.zip`** — распакуйте в любую папку и запустите `Clippy.exe`.
             Ничего не устанавливается.
 
-            `ffmpeg.exe` уже внутри обоих вариантов, отдельно ничего ставить не нужно.
+            NVENC + Media Foundation работают из коробки без сторонних зависимостей (ffmpeg не требуется).
 
             Горячие клавиши: **F8** — 30 секунд, **F9** — 3 минуты.
             Клипы в `clips/`, отладочные логи в `logs/`.

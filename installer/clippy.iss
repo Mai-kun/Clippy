@@ -1,15 +1,15 @@
 ; Clippy installer.
 ;
 ; Built by the release workflow, which passes the tag in:
-;   ISCC.exe /DPublishVersion=1.3.4 installer\clippy.iss
-; A human running it by hand gets 1.3.4, which is fine for a smoke test.
+;   ISCC.exe /DPublishVersion=1.3.5 installer\clippy.iss
+; A human running it by hand gets 1.3.5, which is fine for a smoke test.
 ;
 ; Every path is relative to this file, so the script does not care where the repository sits.
 
 #ifndef PublishVersion
   ; Only used when ISCC is run by hand. The release workflow always passes the tag as
   ; /DPublishVersion=, so the two can never disagree about what release this is.
-  #define PublishVersion "1.3.4"
+  #define PublishVersion "1.3.5"
 #endif
 
 #ifndef PublishDir
@@ -63,7 +63,7 @@ Name: "desktopicon"; Description: "Создать значок на рабоче
 ; One entry with a wildcard, not a hand-kept list: the publish folder is the definition of what ships,
 ; and a list would silently fall behind the moment a file is added. setup.exe is skipped so a nested
 ; installer inside the archive can never install itself.
-Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "setup.exe"
+Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "setup.exe,mp4-selftest-*,Tests\*,Tests,*.pdb"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExe}"

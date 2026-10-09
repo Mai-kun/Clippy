@@ -14,7 +14,7 @@ internal static class CrashLog
     private static bool broken;
 
     public static string Path { get; } =
-        System.IO.Path.Combine(AppContext.BaseDirectory, "clippy-error.log");
+        System.IO.Path.Combine(LogPaths.LogsDirectory, "clippy-error.log");
 
     public static void Write(string message)
     {
@@ -24,6 +24,10 @@ internal static class CrashLog
             {
                 if (broken)
                     return;
+
+                var dir = System.IO.Path.GetDirectoryName(Path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
 
                 File.AppendAllText(
                     Path,

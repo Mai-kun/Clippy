@@ -587,7 +587,7 @@ internal sealed partial class ScreenCapture : IDisposable
     }
 
     /// <summary>Records a raw video stream: every captured frame is piped to ffmpeg.</summary>
-    public static int RunVideo(TimeSpan? duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null, ClippyConfig? config = null, bool tray = false)
+    public static int RunVideo(TimeSpan? duration, string outputPath, string encoderName, string fpsMode = "passthrough", bool withAudio = false, bool audioCaptureOnly = false, bool hotkeys = false, double? exportAt = null, double? exportDuration = null, ClippyConfig? config = null, bool tray = false, bool updated = false)
     {
         // Without audio there is no mux, so the encoder writes a raw Annex B stream. Naming that file
         // .mp4 would be actively misleading: the bytes are correct but the extension lies.
@@ -615,6 +615,11 @@ internal sealed partial class ScreenCapture : IDisposable
         {
             capture.notify = trayIcon.ShowNotification;
             capture.tray = trayIcon;
+
+            if (updated)
+            {
+                trayIcon.ShowNotification("Clippy", $"Программа успешно обновлена до версии {UpdateService.CurrentVersion}!");
+            }
 
             // Fire and forget, deliberately. This is a network call on the way to recording, and a
             // user whose network hangs must still get their recorder running now, not in ten seconds.
