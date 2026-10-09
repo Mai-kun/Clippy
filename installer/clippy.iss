@@ -59,6 +59,13 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "autostart"; Description: "Запускать {#AppName} при старте Windows"; GroupDescription: "Дополнительно:"
 Name: "desktopicon"; Description: "Создать значок на рабочем столе"; GroupDescription: "Дополнительно:"; Flags: unchecked
 
+[InstallDelete]
+; Clean up legacy/test files from previous versions during upgrade:
+Type: files; Name: "{app}\mp4-selftest-*"
+Type: filesandordirs; Name: "{app}\Tests"
+Type: files; Name: "{app}\clippy-error.log"
+Type: files; Name: "{app}\ffmpeg.exe"
+
 [Files]
 ; One entry with a wildcard, not a hand-kept list: the publish folder is the definition of what ships,
 ; and a list would silently fall behind the moment a file is added. setup.exe is skipped so a nested
