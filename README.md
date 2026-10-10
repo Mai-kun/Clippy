@@ -77,6 +77,7 @@ winget install Mai-kun.Clippy
 | `ShortClipHotkey` | `F8` | Горячая клавиша короткого клипа (F1–F12, NumPad 0–9) |
 | `LongClipHotkey` | `F9` | Горячая клавиша длинного клипа (F1–F12, NumPad 0–9) |
 | `PlaySoundNotification` | `true` | Звуковой сигнал в наушники при сохранении |
+| `CustomSoundPath` | `""` | Свой звук уведомления (`.wav`); пусто = системный звук Windows |
 | `StartMinimizedToTray` | `true` | Запуск сразу в системный трей без окна консоли |
 | `CheckForUpdates` | `true` | Фоновая проверка обновлений на GitHub при старте |
 | `VideoEncoder` | `nvenc_direct` | Энкодер: `nvenc_direct` (0-copy VRAM) / `h264_nvenc` / `libx264` |

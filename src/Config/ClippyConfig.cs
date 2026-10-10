@@ -27,6 +27,14 @@ public sealed class ClippyConfig
     public bool PlaySoundNotification { get; set; } = true;
 
     /// <summary>
+    /// Own notification sound, a .wav, played instead of the system beep when the file exists.
+    /// Relative paths are resolved against the executable's folder. Empty (the default), a blank or
+    /// a path with no file behind it all mean the same thing: the standard Windows sound, because a
+    /// wrong path must degrade rather than leave the save confirmed by silence.
+    /// </summary>
+    public string CustomSoundPath { get; set; } = "";
+
+    /// <summary>
     /// Start with the console hidden, living only in the tray. False by default: while the recorder
     /// is being developed the log is the whole point, and a process that vanishes into the tray
     /// looks identical to one that crashed on startup.

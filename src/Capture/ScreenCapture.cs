@@ -320,7 +320,7 @@ internal sealed partial class ScreenCapture : IDisposable
         // is safe when it is not.
         if (config.PlaySoundNotification)
         {
-            ExportNotification.PlayExportSaved();
+            ExportNotification.PlayExportSaved(config.CustomSoundPath);
             Console.WriteLine("Export: played the confirmation sound.");
         }
 

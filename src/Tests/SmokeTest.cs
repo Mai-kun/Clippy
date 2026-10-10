@@ -21,6 +21,7 @@ internal static class SmokeTest
         failures += Check("Tray menu: bitrate options are consistent", BitrateOptions);
     failures += Check("Tray menu: hotkey choices are unique, bindable and do not clash", HotkeyChoices);
         failures += Check("Tray menu: last clip is the newest one", LastClip);
+        failures += Check("Export notification: custom sound path resolution", CustomSoundPath);
         failures += Check("Folder picker: runs on an STA thread", FolderPickerApartment);
 
         Console.WriteLine(failures == 0 ? "SMOKE: OK" : $"SMOKE: FAILED ({failures})");
@@ -185,6 +186,39 @@ private static void FolderPickerApartment()
         throw new InvalidOperationException($"the picker thread is {seen}; SHBrowseForFolder would hang");
     Console.WriteLine($"       picker apartment = {seen}");
 }
+
+    /// <summary>
+    /// The configured custom notification sound is resolved the way the config documents it: a
+    /// relative path is anchored to the executable's folder -- never to the current directory, which
+    /// for a tray app is wherever the shortcut happened to start -- an absolute path is used as it
+    /// stands, and anything that does not name an existing file resolves to null so the exporter
+    /// falls back to the system beep instead of playing silence.
+    /// </summary>
+    private static void CustomSoundPath()
+    {
+        var expected = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "config.example.json"));
+
+        Expect(ExportNotification.ResolveCustomSound(null), null, "null");
+        Expect(ExportNotification.ResolveCustomSound(""), null, "empty");
+        Expect(ExportNotification.ResolveCustomSound("   "), null, "whitespace");
+        Expect(ExportNotification.ResolveCustomSound("no-such-sound.wav"), null, "missing relative path");
+        Expect(ExportNotification.ResolveCustomSound(Path.Combine(AppContext.BaseDirectory, "no-such-sound.wav")),
+            null, "missing absolute path");
+
+        // config.example.json is copied next to the binary by the csproj, so both branches resolve
+        // to a file that really exists without the test having to create one.
+        Expect(ExportNotification.ResolveCustomSound("config.example.json"), expected, "existing relative path");
+        Expect(ExportNotification.ResolveCustomSound(expected), expected, "existing absolute path");
+
+        Console.WriteLine($"       custom sound resolves to {expected}");
+    }
+
+    private static void Expect(string? actual, string? expected, string label)
+    {
+        if (actual != expected)
+            throw new InvalidOperationException(
+                $"{label}: expected {(expected is null ? "null" : $"'{expected}'")}, got {(actual is null ? "null" : $"'{actual}'")}");
+    }
 
     private static string Write(string folder, string name, DateTime lastWriteUtc)
     {
