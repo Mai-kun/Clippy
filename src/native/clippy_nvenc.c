@@ -189,9 +189,12 @@ int Nvenc_Open(void* pD3DDevice, int width, int height, int fps, int bitrateBps,
     // header names them LOW_LATENCY_HP and friends, so a name that compiles against one header is
     // rejected by the driver as NV_ENC_ERR_UNSUPPORTED_PARAM; and a GPU is free to implement only
     // part of the range. Asking which presets exist costs one call and removes both failure modes.
-    // P4 is the middle of the range; the low-latency behaviour comes from tuningInfo below, not from
-    // the preset, which is how the API separates the two since the P1..P7 renumbering.
-    GUID wanted[3] = { NV_ENC_PRESET_P4_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P5_GUID };
+    // P1 first: the fastest hardware preset (the one ShadowPlay runs), so the chip spends the least
+    // time per frame -- that is the whole point of the P-series switch. The rest of the list is the
+    // fall-back order for a GPU that advertises only part of the range; P4/P3/P5 were the old
+    // quality-biased preference. The low-latency BEHAVIOUR still comes from tuningInfo below, not
+    // from the preset, which is how the API separates the two since the P1..P7 renumbering.
+    GUID wanted[3] = { NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P4_GUID, NV_ENC_PRESET_P3_GUID };
 
     uint32_t presetCount = 0;
     st = c->api.nvEncGetEncodePresetCount(c->encoder, *codecGuid, &presetCount);
@@ -210,14 +213,24 @@ int Nvenc_Open(void* pD3DDevice, int width, int height, int fps, int bitrateBps,
 
     GUID fallback = NV_ENC_PRESET_P1_GUID;  // fastest, and implemented on every encoder
     GUID chosen = fallback;
-    for (int w = 0; w < 3; w++)
+    // Take the FIRST supported preference. The old loop only broke out when the pick differed from
+    // the fallback, so a wanted[0] that EQUALLED the fallback (P1 == P1) never broke and the walk
+    // fell through to a later entry -- listing P1 first kept selecting P4.
+    int foundWanted = 0;
+    for (int w = 0; w < 3 && !foundWanted; w++)
     {
         for (uint32_t i = 0; i < presetCount; i++)
         {
-            if (SameGuid(&supported[i], &wanted[w])) { chosen = wanted[w]; break; }
+            if (SameGuid(&supported[i], &wanted[w])) { chosen = wanted[w]; foundWanted = 1; break; }
         }
-        if (!SameGuid(&chosen, &fallback)) break;
     }
+
+    // The pick is logged because it was previously invisible: a preference list whose first entry
+    // equalled the fallback silently selected a later preset for months.
+    fprintf(stderr, "[nvenc-c] preset: {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
+            (unsigned)chosen.Data1, (unsigned)chosen.Data2, (unsigned)chosen.Data3,
+            chosen.Data4[0], chosen.Data4[1], chosen.Data4[2], chosen.Data4[3],
+            chosen.Data4[4], chosen.Data4[5], chosen.Data4[6], chosen.Data4[7]);
 
     // The advertised preset names go into the error string. A bare UNSUPPORTED_PARAM does not
     // distinguish "this GPU has no low-latency preset" from "the query answered something
