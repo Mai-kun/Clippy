@@ -19,7 +19,8 @@ internal static class SmokeTest
         failures += Check("WASAPI: endpoints + loopback recorder", Wasapi);
         failures += Check("Media Foundation: startup/shutdown", MediaFoundation);
         failures += Check("Tray menu: bitrate options are consistent", BitrateOptions);
-    failures += Check("Tray menu: hotkey choices are unique, bindable and do not clash", HotkeyChoices);
+        failures += Check("Tray menu: hotkey choices are unique, bindable and do not clash", HotkeyChoices);
+        failures += Check("Notification: supported styles and fallback", NotificationTypes);
         failures += Check("Tray menu: last clip is the newest one", LastClip);
         failures += Check("Export notification: custom sound path resolution", CustomSoundPath);
         failures += Check("Export notification: embedded default sound plays from memory", EmbeddedSound);
@@ -126,6 +127,41 @@ internal static class SmokeTest
                 throw new InvalidOperationException($"label '{option.Label}' does not name {option.Mbps} Mbps");
             Console.WriteLine($"       {option.Label}");
         }
+    }
+
+    /// <summary>
+    /// The three notification styles are mutually exclusive and the default is "overlay". This is the
+    /// one place that can catch a drift between the tray menu's three command ids, the config values
+    /// they write and the helper properties the routing code branches on -- if any of those disagree
+    /// the wrong (or no) card shows, which is invisible until a clip is saved.
+    /// </summary>
+    private static void NotificationTypes()
+    {
+        var expected = new[] { "overlay", "windows_toast", "none" };
+        if (ClippyConfig.SupportedNotificationTypes.Length != expected.Length)
+            throw new InvalidOperationException(
+                $"expected {expected.Length} notification styles, config lists {ClippyConfig.SupportedNotificationTypes.Length}");
+
+        foreach (var style in expected)
+        {
+            if (!ClippyConfig.SupportedNotificationTypes.Contains(style, StringComparer.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"'{style}' is offered in the tray menu but not accepted by the config");
+
+            var config = new ClippyConfig { NotificationType = style };
+            var branch = config.UseOverlayNotification ? "overlay"
+                : config.UseWindowsToastNotification ? "windows_toast"
+                : "none";
+            if (!string.Equals(branch, style, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"NotificationType='{style}' routes to '{branch}'");
+
+            Console.WriteLine($"{style} -> {branch}");
+        }
+
+        // The default must be the overlay, and exactly one of the two "show something" helpers may be
+        // true for it -- otherwise the menu's check marks would disagree about what is selected.
+        var def = new ClippyConfig();
+        if (!def.UseOverlayNotification || def.UseWindowsToastNotification)
+            throw new InvalidOperationException($"default NotificationType must be 'overlay' (got '{def.NotificationType}')");
     }
 
     /// <summary>

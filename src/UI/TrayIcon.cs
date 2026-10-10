@@ -35,6 +35,13 @@ public sealed partial class TrayIcon : IDisposable
     private const int NIF_INFO = 0x00000010;
     private const int NIIF_INFO = 0x00000001;
 
+    /// <summary>
+    /// Suppresses the toast's default "ding". Without this, Windows plays its own notification sound
+    /// layered on top of Clippy's clip-saved sound, so the user hears two tones at once. We always
+    /// want only our own (or the custom) sound, so this flag is OR'd into every info balloon.
+    /// </summary>
+    private const int NIIF_NOSOUND = 0x00000010;
+
     /// <summary>Identifies our one icon. Shell_NotifyIcon matches on (hWnd, uID), so a NIM_MODIFY
     /// aimed at a notification has to repeat the same pair NIM_ADD used or it silently no-ops.</summary>
     private const uint IconId = 1;
@@ -85,6 +92,11 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_ENCODER_X264 = 1402;
     private const uint IDC_CODEC_HEVC = 1404;
     private const uint IDC_CODEC_H264 = 1405;
+    // The three notification styles, one id each. 15xx so they group with the other single-choice
+    // settings (1600s is the folder/quota block right below).
+    private const uint IDC_NOTIFY_OVERLAY = 1501;
+    private const uint IDC_NOTIFY_TOAST = 1502;
+    private const uint IDC_NOTIFY_NONE = 1503;
     // Two contiguous command-id ranges, one per clip, and one table of choices. The id is the range's
     // base plus the index in the table, so adding a key is a new table row and nothing else -- there
     // is no per-key constant to declare, no case to add, and no way for the menu and the handler to
@@ -396,7 +408,9 @@ public sealed partial class TrayIcon : IDisposable
         // Only NIF_INFO: with the other flags set, NIM_MODIFY rewrites the tip and the icon as well,
         // which is not what this call is for.
         nid.uFlags = NIF_INFO;
-        nid.dwInfoFlags = NIIF_INFO;
+        // NIIF_INFO shows the info balloon; NIIF_NOSOUND silences Windows' own notification chime so
+        // it does not play on top of Clippy's clip-saved sound (see NIIF_NOSOUND).
+        nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
 
         // CopyTo stops at the NUL but throws if the text is longer than the fixed buffer, so the
         // length is clamped first. Windows truncates a balloon silently otherwise, and a notification
@@ -643,6 +657,17 @@ public sealed partial class TrayIcon : IDisposable
                 case IDC_CODEC_H264:
                     ApplySetting("Codec", "H.264", c => c.VideoCodec = "h264", live: false);
                     break;
+                case IDC_NOTIFY_OVERLAY:
+                    // Live: the next clip uses the new style immediately. Which notifier is actually
+                    // wired is decided in ScreenCapture.RunVideo from capture.Config, so it just works.
+                    ApplySetting("Notification", "Game Overlay", c => c.NotificationType = "overlay", live: true);
+                    break;
+                case IDC_NOTIFY_TOAST:
+                    ApplySetting("Notification", "Windows Toast", c => c.NotificationType = "windows_toast", live: true);
+                    break;
+                case IDC_NOTIFY_NONE:
+                    ApplySetting("Notification", "Sound Only", c => c.NotificationType = "none", live: true);
+                    break;
                 case IDC_PICK_FOLDER:
                     PickClipsFolder();
                     break;
@@ -745,6 +770,14 @@ public sealed partial class TrayIcon : IDisposable
             (IDC_CODEC_HEVC, "HEVC / H.265  (sharper at the same bitrate)", config.UseHevc),
             (IDC_CODEC_H264, "H.264  (wider compatibility)", !config.UseHevc));
 
+        // How a saved clip is announced. The overlay is the Medal / ShadowPlay-style game card;
+        // the toast is the plain (now silent) Windows balloon; Sound Only shows nothing and lets the
+        // built-in sound be the whole feedback.
+        var notifications = Submenu(menu, "Notifications",
+            (IDC_NOTIFY_OVERLAY, "Game Overlay (Medal style)", config.UseOverlayNotification),
+            (IDC_NOTIFY_TOAST, "Windows Toast", config.UseWindowsToastNotification),
+            (IDC_NOTIFY_NONE, "Sound Only", !config.UseOverlayNotification && !config.UseWindowsToastNotification));
+
         // Two independent submenus instead of three presets. The binding currently in force is named in
         // the title and carries the check mark, so the answer to "what is F9 doing right now?" is on
         // screen without opening anything -- which the old preset list could not do, since it showed
@@ -762,7 +795,7 @@ public sealed partial class TrayIcon : IDisposable
         // Keep the handles alive until after the parent menu is shown; the OS reads them during
         // TrackPopupMenuEx, not during AppendMenu.
         _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = codec;
-        _ = shortKey; _ = longKey; _ = quota;
+        _ = notifications; _ = shortKey; _ = longKey; _ = quota;
     }
 
     /// <summary>

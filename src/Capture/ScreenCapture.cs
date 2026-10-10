@@ -621,9 +621,27 @@ internal sealed partial class ScreenCapture : IDisposable
         // stopping from the menu would leave the ffmpeg pipes and the ring buffer unwritten.
         using var trayIcon = tray ? new TrayIcon(capture.Config, Path.GetDirectoryName(videoPath)!, capture.RequestStop) : null;
         trayIcon?.Start();
+
+        // Route the "clip saved" visual to what the config asked for: the Medal-style overlay card
+        // (its own non-activating window), the now-silent Windows toast, or nothing at all (sound
+        // only). The overlay degrades to the toast if its layered window could not be created, so a
+        // saved clip is never announced by silence. The confirmation SOUND is separate and unchanged.
+        using var overlay = capture.Config.UseOverlayNotification ? new OverlayNotification() : null;
+        overlay?.Start();
+
+        // Wire the "clip saved" visual independent of the tray: the overlay card is its own window and
+        // works even without an icon; only the toast fallback needs the tray to exist.
+        if (overlay is not null && overlay.IsReady)
+            capture.notify = overlay.Show;
+        else if (capture.Config.UseWindowsToastNotification && trayIcon is not null)
+            capture.notify = trayIcon.ShowNotification;
+        else if (capture.Config.UseOverlayNotification && trayIcon is not null)
+            // "overlay" whose window could not be built: fall back to the (now silent) toast so a
+            // saved clip is never announced by nothing but a sound.
+            capture.notify = trayIcon.ShowNotification;
+
         if (trayIcon is not null)
         {
-            capture.notify = trayIcon.ShowNotification;
             capture.tray = trayIcon;
 
             if (updated)

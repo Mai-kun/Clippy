@@ -35,6 +35,29 @@ public sealed class ClippyConfig
     public string CustomSoundPath { get; set; } = "";
 
     /// <summary>
+    /// How a saved clip is announced visually:
+    /// "overlay" (the default) shows a compact Medal / ShadowPlay-style game card in the top-right
+    /// corner that never steals focus from a running game;
+    /// "windows_toast" shows the plain Windows notification balloon;
+    /// "none" shows no visual window at all -- the built-in sound (if <see cref="PlaySoundNotification"/>)
+    /// is the only feedback.
+    ///
+    /// A preference, not a requirement: an unknown value falls back to "overlay", and if the overlay
+    /// window cannot be created the code degrades to the toast rather than announcing a clip by silence.
+    /// </summary>
+    public string NotificationType { get; set; } = "overlay";
+
+    /// <summary>The only notification-style values this class accepts; anything else falls back to the default.</summary>
+    public static readonly string[] SupportedNotificationTypes = ["overlay", "windows_toast", "none"];
+
+    /// <summary>True when the config asks for the Medal-style game overlay card.</summary>
+    public bool UseOverlayNotification => string.Equals(NotificationType, "overlay", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when the config asks for the plain Windows toast balloon.</summary>
+    public bool UseWindowsToastNotification => string.Equals(NotificationType, "windows_toast", StringComparison.OrdinalIgnoreCase);
+
+
+    /// <summary>
     /// Start with the console hidden, living only in the tray. False by default: while the recorder
     /// is being developed the log is the whole point, and a process that vanishes into the tray
     /// looks identical to one that crashed on startup.
@@ -211,6 +234,10 @@ public sealed class ClippyConfig
             // encoder: a typo in a config file must not stop the recorder, same as everywhere else.
             if (!SupportedVideoCodecs.Contains(config.VideoCodec, StringComparer.OrdinalIgnoreCase))
                 config.VideoCodec = "hevc";
+            // An unknown notification style falls back to the overlay default, same rationale as the
+            // codec: a typo must not stop the recorder, it just picks the default look.
+            if (!SupportedNotificationTypes.Contains(config.NotificationType, StringComparer.OrdinalIgnoreCase))
+                config.NotificationType = "overlay";
 
             // At startup as well as after every save. Startup is the half that matters: it is the only
             // moment the user is not actively recording, so it is the safe time to reclaim a few hundred
