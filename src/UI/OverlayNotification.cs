@@ -29,15 +29,15 @@ internal sealed partial class OverlayNotification : IDisposable
     private const int BaseWidth = 320;
     private const int BaseHeight = 65;
     private const int BaseCornerRadius = 12;
-    private const int BaseBorder = 2;
+    private const int BaseBorder = 1;
     private const int BaseMargin = 16;
 
-    // Icon at the left, vertically centred; text to its right.
-    private const int BaseIconSize = 32;
-    private const int BaseIconX = 14;
-    private const int BaseTextX = 58;
-    private const int BaseTitleY = 13;
-    private const int BaseMessageY = 35;
+    // Text only, no left-hand icon: the inset is the same on both sides, so the two lines read as
+    // one centred block instead of a label stuck beside a picture.
+    private const int BaseTextX = 14;
+    // Vertical rhythm of the two lines: title, a small gap, subtitle. Layout() centres the whole
+    // block on the card's height, so this gap is the only thing separating the lines.
+    private const int BaseLineGap = 4;
 
     // Font heights are in pixels here (the memory DC is a screen DC, so 1 unit = 1 pixel) and are
     // the one place the scale has to reach: a 16 px title on a 200% monitor must be 32 px or it is
@@ -94,7 +94,6 @@ internal sealed partial class OverlayNotification : IDisposable
     private const uint ULW_ALPHA = 0x00000002;
     private const byte AC_SRC_OVER = 0x00;
     private const byte AC_SRC_ALPHA = 0x01;
-    private const uint DI_NORMAL = 0x0003;
     private const int TRANSPARENT_BK = 1;
     private const int DEFAULT_CHARSET = 1;
     private const int FW_BOLD = 700;
@@ -104,7 +103,7 @@ internal sealed partial class OverlayNotification : IDisposable
 
     // COLORREF values are 0x00BBGGRR.
     private const uint BgColor = 0x001E1E1E;      // #1E1E1E dark card
-    private const uint AccentColor = 0x002A2AE8;  // red accent border
+    private const uint BorderColor = 0x003D3D3D;  // #3D3D3D neutral dark grey hairline
     private const uint TitleColor = 0x00F0F0F0;   // near-white bold title
     private const uint MessageColor = 0x00AAAAAA; // grey message
 
@@ -124,11 +123,10 @@ internal sealed partial class OverlayNotification : IDisposable
     private nint dib;
     private nint oldBitmap;
     private nint bitsPtr;
-    private nint accentBrush;
+    private nint borderBrush;
     private nint bgBrush;
     private nint titleFont;
     private nint messageFont;
-    private nint iconHandle;
     private int posX;
     private int posY;
     private Phase phase = Phase.Idle;
@@ -147,16 +145,15 @@ internal sealed partial class OverlayNotification : IDisposable
     internal int Height;
     internal int Margin;
     internal int MessageY;
+    internal int TitleY;
+    internal int TextX;
+    internal int Border;
+    /// <summary>Height of the two text lines plus the gap between them; what <see cref="TitleY"/> centres.</summary>
+    internal int TextHeight;
     internal int TitleFontPx;
     private int messageFontPx = BaseMessageFontPx;
 
     private int CornerRadius = BaseCornerRadius;
-    private int Border = BaseBorder;
-    private int IconSize = BaseIconSize;
-    private int IconX = BaseIconX;
-    private int IconY;
-    private int TextX = BaseTextX;
-    private int TitleY = BaseTitleY;
 
     // Kept alive for the life of the window: if the GC collected the delegate while the window still
     // existed, Windows would call into freed memory.
@@ -275,7 +272,7 @@ internal sealed partial class OverlayNotification : IDisposable
         FreeGraphicsResources();
     }
 
-    /// <summary>Creates the memory DC and the app icon, both DPI-independent, then the per-size DIB.</summary>
+    /// <summary>Creates the memory DC, then the per-size DIB.</summary>
     private unsafe void CreateGraphicsResources()
     {
         var screenDc = GetDC(0);
@@ -283,7 +280,6 @@ internal sealed partial class OverlayNotification : IDisposable
         if (screenDc != 0)
             ReleaseDC(0, screenDc);
 
-        iconHandle = LoadApplicationIcon();
         ResizeGraphics();
     }
 
@@ -307,7 +303,7 @@ internal sealed partial class OverlayNotification : IDisposable
         }
         if (titleFont != 0) { DeleteObject(titleFont); titleFont = 0; }
         if (messageFont != 0) { DeleteObject(messageFont); messageFont = 0; }
-        if (accentBrush != 0) { DeleteObject(accentBrush); accentBrush = 0; }
+        if (borderBrush != 0) { DeleteObject(borderBrush); borderBrush = 0; }
         if (bgBrush != 0) { DeleteObject(bgBrush); bgBrush = 0; }
 
         var header = new BitmapInfoHeader
@@ -324,7 +320,7 @@ internal sealed partial class OverlayNotification : IDisposable
         if (dib != 0 && bitsPtr != 0)
             oldBitmap = SelectObject(memDc, dib);
 
-        accentBrush = CreateSolidBrush(AccentColor);
+        borderBrush = CreateSolidBrush(BorderColor);
         bgBrush = CreateSolidBrush(BgColor);
 
         // CreateFont's height is in pixels on a screen DC and must be negative for "cell height",
@@ -347,11 +343,10 @@ internal sealed partial class OverlayNotification : IDisposable
         }
 
         if (dib != 0) { DeleteObject(dib); dib = 0; }
-        if (accentBrush != 0) { DeleteObject(accentBrush); accentBrush = 0; }
+        if (borderBrush != 0) { DeleteObject(borderBrush); borderBrush = 0; }
         if (bgBrush != 0) { DeleteObject(bgBrush); bgBrush = 0; }
         if (titleFont != 0) { DeleteObject(titleFont); titleFont = 0; }
         if (messageFont != 0) { DeleteObject(messageFont); messageFont = 0; }
-        // The icon handle from ExtractIconEx is deliberately never destroyed; see TrayIcon.
     }
 
     /// <summary>
@@ -413,14 +408,17 @@ internal sealed partial class OverlayNotification : IDisposable
         CornerRadius = Scaled(BaseCornerRadius);
         Border = Math.Max(1, Scaled(BaseBorder));
         Margin = Scaled(BaseMargin);
-        IconSize = Scaled(BaseIconSize);
-        IconX = Scaled(BaseIconX);
-        IconY = (Height - IconSize) / 2;
         TextX = Scaled(BaseTextX);
-        TitleY = Scaled(BaseTitleY);
-        MessageY = Scaled(BaseMessageY);
         TitleFontPx = Scaled(BaseTitleFontPx);
         messageFontPx = Scaled(BaseMessageFontPx);
+
+        // One text block, centred as a whole: title + gap + subtitle. Centring each line separately
+        // would leave the two lines drifting apart as the card and the fonts scale at different
+        // rounding steps, which is exactly the "the text sits low" look this replaces.
+        var lineGap = Scaled(BaseLineGap);
+        TextHeight = TitleFontPx + lineGap + messageFontPx;
+        TitleY = (Height - TextHeight) / 2;
+        MessageY = TitleY + TitleFontPx + lineGap;
     }
 
     private int Scaled(int design) => (int)MathF.Round(design * layoutScale);
@@ -446,16 +444,6 @@ internal sealed partial class OverlayNotification : IDisposable
 
     /// <summary>Top-right of the work area (the screen minus the taskbar), with a margin.</summary>
     private readonly record struct Placement(int X, int Y, uint Dpi);
-
-    /// <summary>The icon embedded in this exe, or 0 when there is none.</summary>
-    private static nint LoadApplicationIcon()
-    {
-        var path = Environment.ProcessPath;
-        if (!string.IsNullOrEmpty(path) && ExtractIconEx(path, 0, out _, out var icon, 1) && icon != 0)
-            return icon;
-
-        return LoadIcon(0, new nint(32512)); // IDI_APPLICATION
-    }
 
     private nint WndProc(nint hWnd, int message, nint wParam, nint lParam)
     {
@@ -643,15 +631,17 @@ internal sealed partial class OverlayNotification : IDisposable
         var title = Fit(pendingTitle, TitleMaxChars);
         var message = Fit(pendingMessage, MessageMaxChars);
 
-        var outer = CreateRoundRectRgn(0, 0, Width, Height, CornerRadius * 2, CornerRadius * 2);
-        var inner = CreateRoundRectRgn(Border, Border, Width - Border, Height - Border,
+        // GDI's round-rect region is exclusive of its right and bottom edges: CreateRoundRectRgn(0, 0,
+        // W, H) covers x in [0, W-1] but y only up to H-2, so the last row and column of the card
+        // were never painted -- the bottom border came out transparent black against a dark game.
+        // The +1 makes the region reach the final pixel; the interior is inset the same way, so the
+        // hairline keeps its 1 px thickness on all four sides.
+        var outer = CreateRoundRectRgn(0, 0, Width + 1, Height + 1, CornerRadius * 2, CornerRadius * 2);
+        var inner = CreateRoundRectRgn(Border, Border, Width - Border + 1, Height - Border + 1,
             (CornerRadius - Border) * 2, (CornerRadius - Border) * 2);
 
-        FillRgn(memDc, outer, accentBrush); // accent border ring
+        FillRgn(memDc, outer, borderBrush); // hairline border ring
         FillRgn(memDc, inner, bgBrush);     // dark interior
-
-        if (iconHandle != 0)
-            DrawIconEx(memDc, IconX, IconY, IconSize, IconSize, iconHandle, 0, 0, DI_NORMAL);
 
         SetBkMode(memDc, TRANSPARENT_BK);
 
@@ -681,6 +671,45 @@ internal sealed partial class OverlayNotification : IDisposable
     /// <summary>Truncates with an ellipsis so text never runs past the card.</summary>
     private static string Fit(string text, int max) =>
         text.Length <= max ? text : string.Concat(text.AsSpan(0, max - 1), "\u2026");
+
+    /// <summary>
+    /// Renders one card into an off-screen DIB and returns its BGRA pixels, so a test can assert on
+    /// what actually reaches the screen -- the hairline's colour, and where the ink starts and stops
+    /// -- rather than only on the numbers <see cref="Layout"/> computed. Both are needed: every
+    /// measurement can be right while the drawn card is wrong (a stale brush, a column of icon that
+    /// no layout metric reserves room for any more).
+    ///
+    /// The DC, DIB and fonts are all made and freed on the calling thread, because a GDI DC may only
+    /// be deleted by the thread that created it. The overlay's own pump thread is never started
+    /// here, so this draws without a window existing at all.
+    /// </summary>
+    internal unsafe byte[] RenderForTest(string title, string message, uint dpi = 96)
+    {
+        Layout(dpi);
+        CreateGraphicsResources();
+        if (memDc == 0 || bitsPtr == 0)
+        {
+            FreeGraphicsResources();
+            throw new InvalidOperationException(
+                "No GDI device context in this session, so the card cannot be rendered off-screen.");
+        }
+
+        pendingTitle = title;
+        pendingMessage = message;
+        RenderCard();
+
+        var pixels = new byte[Width * Height * 4];
+        new Span<byte>((void*)bitsPtr, pixels.Length).CopyTo(pixels);
+        FreeGraphicsResources();
+        return pixels;
+    }
+
+    /// <summary>The pixel at (x, y) of a DIB rendered by <see cref="RenderForTest"/>.</summary>
+    internal static (byte blue, byte green, byte red) PixelAt(byte[] pixels, int width, int x, int y)
+    {
+        var i = (y * width + x) * 4;
+        return (pixels[i], pixels[i + 1], pixels[i + 2]);
+    }
 
     /// <summary>Whether (x, y) lies inside the card's rounded rectangle of radius <see cref="CornerRadius"/>.</summary>
     private bool InsideRoundedRect(int x, int y)
@@ -880,12 +909,6 @@ internal sealed partial class OverlayNotification : IDisposable
     [LibraryImport("user32.dll", EntryPoint = "ReleaseDC")]
     private static partial int ReleaseDC(nint hWnd, nint hdc);
 
-    [LibraryImport("user32.dll", EntryPoint = "DrawIconEx")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool DrawIconEx(
-        nint hdc, int xLeft, int yTop, int cxWidth, int cyHeight,
-        nint hIcon, uint istepIfAniCur, nint hbrFlickerFreeDraw, uint diFlags);
-
     [LibraryImport("gdi32.dll", EntryPoint = "CreateCompatibleDC")]
     private static partial nint CreateCompatibleDC(nint hdc);
 
@@ -929,13 +952,6 @@ internal sealed partial class OverlayNotification : IDisposable
     [LibraryImport("gdi32.dll", EntryPoint = "TextOutW", StringMarshalling = StringMarshalling.Utf16)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool TextOut(nint hdc, int x, int y, string text, int count);
-
-    [LibraryImport("user32.dll", EntryPoint = "LoadIconW", StringMarshalling = StringMarshalling.Utf16)]
-    private static partial nint LoadIcon(nint instance, nint name);
-
-    [LibraryImport("shell32.dll", EntryPoint = "ExtractIconExW", StringMarshalling = StringMarshalling.Utf16)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool ExtractIconEx(string exePath, int iconIndex, out nint large, out nint small, uint count);
 
     [LibraryImport("kernel32.dll", EntryPoint = "GetModuleHandleW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial nint GetModuleHandle(string? name);

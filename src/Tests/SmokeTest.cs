@@ -27,6 +27,9 @@ internal static class SmokeTest
         failures += Check("Folder picker: runs on an STA thread", FolderPickerApartment);
         failures += Check("Clip naming: ISO stamp sorts chronologically and never collides", ClipNaming);
         failures += Check("Overlay: card lands on the target monitor and scales with its DPI", OverlayPlacement);
+        failures += Check("Overlay: text block is centred and the border is a hairline", OverlayLayout);
+        failures += Check("Overlay: rendered card has a neutral hairline and symmetric insets", OverlayPixels);
+        failures += Check("Clip stamp: duration rounds to the nearest second", ClipDurationRounding);
 
         Console.WriteLine(failures == 0 ? "SMOKE: OK" : $"SMOKE: FAILED ({failures})");
         return failures;
@@ -337,6 +340,224 @@ private static void FolderPickerApartment()
                 overlay.Layout(d);
                 return $"{overlay.Width}px @{d}";
             })));
+    }
+
+    /// <summary>
+    /// The two failure modes of the card's typography, neither of which throws and neither of which
+    /// shows up anywhere but on a real monitor next to a game:
+    ///
+    ///   * unequal insets. The icon column used to push the text 58 px in while the right edge sat
+    ///     at 14, so the card read lopsided; the text inset is now the same number on both sides.
+    ///   * a text block that is not centred as a whole. Centring each line independently, or leaving
+    ///     the two at fixed offsets, drifts as the card and the fonts scale at different rounding
+    ///     steps -- the "the text sits low in the box" look.
+    ///
+    /// Only the arithmetic, for the same reason OverlayPlacement only checks the arithmetic.
+    /// </summary>
+    private static void OverlayLayout()
+    {
+        foreach (var (dpi, ratio) in new[] { (96u, 1f), (120u, 1.25f), (144u, 1.5f), (192u, 2f) })
+        {
+            using var overlay = new OverlayNotification();
+            overlay.Layout(dpi);
+
+            // 1 px at 96 DPI and scaling with it from there, like every other dimension on the card:
+            // a hairline that stayed 1 physical pixel would look thinner on a 150% display than on a
+            // 100% one, and the point of the neutral border is that it reads the same everywhere.
+            var expectedBorder = Math.Max(1, (int)MathF.Round(ratio));
+            if (overlay.Border != expectedBorder)
+                throw new InvalidOperationException(
+                    $"{dpi} DPI: border is {overlay.Border} px, expected the {expectedBorder} px hairline");
+
+            var expectedTextX = (int)MathF.Round(14 * ratio);
+            if (overlay.TextX != expectedTextX)
+                throw new InvalidOperationException(
+                    $"{dpi} DPI: text inset {overlay.TextX}, expected {expectedTextX} (symmetric with the right inset)");
+
+            // title + gap + subtitle is what TitleY centres on: the space above the block must equal
+            // the space below it, to the pixel the odd/even split loses.
+            var expectedTextHeight = (int)MathF.Round(16 * ratio) + (int)MathF.Round(4 * ratio)
+                                   + (int)MathF.Round(14 * ratio);
+            if (overlay.TextHeight != expectedTextHeight)
+                throw new InvalidOperationException(
+                    $"{dpi} DPI: text block is {overlay.TextHeight} px tall, expected {expectedTextHeight}");
+
+            var above = overlay.TitleY;
+            var below = overlay.Height - (overlay.TitleY + overlay.TextHeight);
+            if (Math.Abs(above - below) > 1)
+                throw new InvalidOperationException(
+                    $"{dpi} DPI: text block is not vertically centred ({above} px above, {below} px below)");
+
+            // The whole block has to stay inside the card, or the subtitle would be drawn over the
+            // border. TextHeight already covers both lines plus the gap, so TitleY + TextHeight is
+            // the block's bottom edge -- MessageY is inside it, not below it.
+            if (overlay.TitleY < overlay.Border ||
+                overlay.TitleY + overlay.TextHeight > overlay.Height - overlay.Border)
+                throw new InvalidOperationException(
+                    $"{dpi} DPI: text block overflows the card (y={overlay.TitleY}.." +
+                    $"{overlay.TitleY + overlay.TextHeight} inside a {overlay.Height} px card)");
+        }
+
+        Console.WriteLine("       1 px border, symmetric 14 px inset, text block centred at every DPI");
+    }
+
+    /// <summary>
+    /// The same card, but measured in the pixels GDI actually produced instead of the numbers
+    /// Layout() computed. This is what catches a neutral border that is only neutral in the constant
+    /// (a brush still holding the old red), an icon column that the layout no longer reserves room
+    /// for but whose drawing call was left behind, and text that does not start on the left inset --
+    /// none of which the arithmetic above can see, because it never opens a DC.
+    ///
+    /// It also prints the card as text, which is the only way to eyeball its balance on a machine
+    /// with no display attached.
+    /// </summary>
+    private static void OverlayPixels()
+    {
+        const string title = "Clip Saved";
+        const string message = "0:30 · 12.4 MB";
+
+        using var overlay = new OverlayNotification();
+        var pixels = overlay.RenderForTest(title, message, 96);
+        var w = overlay.Width;
+
+        // The hairline itself, sampled on the top edge away from the rounded corners: it must be
+        // exactly #3D3D3D. Sampling the pixel inside it too is what proves the ring is one pixel
+        // wide -- that one has to be the card's #1E1E1E, not the border colour a second time.
+        var (b, g, r) = OverlayNotification.PixelAt(pixels, w, w / 2, 0);
+        ExpectNeutral(0x3D, r, g, b, "border at top edge");
+        (b, g, r) = OverlayNotification.PixelAt(pixels, w, w / 2, 1);
+        if (r != 0x1E || g != 0x1E || b != 0x1E)
+            throw new InvalidOperationException(
+                $"Border is not 1 px: the pixel inside it is #{r:X2}{g:X2}{b:X2}, expected #1E1E1E");
+
+        // The bottom edge must match the top one. A frame that is drawn on the top row but not the
+        // last row reads as a card with a missing bottom border -- a GDI round-rect region stops one
+        // row short of the rectangle it was given, so this is exactly the seam that can slip.
+        (b, g, r) = OverlayNotification.PixelAt(pixels, w, w / 2, overlay.Height - 1);
+        ExpectNeutral(0x3D, r, g, b, "border at bottom edge");
+        (b, g, r) = OverlayNotification.PixelAt(pixels, w, w / 2, overlay.Height - 2);
+        if (r != 0x1E || g != 0x1E || b != 0x1E)
+            throw new InvalidOperationException(
+                $"Bottom border is not 1 px: the pixel inside it is #{r:X2}{g:X2}{b:X2}, expected #1E1E1E");
+
+        // Ink is measured strictly inside the frame, so the border ring itself is never mistaken for
+        // text -- the rightmost column of the bitmap is frame, and counting it would report every
+        // line as running off the card.
+        var left = int.MaxValue;
+        var right = 0;
+
+        MeasureLine(overlay, pixels, title, overlay.TitleY,
+            overlay.TitleY + overlay.TitleFontPx, ref left, ref right);
+        MeasureLine(overlay, pixels, message, overlay.MessageY,
+            overlay.MessageY + overlay.TitleFontPx, ref left, ref right);
+
+        // A glyph's stem starts a hair inside its advance origin, so allow the outer pixel or two;
+        // a column reserved for an icon shifts the first ink by tens of pixels, not two.
+        if (left > overlay.TextX + 2)
+            throw new InvalidOperationException(
+                $"Text starts {left} px in, past the {overlay.TextX} px inset plus 2 px of bearing -- " +
+                "something is still reserving space on the left");
+
+        var rightLimit = w - overlay.Margin;
+        if (right > rightLimit)
+            throw new InvalidOperationException(
+                $"Text runs to {right} px, past the {rightLimit} px right inset");
+
+        // The card, as text: the balance that is the whole point of this change is visible here
+        // rather than only asserted, and a regression shows up in a diff of this line.
+        Console.WriteLine($"       {w}x{overlay.Height} px card, border #3D3D3D, text {left}..{right} " +
+                          $"of insets {overlay.TextX}..{rightLimit}");
+        DumpCard(overlay, pixels);
+    }
+
+    private static void ExpectNeutral(int expected, byte r, byte g, byte b, string label)
+    {
+        if (r != expected || g != expected || b != expected)
+            throw new InvalidOperationException(
+                $"{label}: got #{r:X2}{g:X2}{b:X2}, expected #{expected:X2}{expected:X2}{expected:X2}");
+    }
+
+    /// <summary>
+    /// Widens the bounding box of one line's ink to cover both lines passed so far. Rows are scanned
+    /// only inside the line's own band, so the other line's ascenders cannot contaminate it.
+    /// </summary>
+    private static void MeasureLine(
+        OverlayNotification overlay, byte[] pixels, string text,
+        int rowFrom, int rowTo, ref int left, ref int right)
+    {
+        var w = overlay.Width;
+        var found = false;
+
+        for (var y = rowFrom; y < rowTo; y++)
+        {
+            for (var x = overlay.Border; x <= w - overlay.Border - 1; x++)
+            {
+                var (b, g, r) = OverlayNotification.PixelAt(pixels, w, x, y);
+                // Anything that is neither the card nor the frame colour is glyph ink.
+                if ((r == 0x1E && g == 0x1E && b == 0x1E) || (r == 0x3D && g == 0x3D && b == 0x3D))
+                    continue;
+
+                found = true;
+                if (x < left) left = x;
+                if (x > right) right = x;
+            }
+        }
+
+        if (!found)
+            throw new InvalidOperationException(
+                $"'{text}' was not drawn at all, so its placement cannot be measured");
+    }
+
+    /// <summary>
+    /// Prints the rendered card as ASCII: frame, interior and glyph ink. One character per four
+    /// pixels, which keeps a 320 px card inside a line of console output while still showing where
+    /// the text sits.
+    /// </summary>
+    private static void DumpCard(OverlayNotification overlay, byte[] pixels)
+    {
+        var w = overlay.Width;
+        for (var y = 0; y < overlay.Height; y += 2)
+        {
+            var line = new System.Text.StringBuilder();
+            for (var x = 0; x < w; x += 2)
+            {
+                var (b, g, r) = OverlayNotification.PixelAt(pixels, w, x, y);
+                line.Append((r, g, b) switch
+                {
+                    (0x3D, 0x3D, 0x3D) => '#',   // frame
+                    (0x1E, 0x1E, 0x1E) => '.',   // card interior
+                    _ => '@',                    // glyph ink
+                });
+            }
+
+            Console.WriteLine($"       |{line}|");
+        }
+    }
+
+    /// <summary>
+    /// A clip the encoder closes at 29.96 s is a 30 s clip to the player. Truncating instead of
+    /// rounding printed "0:29", which reads as a recorder that came up a second short -- the exact
+    /// complaint this rounding was introduced for. AwayFromZero, so 179.96 s is 3:00 and not 2:59.
+    /// </summary>
+    private static void ClipDurationRounding()
+    {
+        Expect((int)Math.Round(29.96, MidpointRounding.AwayFromZero), 30, "29.96 s");
+        Expect((int)Math.Round(179.96, MidpointRounding.AwayFromZero), 180, "179.96 s");
+        Expect((int)Math.Round(0.4, MidpointRounding.AwayFromZero), 0, "0.4 s");
+        Expect((int)Math.Round(0.5, MidpointRounding.AwayFromZero), 1, "0.5 s (ties go up)");
+
+        Expect(ScreenCapture.ClipStamp(30), "0:30", "stamp of 30 s");
+        Expect(ScreenCapture.ClipStamp(180), "3:00", "stamp of 180 s");
+        Expect(ScreenCapture.ClipStamp(9), "0:09", "stamp of 9 s");
+        Expect(ScreenCapture.ClipStamp(60), "1:00", "stamp of 60 s");
+
+        Console.WriteLine("       29.96 s -> 0:30, 179.96 s -> 3:00");
+    }
+
+    private static void Expect(int actual, int expected, string label)
+    {
+        if (actual != expected)
+            throw new InvalidOperationException($"{label}: expected {expected}, got {actual}");
     }
 
     /// <summary>Stand-in for GDI's RECT in the placement check; no Win32 call can take a monitor.</summary>

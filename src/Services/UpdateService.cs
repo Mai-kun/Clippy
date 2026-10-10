@@ -224,7 +224,8 @@ internal static class UpdateService
             Log($"Downloaded installer successfully ({new FileInfo(setupPath).Length} bytes).");
             notify?.Invoke("Clippy Update", "Installing...");
 
-            // В цепочке cmd.exe запускаем установщик, ждём завершения (&) и стартуем обновлённый Clippy с флагом --updated:
+            // One cmd.exe chain: launch the installer, wait for it to finish (&), then start the
+            // updated Clippy with the --updated flag:
             string cmdLine = $"/c \"%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul & \"{setupPath}\" /VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS /NORESTART & start \"\" \"{Path.Combine(appDir, "Clippy.exe")}\" --updated\"";
             Log($"Launching installer via: cmd.exe {cmdLine}");
 
@@ -253,7 +254,7 @@ internal static class UpdateService
                 Process.Start(new ProcessStartInfo
                 {
                     FileName = setupPath,
-                    UseShellExecute = true // Открывает стандартный визард Inno Setup с окном
+                    UseShellExecute = true // Opens the standard Inno Setup wizard with a window
                 });
                 Environment.Exit(0);
             }

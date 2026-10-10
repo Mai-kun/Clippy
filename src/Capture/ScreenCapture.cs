@@ -331,12 +331,17 @@ internal sealed partial class ScreenCapture : IDisposable
 
         // The card says what the player actually wants to know -- how long the clip is and what it
         // cost in disk -- not a technical path they would have to go and read off a file manager.
-        var saved = TimeSpan.FromSeconds(clipSeconds);
+        //
+        // Rounded, not truncated: a 30 s clip that the encoder closed at 29.96 s is 30 s to the
+        // player, and "0:29" reads as a clip that came up a second short -- i.e. as a recorder bug,
+        // not as a GOP boundary. AwayFromZero so .5 always goes up, which is the direction a user
+        // complaining about a short clip would expect.
+        var totalSeconds = (int)Math.Round(clipSeconds, MidpointRounding.AwayFromZero);
         try
         {
             notify?.Invoke(
-                "Клип сохранён",
-                $"{(int)saved.TotalMinutes}:{saved.Seconds:D2} · {FileMegabytes(path):F1} МБ");
+                "Clip Saved",
+                $"{ClipStamp(totalSeconds)} · {FileMegabytes(path):F1} MB");
         }
         catch (Exception ex)
         {
@@ -371,6 +376,14 @@ internal sealed partial class ScreenCapture : IDisposable
 
         return path;
     }
+
+    /// <summary>
+    /// m:ss for the overlay card, from a whole-second count that has already been rounded to the
+    /// nearest second. Minutes are NOT padded and seconds always are, so the line grows only when
+    /// it has to: "0:30" reads as half a minute, "03:00" would just be wider.
+    /// </summary>
+    internal static string ClipStamp(int totalSeconds) =>
+        $"{totalSeconds / 60}:{totalSeconds % 60:D2}";
 
     /// <summary>Megabytes actually on disk, so the toast reports a real size and not a bitrate guess.</summary>
     private static double FileMegabytes(string path)
@@ -720,7 +733,7 @@ internal sealed partial class ScreenCapture : IDisposable
 
             if (updated)
             {
-                trayIcon.ShowNotification("Clippy", $"Программа успешно обновлена до версии {UpdateService.CurrentVersion}!");
+                trayIcon.ShowNotification("Clippy", $"Program successfully updated to version {UpdateService.CurrentVersion}!");
             }
 
             // Fire and forget, deliberately. This is a network call on the way to recording, and a

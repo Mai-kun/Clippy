@@ -8,7 +8,7 @@ namespace Clippy;
 /// No ring buffer: the caller serialises writes, and a slow encoder simply drops capture pace.
 ///
 /// Audio is NOT handled here: it runs in its own process (FfmpegAudioEncoder). Two live inputs in one
-/// ffmpeg deadlocked вЂ” measured 6 audio packets read out of ~450 while video flowed fine.
+/// ffmpeg deadlocked -- measured 6 audio packets read out of ~450 while video flowed fine.
 /// </summary>
 internal sealed class FfmpegVideoEncoder : IVideoEncoder
 {
