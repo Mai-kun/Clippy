@@ -29,6 +29,15 @@
     <PackageReference Include="Vortice.Win32.Graphics.Imaging" Version="2.5.0" />
   </ItemGroup>
 
+  <!-- The default notification sound, compiled INTO the exe so a portable install ships one file
+       and an empty CustomSoundPath still plays something. LogicalName pins the manifest name to
+       DefaultSound.wav (no namespace prefix); that string is hard-coded in
+       ExportNotification.LoadEmbeddedSound, so renaming either side silently degrades to
+       MessageBeep, and the "embedded default sound" smoke check is what catches it. -->
+  <ItemGroup>
+    <EmbeddedResource Include="assets\sounds\sound.wav" LogicalName="DefaultSound.wav" />
+  </ItemGroup>
+
   <!-- A portable folder: ffmpeg.exe dropped next to the binary is used in preference to PATH, and
        both the default config and the bundled tool travel with the published app. -->
   <ItemGroup>

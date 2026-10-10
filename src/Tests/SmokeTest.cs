@@ -22,6 +22,7 @@ internal static class SmokeTest
     failures += Check("Tray menu: hotkey choices are unique, bindable and do not clash", HotkeyChoices);
         failures += Check("Tray menu: last clip is the newest one", LastClip);
         failures += Check("Export notification: custom sound path resolution", CustomSoundPath);
+        failures += Check("Export notification: embedded default sound plays from memory", EmbeddedSound);
         failures += Check("Folder picker: runs on an STA thread", FolderPickerApartment);
 
         Console.WriteLine(failures == 0 ? "SMOKE: OK" : $"SMOKE: FAILED ({failures})");
@@ -211,6 +212,27 @@ private static void FolderPickerApartment()
         Expect(ExportNotification.ResolveCustomSound(expected), expected, "existing absolute path");
 
         Console.WriteLine($"       custom sound resolves to {expected}");
+    }
+
+    /// <summary>
+    /// The default notification sound is compiled into the exe (assets\sounds\sound.wav as the
+    /// embedded resource DefaultSound.wav) and played through winmm from a pinned in-memory buffer,
+    /// so a portable install has nothing extra to ship. Both halves of that can break without any
+    /// compiler noticing: a wrong LogicalName in the csproj makes GetManifestResourceStream return
+    /// null, and a bad WAV image or unpinned buffer makes PlaySoundW refuse to start -- which is
+    /// why the assertion is on PlayExportSaved's return value (a wav really began playing) and not
+    /// merely on "it did not throw".
+    /// </summary>
+    private static void EmbeddedSound()
+    {
+        if (!ExportNotification.HasEmbeddedSound)
+            throw new InvalidOperationException(
+                "embedded resource 'DefaultSound.wav' is missing from this build (check Clippy.csproj)");
+
+        if (!ExportNotification.PlayExportSaved(null))
+            throw new InvalidOperationException("winmm refused the in-memory default sound");
+
+        Console.WriteLine("       embedded default sound plays from memory");
     }
 
     private static void Expect(string? actual, string? expected, string label)
