@@ -496,6 +496,16 @@ internal sealed partial class ScreenCapture : IDisposable
     private int frameCount;
     private bool disposed;
 
+    // ---- Frame limiter: at most ~60 fps reach the encoder ----
+    // Passthrough used to compress every delivered frame, so on a high-refresh display the NVENC
+    // chip worked at the display's rate even though replay clips never need more than 60. A frame
+    // arriving closer than MinFrameIntervalMs to the last ADMITTED one is dropped in
+    // OnFrameArrivedCore before any GPU copy -- and before the capture-rate calibration, which
+    // must measure the admitted rate, or the encoder would be told the raw delivery rate and fed
+    // a fraction of it, silently mis-scaling the bitrate.
+    private TimeSpan? lastEncodedFrameTime;
+    private const double MinFrameIntervalMs = 16.0;
+
     // ---- Capture rate calibration, for the direct NVENC path only ----
     //
     // NVENC is told a frame rate (init.frameRateNum) and splits the requested bitrate across it. If it
@@ -948,6 +958,18 @@ internal sealed partial class ScreenCapture : IDisposable
 
             var currentFrame = ++frameCount;
             LogFrameTiming();
+
+            // Frame limiter: nothing closer than MinFrameIntervalMs (16.0 ms ~ 60 fps) to the last
+            // admitted frame goes any further -- no GPU copy, no calibration tick, no encode. The
+            // `using var frame` above disposes the frame on this return, so the pool slot is
+            // released exactly as it would be on any other early exit.
+            if (videoPath is not null)
+            {
+                var now = stopwatch.Elapsed;
+                if (lastEncodedFrameTime is { } last && (now - last).TotalMilliseconds < MinFrameIntervalMs)
+                    return;
+                lastEncodedFrameTime = now;
+            }
 
             // The direct NVENC session waits here until the real delivery rate is known, because a
             // wrong rate silently multiplies the bitrate by delivered/declared. Frames that arrive

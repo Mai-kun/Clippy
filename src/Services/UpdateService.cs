@@ -25,7 +25,7 @@ internal readonly record struct UpdateInfo(bool Available, string Tag, string Do
 /// </summary>
 internal static class UpdateService
 {
-    public const string CurrentVersion = "v1.3.5";
+    public const string CurrentVersion = "v1.3.6";
     private const string ApiUrl = "https://api.github.com/repos/Mai-kun/Clippy/releases/latest";
 
     /// <summary>Installer, used when the running copy was installed by the setup.</summary>

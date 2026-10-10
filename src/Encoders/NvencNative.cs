@@ -126,7 +126,7 @@ internal static unsafe class NvencNativeSpike
             Console.WriteLine($"[FAIL] Nvenc_Open returned {rc}: {NvencNative.ErrorText}");
             return 1;
         }
-        Console.WriteLine("[ok] NVENC session open (H.264, preset P4, low-latency tuning, CBR, 1 IDR per second)");
+        Console.WriteLine("[ok] NVENC session open (H.264, preset P1, low-latency tuning, CBR, 1 IDR per second)");
 
         var outBuf = new byte[8 * 1024 * 1024];
         int totalBytes = 0, framesOut = 0, keyframes = 0, emptyFrames = 0;
