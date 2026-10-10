@@ -235,7 +235,28 @@ internal static class UpdateService
                 CreateNoWindow = true,
                 UseShellExecute = false,
             };
-            Process.Start(psi);
+
+            try
+            {
+                var silent = Process.Start(psi);
+                if (silent is null)
+                    throw new InvalidOperationException("cmd.exe did not start");
+            }
+            catch (Exception ex)
+            {
+                // Antivirus or the OS blocked the headless launch. The installer is already on disk,
+                // so rather than reporting failure, open it as the ordinary visible Inno Setup wizard:
+                // the user finishes the update by hand and nothing is lost. Environment.Exit so the
+                // wizard is not fighting a running copy of Clippy.exe for the files it must replace.
+                Log($"Silent launch failed ({ex.GetType().Name}: {ex.Message}); opening interactive installer.");
+                notify?.Invoke("Clippy Update", "Silent update failed, opening installer window...");
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = setupPath,
+                    UseShellExecute = true // Открывает стандартный визард Inno Setup с окном
+                });
+                Environment.Exit(0);
+            }
         }
         catch (Exception)
         {
