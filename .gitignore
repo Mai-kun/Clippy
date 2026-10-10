@@ -509,3 +509,4 @@ config.json
 src/native/clippy_nvenc.dll
 src/native/clippy_nvenc.exp
 src/native/clippy_nvenc.lib
+tools/
