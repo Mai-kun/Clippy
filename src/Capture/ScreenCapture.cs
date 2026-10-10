@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
@@ -305,9 +306,13 @@ internal sealed partial class ScreenCapture : IDisposable
             writer.AddAudioSample(finalAudio[i], finalAudioTimes[i]);
         }
 
-        var path = Path.Combine(outputDirectory, $"clip-{DateTime.Now:HHmmssfff}.mp4");
+        var path = ClipPath(outputDirectory, DateTime.Now);
         writer.BuildToFile(path);
         Console.WriteLine($"Export: wrote {path} ({writer.SampleCount} samples)");
+
+        // Reported NOW, while the slice is still in scope: after this line the packets are gone and
+        // there is nothing left to measure.
+        var clipSeconds = ActualClipSeconds(alignment);
 
         // The clip bytes are on disk and nothing points at them any more, but the GC does not hand the
         // pages back to Windows on its own: the heap stays reserved and the task manager keeps showing
@@ -324,14 +329,14 @@ internal sealed partial class ScreenCapture : IDisposable
             Console.WriteLine("Export: played the confirmation sound.");
         }
 
-        // Alongside the beep, not instead of it: the sound confirms to a user who is already looking
-        // at the screen, the balloon confirms to one who has switched away. The clip name is what
-        // they are actually looking for.
+        // The card says what the player actually wants to know -- how long the clip is and what it
+        // cost in disk -- not a technical path they would have to go and read off a file manager.
+        var saved = TimeSpan.FromSeconds(clipSeconds);
         try
         {
             notify?.Invoke(
-                "Clippy",
-                $"Clip saved: {Path.GetFileName(path)} ({durationSeconds:F0}s)");
+                "Клип сохранён",
+                $"{(int)saved.TotalMinutes}:{saved.Seconds:D2} · {FileMegabytes(path):F1} МБ");
         }
         catch (Exception ex)
         {
@@ -345,6 +350,75 @@ internal sealed partial class ScreenCapture : IDisposable
         ClipsQuota.Enforce(outputDirectory, config.MaxClipsFolderSizeGB);
 
         return path;
+    }
+
+    /// <summary>
+    /// clip_yyyy-MM-dd_HH-mm-ss.mp4: an ISO-shaped stamp instead of the old HHmmssfff. The point is
+    /// not readability alone -- zero-padded, widest-field-first fields mean a plain lexicographic sort
+    /// (Explorer's default, and any script's sort) IS chronological order, while "93000" sorted after
+    /// "101500" and a name told you nothing about which day it was.
+    /// </summary>
+    internal static string ClipPath(string directory, DateTime when)
+    {
+        var stamp = when.ToString("yyyy-MM-dd_HH-mm-ss", CultureInfo.InvariantCulture);
+        var path = Path.Combine(directory, $"clip_{stamp}.mp4");
+
+        // Two clips inside the same second used to collide and the second silently overwrote the
+        // first, losing a recording the user asked for. Keep the documented name for the common case
+        // and only add a suffix when that exact second is already taken.
+        for (var n = 2; File.Exists(path); n++)
+            path = Path.Combine(directory, $"clip_{stamp}-{n}.mp4");
+
+        return path;
+    }
+
+    /// <summary>Megabytes actually on disk, so the toast reports a real size and not a bitrate guess.</summary>
+    private static double FileMegabytes(string path)
+    {
+        try
+        {
+            return new FileInfo(path).Length / (1024.0 * 1024.0);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The bytes are already written at this point, so a stat failure is cosmetic: report 0
+            // rather than losing the notification over it.
+            Console.WriteLine($"Export: could not read the clip size ({ex.GetType().Name}).");
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// The clip's real length, as opposed to the length the caller asked for. They differ by up to a
+    /// GOP: the export advances to the first keyframe at or after the requested start (see the note
+    /// above), so a requested 30 s clip can be 29 s of video. The toast quoting the requested number
+    /// would then disagree with the file the player is about to open, which reads as a bug in the
+    /// recorder rather than as the encoder's GOP.
+    ///
+    /// Last sample time plus one frame interval -- a file's duration is the END of its last frame,
+    /// not its start. The video track wins when it is the longer one, because audio is padded with
+    /// silence to match it and never the other way round.
+    /// </summary>
+    private static double ActualClipSeconds(TrackAlignment alignment)
+    {
+        // frames / span is the measured frame rate, so a variable-frame capture reports honestly
+        // instead of assuming 25 fps.
+        var videoEnd = 0.0;
+        if (alignment.VideoTimes.Count > 0)
+        {
+            var last = alignment.VideoTimes[^1];
+            var frame = alignment.VideoTimes.Count > 1
+                ? (alignment.VideoTimes[^1] - alignment.VideoTimes[0]) / (alignment.VideoTimes.Count - 1)
+                : 1.0 / 25.0;
+            videoEnd = last + (frame > 0 ? frame : 1.0 / 25.0);
+        }
+
+        // 1024/48000 is one AAC frame, the unit the audio track is written in.
+        var audioEnd = alignment.AudioTimes.Count > 0
+            ? alignment.AudioTimes[^1] + 1024.0 / 48000.0
+            : 0.0;
+
+        return Math.Max(videoEnd, audioEnd);
     }
 
     /// <summary>

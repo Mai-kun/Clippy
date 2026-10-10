@@ -25,6 +25,23 @@ if (args.Contains("--console", StringComparer.OrdinalIgnoreCase) ||
     Console.SetError(consoleOut);
 }
 
+// The whole UI assumes it gets real pixel coordinates from Windows, which it only does once this
+// process declares itself DPI-aware. Unaware (the default for a WinExe with no manifest), Windows
+// scales every coordinate by 96/monitor-DPI on the way out and back: rcWork comes back as a
+// virtualized desktop, GetDpiForMonitor reports 96, and a card laid out at 320 px is stretched by
+// the compositor instead of drawn at its intended size -- the blurry-toast problem in reverse.
+//
+// V2 (rather than V1) because it is the only mode that reports a DPI change for a window already
+// sitting on a monitor: WM_DPICHANGED arrives when the game is dragged to another screen, which is
+// what lets the overlay re-layout mid-run instead of waiting for the next process start.
+//
+// -4 is DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. Failure is not fatal (Win7, or an app compat
+// setting): every measurement then just falls back to 96 DPI, which is exactly the old behaviour.
+var dpiAware = NativeDpi.SetProcessDpiAwarenessContext(new IntPtr(-4));
+Console.WriteLine(dpiAware
+    ? "DPI: per-monitor-v2 awareness enabled."
+    : $"DPI: awareness not set (error {Marshal.GetLastWin32Error()}); layout assumes 96 DPI.");
+
 // Installed before anything else can fail. In tray mode there is no console at all, so a crash
 // leaves the user with a vanished tray icon and no explanation on screen -- and no way to report
 // it. This writes the reason to a file next to the exe where it can actually be found, and puts
@@ -65,7 +82,10 @@ if (nonOptionArgs.Length == 0)
         // No timeout: this mode runs until the user quits it from the tray, which is what an instant
         // replay is for. A duration would silently stop the recorder at an arbitrary moment.
         duration: null,
-        Path.Combine(AppContext.BaseDirectory, defaults.OutputFolder, $"clip-{DateTime.Now:yyyyMMdd-HHmmss}.mp4"),
+        // One helper owns the clip-name format, so the tray path and the hotkey path cannot drift
+        // apart into two different naming schemes in the same folder.
+        Clippy.ScreenCapture.ClipPath(
+            Path.Combine(AppContext.BaseDirectory, defaults.OutputFolder), DateTime.Now),
         defaults.VideoEncoder,
         "passthrough",
         withAudio: true,
@@ -165,7 +185,8 @@ if (args.FirstOrDefault() == "--record")
     var videoSeconds = args.Length > 1 && double.TryParse(args[1], CultureInfo.InvariantCulture, out var parsed) && parsed > 0
         ? parsed
         : 60;
-    var videoPath = Path.Combine(Environment.CurrentDirectory, config.OutputFolder, $"clip-{DateTime.Now:yyyyMMdd-HHmmss}.mp4");
+    var videoPath = Clippy.ScreenCapture.ClipPath(
+        Path.Combine(Environment.CurrentDirectory, config.OutputFolder), DateTime.Now);
     // The config file is the default; an explicit --encoder= on the command line overrides it for
     // one run, which is how you test a different GPU without editing anything.
     var videoEncoder = args.FirstOrDefault(a => a.StartsWith("--encoder=", StringComparison.Ordinal))?["--encoder=".Length..]
@@ -263,6 +284,17 @@ static int PrintUsage()
     Console.WriteLine();
     Console.WriteLine($"Config: {ClippyConfig.Path}");
     return 0;
+}
+
+/// <summary>
+/// The user32 entry point behind the DPI-awareness call at the top of this file. It lives here
+/// because top-level statements leave no class of their own to hang a LibraryImport on.
+/// </summary>
+internal static partial class NativeDpi
+{
+    [LibraryImport("user32.dll", EntryPoint = "SetProcessDpiAwarenessContext", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool SetProcessDpiAwarenessContext(nint value);
 }
 
 /// <summary>

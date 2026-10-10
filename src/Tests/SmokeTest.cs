@@ -25,6 +25,8 @@ internal static class SmokeTest
         failures += Check("Export notification: custom sound path resolution", CustomSoundPath);
         failures += Check("Export notification: embedded default sound plays from memory", EmbeddedSound);
         failures += Check("Folder picker: runs on an STA thread", FolderPickerApartment);
+        failures += Check("Clip naming: ISO stamp sorts chronologically and never collides", ClipNaming);
+        failures += Check("Overlay: card lands on the target monitor and scales with its DPI", OverlayPlacement);
 
         Console.WriteLine(failures == 0 ? "SMOKE: OK" : $"SMOKE: FAILED ({failures})");
         return failures;
@@ -223,6 +225,122 @@ private static void FolderPickerApartment()
         throw new InvalidOperationException($"the picker thread is {seen}; SHBrowseForFolder would hang");
     Console.WriteLine($"       picker apartment = {seen}");
 }
+
+    /// <summary>
+    /// The clip name is the feature, not a detail: clip_yyyy-MM-dd_HH-mm-ss.mp4 exists so that a plain
+    /// lexicographic sort -- Explorer's default, a shell glob, `sort` -- reproduces chronological
+    /// order. The old HHmmssfff format broke that across midnight and across days (9:30:00 sorted
+    /// after 10:15:00, and nothing in the name said which day it was), so both properties are
+    /// asserted here rather than trusted.
+    ///
+    /// Two clips inside one second is the other failure: same name, and the second silently
+    /// overwrote a recording the user had asked for.
+    /// </summary>
+    private static void ClipNaming()
+    {
+        var folder = Path.Combine(Path.GetTempPath(), $"clippy-naming-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var a = Path.GetFileName(ScreenCapture.ClipPath(folder, new DateTime(2026, 10, 10, 21, 14, 33)));
+            if (a != "clip_2026-10-10_21-14-33.mp4")
+                throw new InvalidOperationException($"stamp is '{a}', expected 'clip_2026-10-10_21-14-33.mp4'");
+
+            // Written out and re-generated at the SAME instant: the second clip must not take the
+            // first one's name.
+            var same = ScreenCapture.ClipPath(folder, new DateTime(2026, 10, 10, 21, 14, 33));
+            File.WriteAllText(same, "first");
+            var again = Path.GetFileName(ScreenCapture.ClipPath(folder, new DateTime(2026, 10, 10, 21, 14, 33)));
+            if (again == a)
+                throw new InvalidOperationException("a second clip in the same second overwrote the first");
+
+            // The sort property, with the values the old format got wrong: 9:30 must precede 10:15,
+            // and 23:59 must precede 00:01 of the next day. Declared deliberately out of order, and
+            // compared against the chronological order the names are MEANT to sort into -- so this
+            // fails if a lexicographic sort stops reproducing time, which is the whole point of the
+            // zero-padded widest-field-first stamp.
+            var names = new[]
+            {
+                Path.GetFileName(ScreenCapture.ClipPath(Path.Combine(folder, "n1"), new DateTime(2026, 10, 10, 10, 15, 0))),
+                Path.GetFileName(ScreenCapture.ClipPath(Path.Combine(folder, "n2"), new DateTime(2026, 10, 10, 9, 30, 0))),
+                Path.GetFileName(ScreenCapture.ClipPath(Path.Combine(folder, "n3"), new DateTime(2026, 10, 10, 23, 59, 0))),
+                Path.GetFileName(ScreenCapture.ClipPath(Path.Combine(folder, "n4"), new DateTime(2026, 10, 11, 0, 1, 0))),
+            };
+            var chronological = new[]
+            {
+                "clip_2026-10-10_09-30-00.mp4",
+                "clip_2026-10-10_10-15-00.mp4",
+                "clip_2026-10-10_23-59-00.mp4",
+                "clip_2026-10-11_00-01-00.mp4",
+            };
+            var sorted = (string[])names.Clone();
+            Array.Sort(sorted, StringComparer.Ordinal);
+            if (!sorted.SequenceEqual(chronological))
+                throw new InvalidOperationException(
+                    $"alphabetical order is not chronological: {string.Join(", ", sorted)}");
+
+            Console.WriteLine($"       {a} (second in same second: {again}); sorted = {sorted[0]} .. {sorted[^1]}");
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The overlay is aimed at the monitor holding the foreground window, which on a multi-monitor
+    /// desk means its rectangle has a non-zero origin (monitor 2 starts at x=1920, or wherever the
+    /// user put it). Two things go wrong there and neither throws: subtracting from the primary
+    /// display's width puts the card on the wrong screen, and reporting a 96 DPI scale on a 150%
+    /// monitor leaves it at a third of its intended size.
+    ///
+    /// Only the arithmetic is checked, not the Win32 calls around it: a check that needs a real game
+    /// window on a real second monitor cannot run unattended, and the geometry is where the bugs are.
+    /// </summary>
+    private static void OverlayPlacement()
+    {
+        // A 1920x1080 secondary monitor to the right of the primary one, and a taskbar taking the
+        // bottom 40 px off it (which is why rcWork, not rcMonitor, is what positions the card).
+        var second = new MonitorRect(1920, 0, 3840, 1040);
+
+        using var overlay = new OverlayNotification();
+        overlay.Layout(96);
+        var (x100, y100) = OverlayNotification.CornerInWorkArea(
+            second.Right, second.Top, overlay.Width, overlay.Margin);
+        if (x100 + overlay.Width != second.Right - overlay.Margin || y100 != second.Top + overlay.Margin)
+            throw new InvalidOperationException(
+                $"100%: card at ({x100},{y100}) w={overlay.Width} is not inset from ({second.Right},{second.Top})");
+        if (x100 < second.Left)
+            throw new InvalidOperationException($"100%: card at x={x100} is off the left edge of monitor 2");
+
+        var width100 = overlay.Width;
+
+        // 150% then 200%: every metric must grow by the scale, or the card and its text shrink
+        // relative to the game's own UI at that same scale.
+        foreach (var (dpi, ratio) in new[] { (120u, 1.25f), (144u, 1.5f), (192u, 2f) })
+        {
+            overlay.Layout(dpi);
+            var expected = (int)MathF.Round(width100 * ratio);
+            if (overlay.Width != expected)
+                throw new InvalidOperationException(
+                    $"{dpi} DPI: width {overlay.Width}, expected {expected} ({ratio} of {width100})");
+            if (overlay.TitleFontPx != (int)MathF.Round(OverlayNotification.BaseTitleFontPx * ratio))
+                throw new InvalidOperationException(
+                    $"{dpi} DPI: title font {overlay.TitleFontPx} px did not scale with the card");
+            if (overlay.Height <= overlay.MessageY)
+                throw new InvalidOperationException($"{dpi} DPI: the message line falls outside the card");
+        }
+
+        Console.WriteLine($"       monitor-2 card at ({x100},{y100}); 320 -> {width100} @96, " +
+            string.Join(", ", new[] { 120u, 144u, 192u }.Select(d =>
+            {
+                overlay.Layout(d);
+                return $"{overlay.Width}px @{d}";
+            })));
+    }
+
+    /// <summary>Stand-in for GDI's RECT in the placement check; no Win32 call can take a monitor.</summary>
+    private readonly record struct MonitorRect(int Left, int Top, int Right, int Bottom);
 
     /// <summary>
     /// The configured custom notification sound is resolved the way the config documents it: a

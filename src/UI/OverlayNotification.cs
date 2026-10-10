@@ -23,22 +23,31 @@ namespace Clippy;
 /// </summary>
 internal sealed partial class OverlayNotification : IDisposable
 {
-    private const int Width = 320;
-    private const int Height = 65;
-    private const int CornerRadius = 12;
-    private const int Border = 2;
-    private const int Margin = 16;
+    // Design units, as laid out at 96 DPI. Everything below is multiplied by the target monitor's
+    // scale before it is used: a card built at 320 physical pixels is a quarter of its intended size
+    // on a 200% display, and its 16 px font with it. See Layout().
+    private const int BaseWidth = 320;
+    private const int BaseHeight = 65;
+    private const int BaseCornerRadius = 12;
+    private const int BaseBorder = 2;
+    private const int BaseMargin = 16;
 
     // Icon at the left, vertically centred; text to its right.
-    private const int IconSize = 32;
-    private const int IconX = 14;
-    private const int IconY = (Height - IconSize) / 2;
-    private const int TextX = 58;
-    private const int TitleY = 13;
-    private const int MessageY = 35;
+    private const int BaseIconSize = 32;
+    private const int BaseIconX = 14;
+    private const int BaseTextX = 58;
+    private const int BaseTitleY = 13;
+    private const int BaseMessageY = 35;
+
+    // Font heights are in pixels here (the memory DC is a screen DC, so 1 unit = 1 pixel) and are
+    // the one place the scale has to reach: a 16 px title on a 200% monitor must be 32 px or it is
+    // unreadable next to the game's own UI.
+    internal const int BaseTitleFontPx = 16;
+    private const int BaseMessageFontPx = 14;
 
     // Enough to fit the 320 px card at Segoe UI without wrapping; a longer string is ellipsised
-    // rather than allowed to spill past the rounded border.
+    // rather than allowed to spill past the rounded border. Character counts do not scale: the card
+    // grows in pixels at the same rate as the font, so the capacity is the same at every DPI.
     private const int TitleMaxChars = 28;
     private const int MessageMaxChars = 38;
 
@@ -50,6 +59,8 @@ internal sealed partial class OverlayNotification : IDisposable
     private const int TimerId = 1;
 
     // Window messages.
+    private const int WM_MOUSEACTIVATE = 0x0021;
+    private const int WM_DPICHANGED = 0x02E0;
     private const int WM_TIMER = 0x0113;
     private const int WM_DESTROY = 0x0002;
     private const int WM_APP = 0x8000;
@@ -67,6 +78,19 @@ internal sealed partial class OverlayNotification : IDisposable
     private const int SW_HIDE = 0;
     private const int SW_SHOWNOACTIVATE = 4;
 
+    // SetWindowPos flags: never activate, never reorder z, and the two "I am only changing this" ones.
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOZORDER = 0x0004;
+    private const uint SWP_NOACTIVATE = 0x0010;
+
+    // WM_MOUSEACTIVATE answer: "do not activate, do not discard the mouse message".
+    private const int MA_NOACTIVATE = 3;
+
+    // MONITOR_DEFAULTTONEAREST: a null rectangle gets the closest monitor instead of nothing, so a
+    // minimized or destroyed foreground window still resolves to a real screen.
+    private const uint MONITOR_DEFAULTTONEAREST = 2;
+    private const uint MDT_EFFECTIVE_DPI = 0;   // the DPI the shell draws at, not the raw one
+
     private const uint ULW_ALPHA = 0x00000002;
     private const byte AC_SRC_OVER = 0x00;
     private const byte AC_SRC_ALPHA = 0x01;
@@ -76,6 +100,7 @@ internal sealed partial class OverlayNotification : IDisposable
     private const int FW_BOLD = 700;
     private const uint SPI_GETWORKAREA = 0x0030;
     private const int SM_CXSCREEN = 0;
+    private const int SM_CYSCREEN = 1;
 
     // COLORREF values are 0x00BBGGRR.
     private const uint BgColor = 0x001E1E1E;      // #1E1E1E dark card
@@ -110,6 +135,29 @@ internal sealed partial class OverlayNotification : IDisposable
     private int alpha;
     private long phaseStartTicks;
 
+    // The card's real pixel metrics for the monitor it is currently aimed at, derived from the
+    // Base* design units by Layout(). Not constants: the game can sit on a 100% screen one clip and
+    // a 200% one the next, and the DIB and the fonts are built at one size, so graphicsDpi records
+    // which size that was and BeginShow rebuilds them when it stops matching.
+    private float layoutScale = 1f;
+    private uint graphicsDpi;
+
+    // Read by the smoke test: it asserts the scaled numbers without a monitor of its own.
+    internal int Width;
+    internal int Height;
+    internal int Margin;
+    internal int MessageY;
+    internal int TitleFontPx;
+    private int messageFontPx = BaseMessageFontPx;
+
+    private int CornerRadius = BaseCornerRadius;
+    private int Border = BaseBorder;
+    private int IconSize = BaseIconSize;
+    private int IconX = BaseIconX;
+    private int IconY;
+    private int TextX = BaseTextX;
+    private int TitleY = BaseTitleY;
+
     // Kept alive for the life of the window: if the GC collected the delegate while the window still
     // existed, Windows would call into freed memory.
     private readonly WndProcDelegate wndProc;
@@ -117,6 +165,9 @@ internal sealed partial class OverlayNotification : IDisposable
     public OverlayNotification()
     {
         wndProc = WndProc;
+        // The design units have to land in the fields before the window exists: CreateWindowEx and
+        // the DIB both read them, and 0 would make a zero-sized window.
+        Layout(96);
     }
 
     /// <summary>
@@ -192,7 +243,9 @@ internal sealed partial class OverlayNotification : IDisposable
             return;
         }
 
-        ComputePosition(out posX, out posY);
+        var placement = ComputePlacement();
+        posX = placement.X;
+        posY = placement.Y;
 
         // WS_POPUP (no frame), WS_EX_NOACTIVATE (never foreground), WS_EX_TRANSPARENT (clicks pass
         // through), WS_EX_TOOLWINDOW (out of Alt+Tab), WS_EX_TOPMOST (over the game), WS_EX_LAYERED
@@ -222,13 +275,40 @@ internal sealed partial class OverlayNotification : IDisposable
         FreeGraphicsResources();
     }
 
-    /// <summary>Creates the memory DC / DIB, brushes, fonts and the app icon, all reused per card.</summary>
+    /// <summary>Creates the memory DC and the app icon, both DPI-independent, then the per-size DIB.</summary>
     private unsafe void CreateGraphicsResources()
     {
         var screenDc = GetDC(0);
         memDc = CreateCompatibleDC(screenDc);
         if (screenDc != 0)
             ReleaseDC(0, screenDc);
+
+        iconHandle = LoadApplicationIcon();
+        ResizeGraphics();
+    }
+
+    /// <summary>
+    /// Rebuilds everything whose size depends on the target monitor's DPI: the DIB and the two fonts.
+    /// Called when the DPI changes, which means a new card on another monitor, or a resolution change
+    /// under a running Clippy. Stretching a 320 px bitmap to 640 would be the blurry result DPI
+    /// awareness exists to avoid, so the pixels are redrawn at the real size instead.
+    /// </summary>
+    private unsafe void ResizeGraphics()
+    {
+        if (memDc == 0)
+            return;
+
+        if (dib != 0)
+        {
+            SelectObject(memDc, oldBitmap);
+            DeleteObject(dib);
+            dib = 0;
+            bitsPtr = 0;
+        }
+        if (titleFont != 0) { DeleteObject(titleFont); titleFont = 0; }
+        if (messageFont != 0) { DeleteObject(messageFont); messageFont = 0; }
+        if (accentBrush != 0) { DeleteObject(accentBrush); accentBrush = 0; }
+        if (bgBrush != 0) { DeleteObject(bgBrush); bgBrush = 0; }
 
         var header = new BitmapInfoHeader
         {
@@ -246,11 +326,14 @@ internal sealed partial class OverlayNotification : IDisposable
 
         accentBrush = CreateSolidBrush(AccentColor);
         bgBrush = CreateSolidBrush(BgColor);
-        titleFont = CreateFont(-16, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+
+        // CreateFont's height is in pixels on a screen DC and must be negative for "cell height",
+        // which is what a design size means. TitleFontPx / messageFontPx already carry the monitor's
+        // scale from Layout(); scaling again here would compound it.
+        titleFont = CreateFont(-TitleFontPx, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
             0, 0, 0, 0, "Segoe UI");
-        messageFont = CreateFont(-14, 0, 0, 0, 0, 0, 0, 0, DEFAULT_CHARSET,
+        messageFont = CreateFont(-messageFontPx, 0, 0, 0, 0, 0, 0, 0, DEFAULT_CHARSET,
             0, 0, 0, 0, "Segoe UI");
-        iconHandle = LoadApplicationIcon();
     }
 
     private void FreeGraphicsResources()
@@ -271,20 +354,98 @@ internal sealed partial class OverlayNotification : IDisposable
         // The icon handle from ExtractIconEx is deliberately never destroyed; see TrayIcon.
     }
 
-    /// <summary>Top-right of the work area (the screen minus the taskbar), with a margin.</summary>
-    private static void ComputePosition(out int x, out int y)
+    /// <summary>
+    /// Decides where the card goes and how big it is, from the monitor the player is actually
+    /// looking at: the one holding the foreground window (the game), not the primary display. On a
+    /// two-monitor setup the old code always drew on monitor 0, so a notification about a clip of a
+    /// game running on monitor 1 appeared where the player was not looking.
+    ///
+    /// The DPI of THAT monitor drives the scale. A monitor is not a property of the process: 125% on
+    /// one screen and 200% on the other is the normal multi-display setup, and the card follows the
+    /// game rather than the desktop it was launched from.
+    /// </summary>
+    private Placement ComputePlacement()
     {
+        // MONITOR_DEFAULTTONEAREST rather than NULL: the foreground window can be gone by the time
+        // this runs (it is read on the overlay thread, after the game closed), and "nearest" still
+        // yields a real screen instead of a null handle that would silently disable the feature.
+        var monitor = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
+        var dpi = MonitorDpi(monitor);
+        Layout(dpi);
+
         var work = new Rect();
-        if (SystemParametersInfo(SPI_GETWORKAREA, 0, ref work, 0))
+        if (!GetMonitorInfo(monitor, ref work) &&
+            !SystemParametersInfo(SPI_GETWORKAREA, 0, ref work, 0))
         {
-            x = work.right - Width - Margin;
-            y = work.top + Margin;
-            return;
+            // Neither call worked: fall back to the whole primary screen rather than drawing at 0,0.
+            work = new Rect
+            {
+                right = GetSystemMetrics(SM_CXSCREEN),
+                bottom = GetSystemMetrics(SM_CYSCREEN),
+            };
         }
 
-        x = GetSystemMetrics(SM_CXSCREEN) - Width - Margin;
-        y = Margin;
+        // rcWork, not rcMonitor: the taskbar is part of the screen and the card must not sit under
+        // it. 16 design px in from the right and top edges, scaled with everything else.
+        var spot = CornerInWorkArea(work.right, work.top, Width, Margin);
+        return new Placement(spot.x, spot.y, dpi);
     }
+
+    /// <summary>
+    /// Where the card's left edge goes: inside the right edge of the work area it was given, by its
+    /// own width plus the margin. Separate from <see cref="ComputePlacement"/> because this is the
+    /// one line that decides whether the card lands on the game's monitor or somewhere else, and
+    /// therefore the one line worth testing against a second monitor's rectangle (see SmokeTest).
+    /// </summary>
+    internal static (int x, int y) CornerInWorkArea(int workRight, int workTop, int width, int margin) =>
+        (workRight - margin - width, workTop + margin);
+
+    /// <summary>
+    /// Recomputes every pixel metric from the Base* design units for <paramref name="dpi"/>.
+    /// Called on each show, so a game dragged to another display re-lays-out the card.
+    /// </summary>
+    internal void Layout(uint dpi)
+    {
+        layoutScale = dpi / 96f;
+
+        Width = Scaled(BaseWidth);
+        Height = Scaled(BaseHeight);
+        CornerRadius = Scaled(BaseCornerRadius);
+        Border = Math.Max(1, Scaled(BaseBorder));
+        Margin = Scaled(BaseMargin);
+        IconSize = Scaled(BaseIconSize);
+        IconX = Scaled(BaseIconX);
+        IconY = (Height - IconSize) / 2;
+        TextX = Scaled(BaseTextX);
+        TitleY = Scaled(BaseTitleY);
+        MessageY = Scaled(BaseMessageY);
+        TitleFontPx = Scaled(BaseTitleFontPx);
+        messageFontPx = Scaled(BaseMessageFontPx);
+    }
+
+    private int Scaled(int design) => (int)MathF.Round(design * layoutScale);
+
+    /// <summary>
+    /// The effective DPI of a monitor, or 96 when it cannot be determined -- which is the right
+    /// default because 96 is the scale every measurement above is expressed in, so "unknown" means
+    /// "as designed" rather than "wrong".
+    /// </summary>
+    private uint MonitorDpi(nint monitor)
+    {
+        if (monitor != 0 &&
+            GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, out var x, out _) == 0 /* S_OK */ && x > 0)
+            return x;
+
+        // shcore is Win8.1+ and refuses to answer before the window exists; the window's own DPI is
+        // the same number on a per-monitor-aware process.
+        if (hwnd != 0 && GetDpiForWindow(hwnd) is var fromWindow and > 0)
+            return fromWindow;
+
+        return GetDpiForSystem() is var fromSystem and > 0 ? fromSystem : 96;
+    }
+
+    /// <summary>Top-right of the work area (the screen minus the taskbar), with a margin.</summary>
+    private readonly record struct Placement(int X, int Y, uint Dpi);
 
     /// <summary>The icon embedded in this exe, or 0 when there is none.</summary>
     private static nint LoadApplicationIcon()
@@ -312,13 +473,83 @@ internal sealed partial class OverlayNotification : IDisposable
             case WM_DESTROY:
                 PostQuitMessage(0);
                 return 0;
+
+            // Anything that would activate this window is refused here rather than prevented by
+            // style alone: WS_EX_NOACTIVATE covers the ShowWindow calls, and MA_NOACTIVATE covers the
+            // one path styles do not -- a click. Even though the window is WS_EX_TRANSPARENT, a click
+            // on the very edge or during the fade still asks for activation, and taking focus off a
+            // running game (which in fullscreen means a mode switch or a stutter) is exactly what a
+            // notification must never do. Returning 3 instead of calling DefWindowProc is what makes
+            // the window unfocusable by mouse.
+            case WM_MOUSEACTIVATE:
+                return MA_NOACTIVATE;
+
+            // The window's own DPI changed (it was dragged to another monitor, or the user changed
+            // the scaling). Answering with a resize+reposition from the suggested rectangle is the
+            // documented contract; the geometry is ours to choose, so keep the card's top-right
+            // corner anchored and its designed size at the new scale.
+            case WM_DPICHANGED:
+                // wParam packs the new DPI's low word.
+                MonitorDpiOnChange((uint)(wParam.ToInt64() & 0xFFFF));
+                return 0;
+
             default:
                 return DefWindowProc(hWnd, message, wParam, lParam);
         }
     }
 
+    /// <summary>
+    /// Applies a WM_DPICHANGED for the window itself: re-layout, rebuild the DIB, and keep the card
+    /// in the top-right of whatever work area it now lives on. Suggested rectangles are ignored on
+    /// purpose -- the shell proposes a rectangle for a resizable window, while this one keeps its
+    /// designed size and only its position follows the monitor.
+    /// </summary>
+    private void MonitorDpiOnChange(uint dpi)
+    {
+        if (dpi == 0)
+            return;
+
+        Layout(dpi);
+        graphicsDpi = dpi;
+        ResizeGraphics();
+
+        // This monitor's work area, not the primary one's: the window already sits on the monitor
+        // whose DPI changed, and SPI_GETWORKAREA would move the card back to the main screen.
+        var work = new Rect();
+        if (GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), ref work))
+        {
+            var spot = CornerInWorkArea(work.right, work.top, Width, Margin);
+            posX = spot.x;
+            posY = spot.y;
+            SetWindowPos(hwnd, 0, posX, posY, Width, Height, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        if (phase != Phase.Idle)
+            RenderCard();
+    }
+
     private void BeginShow()
     {
+        // Recomputed per clip, not once per process: the game may have been moved to the other
+        // monitor since the last one, and the card has to follow it. Also where a DPI change is
+        // noticed -- the DIB and fonts cannot be resized after the fact, they have to be rebuilt.
+        var placement = ComputePlacement();
+        posX = placement.X;
+        posY = placement.Y;
+
+        // Repositioned unconditionally, unlike the graphics: the window can move without its DPI
+        // changing (a game dragged between two 100% monitors), and only the position encodes which
+        // monitor it is on.
+        if (placement.Dpi != graphicsDpi)
+        {
+            graphicsDpi = placement.Dpi;
+            ResizeGraphics();
+        }
+
+        // SWP_NOZORDER keeps TOPMOST without re-asserting it, SWP_NOACTIVATE keeps the game focused:
+        // this is a reposition, not an activation.
+        SetWindowPos(hwnd, 0, posX, posY, Width, Height, SWP_NOZORDER | SWP_NOACTIVATE);
+
         RenderCard();
 
         // A card already on screen keeps its place and just gets more time ("smooth restart"); an
@@ -452,7 +683,7 @@ internal sealed partial class OverlayNotification : IDisposable
         text.Length <= max ? text : string.Concat(text.AsSpan(0, max - 1), "\u2026");
 
     /// <summary>Whether (x, y) lies inside the card's rounded rectangle of radius <see cref="CornerRadius"/>.</summary>
-    private static bool InsideRoundedRect(int x, int y)
+    private bool InsideRoundedRect(int x, int y)
     {
         if (x < 0 || y < 0 || x >= Width || y >= Height)
             return false;
@@ -495,6 +726,31 @@ internal sealed partial class OverlayNotification : IDisposable
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Rect { public int left; public int top; public int right; public int bottom; }
+
+    /// <summary>MONITORINFO: rcWork is the work area, i.e. the screen minus the taskbar.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo
+    {
+        public int cbSize;
+        public Rect rcMonitor;
+        public Rect rcWork;
+        public uint dwFlags;
+    }
+
+    /// <summary>
+    /// The work area of a monitor, i.e. the screen minus taskbars and docked appbars. This is what
+    /// positions the card: SPI_GETWORKAREA only ever reports the primary display, which is the very
+    /// limitation being removed here.
+    /// </summary>
+    private static bool GetMonitorInfo(nint monitor, ref Rect work)
+    {
+        var info = new MonitorInfo { cbSize = Marshal.SizeOf<MonitorInfo>() };
+        if (!GetMonitorInfoW(monitor, ref info))
+            return false;
+
+        work = info.rcWork;
+        return true;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BlendFunction
@@ -547,6 +803,30 @@ internal sealed partial class OverlayNotification : IDisposable
 
     [LibraryImport("user32.dll", EntryPoint = "DefWindowProcW")]
     private static partial nint DefWindowProc(nint hWnd, int message, nint wParam, nint lParam);
+
+    [LibraryImport("user32.dll", EntryPoint = "SetWindowPos", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetWindowPos(
+        nint hWnd, nint insertAfter, int x, int y, int cx, int cy, uint flags);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetForegroundWindow")]
+    private static partial nint GetForegroundWindow();
+
+    [LibraryImport("user32.dll", EntryPoint = "MonitorFromWindow")]
+    private static partial nint MonitorFromWindow(nint hWnd, uint flags);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetMonitorInfoW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetMonitorInfoW(nint monitor, ref MonitorInfo info);
+
+    [LibraryImport("shcore.dll", EntryPoint = "GetDpiForMonitor")]
+    private static partial int GetDpiForMonitor(nint monitor, uint dpiType, out uint dpiX, out uint dpiY);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetDpiForWindow")]
+    private static partial uint GetDpiForWindow(nint hWnd);
+
+    [LibraryImport("user32.dll", EntryPoint = "GetDpiForSystem")]
+    private static partial uint GetDpiForSystem();
 
     [LibraryImport("user32.dll", EntryPoint = "GetMessageW")]
     private static partial int GetMessage(out Msg message, nint hWnd, uint min, uint max);
