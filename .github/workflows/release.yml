@@ -215,19 +215,14 @@ jobs:
           # ${{ github.ref_name }} is the tag, so v1.2.3 names the release v1.2.3.
           name: Clippy ${{ github.ref_name }}
           body: |
-            Два варианта на выбор.
+            ### Installation Options
+            - **Installer (`Clippy-Setup.exe`):** Recommended. Installs Clippy with desktop/start menu shortcuts, autostart support, and silent one-click updates.
+            - **Portable archive (`Clippy-win-x64.zip`):** Standalone zero-install folder. Extract anywhere and launch `Clippy.exe`.
 
-            **`Clippy-Setup.exe`** — установщик. Ставится в `%LOCALAPPDATA%\Programs\Clippy` без
-            прав администратора, создаёт ярлык в меню «Пуск», умеет запускаться при старте Windows
-            и обновляется сам.
+            NVENC + Media Foundation work out of the box with no third-party dependencies (ffmpeg is not required).
 
-            **`Clippy-win-x64.zip`** — распакуйте в любую папку и запустите `Clippy.exe`.
-            Ничего не устанавливается.
-
-            NVENC + Media Foundation работают из коробки без сторонних зависимостей (ffmpeg не требуется).
-
-            Горячие клавиши: **F8** — 30 секунд, **F9** — 3 минуты.
-            Клипы в `clips/`, отладочные логи в `logs/`.
+            Hotkeys: **F8** — 30 seconds, **F9** — 3 minutes.
+            Clips go to `clips/`, debug logs to `logs/`.
           draft: false
           generate_release_notes: true
 
