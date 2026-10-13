@@ -1,4 +1,4 @@
-﻿namespace Clippy;
+namespace Clippy;
 
 /// <summary>
 /// Assert-based self-check for the elementary-stream parsers, on synthetic byte sequences only.

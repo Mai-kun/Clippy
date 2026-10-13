@@ -1,4 +1,4 @@
-﻿# Visual marker for the A/V test: a normal maximised WinForms window (NOT exclusive fullscreen, which
+# Visual marker for the A/V test: a normal maximised WinForms window (NOT exclusive fullscreen, which
 # WGC did not capture here) whose background alternates black/white every 5 s.
 #   powershell -File flash-window.ps1 [-PeriodMs 5000] [-OnMs 100]
 param([int]$PeriodMs = 5000, [int]$OnMs = 250)

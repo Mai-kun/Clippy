@@ -1,4 +1,4 @@
-﻿namespace Clippy;
+namespace Clippy;
 
 /// <summary>
 /// Splits a raw Annex B byte stream into individual NAL units.

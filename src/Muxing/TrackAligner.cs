@@ -1,4 +1,4 @@
-﻿namespace Clippy;
+namespace Clippy;
 
 /// <summary>Result of aligning the two tracks onto one shared zero.</summary>
 /// <param name="Zero">The absolute capture time that becomes t=0 of the clip.</param>

@@ -1,4 +1,4 @@
-﻿# Measures A/V sync of a recorded clip against a known source.
+# Measures A/V sync of a recorded clip against a known source.
 #   python av-sync.py <recorded.mp4> [source.mp4]
 # The source has a full-screen white flash and a 1 kHz beep every 5 s, both starting at t=0 by
 # construction. Detecting each independently in the recording gives the offset in ms; comparing the

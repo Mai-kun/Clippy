@@ -1,0 +1,62 @@
+name: Bug report
+description: Something is broken in Clippy
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill in the fields below —
+        the logs are what makes a fix possible, so attach them if you can.
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Settings → System → About, e.g. "Windows 11 24H2 (build 26100)".
+      placeholder: Windows 11 24H2 (build 26100)
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Exact model, e.g. "NVIDIA GeForce RTX 4070" or "AMD Radeon RX 7800 XT".
+      placeholder: NVIDIA GeForce RTX 4070
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Steps to reproduce, what you expected, and what you actually saw.
+      placeholder: |
+        1. Started Clippy, played a game
+        2. Pressed F9
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Drag and drop the log files from the `logs/` folder next to `Clippy.exe`
+        (or zip the folder first). Enable `--console` and reproduce the issue for
+        the most useful output.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I am running the latest Clippy release.
+          required: false
+        - label: I searched existing issues and did not find a duplicate.
+          required: false

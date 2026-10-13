@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using Vortice.Direct3D11;
 
 namespace Clippy;
