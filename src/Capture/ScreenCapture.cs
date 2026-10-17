@@ -162,6 +162,8 @@ internal sealed partial class ScreenCapture : IDisposable
         }
 
         var audioMissing = audioPackets.Count == 0;
+        UpdateService.LogDiagnostic($"Export: video {videoPackets.Count} pkts, audio {audioPackets.Count} pkts; " +
+            (audio is null ? "audio capture is OFF" : audio.TakeLevelReport()));
         Console.WriteLine($"Export: video slice {videoPackets.Count} pkts, " +
             $"clock [{videoPackets[0].CaptureClockSeconds:F3} .. {videoPackets[^1].CaptureClockSeconds:F3}] s, " +
             $"first is keyframe: {(videoPackets[0].IsKeyframe ? "True" : "False")}");
@@ -297,6 +299,8 @@ internal sealed partial class ScreenCapture : IDisposable
             silentPayload.CopyTo(silentFrame, headerLength);
             var secondsPerFrame = 1024.0 / 48000.0;
             var frames = (int)Math.Ceiling(leadIn / secondsPerFrame);
+            UpdateService.LogDiagnostic($"Export: padded audio head with {frames} valid silent AAC frames " +
+                $"({leadIn * 1000:F0} ms, payload {Convert.ToHexString(silentPayload)}).");
             Console.WriteLine($"Export: padding audio head with {leadIn * 1000:F0} ms of silence " +
                 $"({frames} AAC frames) so both tracks start at the same instant");
 
@@ -1213,6 +1217,10 @@ internal sealed partial class ScreenCapture : IDisposable
                     {
                         audio.Start();
                         Console.WriteLine("Both encoders are reading; recording.");
+                        // Fix check: before the fix this never ran when calibration dropped frame 1.
+                        UpdateService.LogDiagnostic(
+                            $"Audio: WASAPI started on the first encoded frame (capture frame #{currentFrame}, " +
+                            $"{currentFrame - 1} calibration frames skipped).");
                     }
                 }
 

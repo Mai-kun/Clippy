@@ -88,6 +88,13 @@ internal sealed class AudioCapture : IDisposable
 
     /// <summary>Set when the endpoint's volume is software-only; see CreateRecorder.</summary>
     private volatile AudioEndpointVolume? softwareVolume;
+    private volatile bool captureIsFloat;
+
+    // Levels since the last export, for the per-export log line. ponytail: plain floats written on the
+    // callback thread and read on export, a torn read only skews one diagnostic line.
+    private float rawPeak;
+    private float outPeak;
+    private float lastGainDb;
 
     // ponytail: 40 dB cap so a near-zero slider does not turn the noise floor into a roar.
     private const float MaxVolumeCompensationDb = 40f;
@@ -133,6 +140,19 @@ internal sealed class AudioCapture : IDisposable
         softwareVolume = !endpoint.HardwareSupport.HasFlag(EEndpointHardwareSupport.Volume) && IsFloat(recorder.WaveFormat)
             ? endpoint
             : null;
+        captureIsFloat = IsFloat(recorder.WaveFormat);
+
+        // Every "clip is silent/quiet" report needs these three facts, so they go to the persistent log.
+        try
+        {
+            UpdateService.LogDiagnostic(
+                $"Audio volume ({reason}): '{render.FriendlyName}' hardware volume={endpoint.HardwareSupport}, " +
+                $"slider {endpoint.MasterVolumeLevel:F1} dB ({endpoint.MasterVolumeLevelScalar:P0}), mute={endpoint.Mute}, " +
+                $"compensation {(softwareVolume is null ? "OFF" : "ON")}");
+        }
+        catch (COMException)
+        {
+        }
 
         // The one line that answers "what exactly is being captured". Every audio bug report starts
         // with a device whose rate or channel count nobody logged, and a 44.1 kHz or 5.1 endpoint
@@ -393,15 +413,30 @@ internal sealed class AudioCapture : IDisposable
     /// </summary>
     private void UndoSoftwareVolume(byte[] samples)
     {
+        if (!captureIsFloat)
+            return;
+        var floats = MemoryMarshal.Cast<byte, float>(samples.AsSpan());
+        var peak = 0f;
+        foreach (var f in floats)
+            peak = Math.Max(peak, Math.Abs(f));
+        rawPeak = Math.Max(rawPeak, peak);
+        lastGainDb = 0f;
+
         var volume = softwareVolume;
         if (volume is null)
+        {
+            outPeak = Math.Max(outPeak, peak);
             return;
+        }
 
         float levelDb;
         try
         {
             if (volume.Mute)
+            {
+                outPeak = Math.Max(outPeak, peak);
                 return;
+            }
             levelDb = volume.MasterVolumeLevel;
         }
         catch (COMException)
@@ -410,12 +445,27 @@ internal sealed class AudioCapture : IDisposable
         }
 
         if (levelDb >= -0.01f)
+        {
+            outPeak = Math.Max(outPeak, peak);
             return;
+        }
 
-        var gain = MathF.Pow(10f, Math.Min(-levelDb, MaxVolumeCompensationDb) / 20f);
-        var floats = MemoryMarshal.Cast<byte, float>(samples.AsSpan());
+        lastGainDb = Math.Min(-levelDb, MaxVolumeCompensationDb);
+        var gain = MathF.Pow(10f, lastGainDb / 20f);
         for (var i = 0; i < floats.Length; i++)
             floats[i] *= gain;
+        outPeak = Math.Max(outPeak, peak * gain);
+    }
+
+    /// <summary>One log line: buffers, raw and compensated peaks since the last call, then resets the peaks.</summary>
+    public string TakeLevelReport()
+    {
+        static string Db(float v) => v > 0 ? $"{20 * Math.Log10(v):F1} dBFS" : "silence";
+        var report = $"WASAPI buffers={bufferCount}, peak raw {Db(rawPeak)} -> recorded {Db(outPeak)}, " +
+            $"last gain +{lastGainDb:F1} dB, compensation {(softwareVolume is null ? "OFF" : "ON")}";
+        rawPeak = 0f;
+        outPeak = 0f;
+        return report;
     }
 
     private void OnDataAvailable(ReadOnlySpan<byte> buffer, long qpcPosition)
@@ -442,6 +492,7 @@ internal sealed class AudioCapture : IDisposable
         if (Interlocked.Increment(ref packetsSeen) == 1)
         {
             var gapSeconds = stopwatch.Elapsed.TotalSeconds - videoStartSeconds;
+            UpdateService.LogDiagnostic($"Audio: first WASAPI packet received ({buffer.Length} bytes), capture is running.");
             Console.WriteLine($"[sync] first WASAPI callback at {stopwatch.Elapsed.TotalSeconds:F3}s " +
                 $"(video origin {videoStartSeconds:F3}s, gap {gapSeconds:F3}s; not prepended)");
             Console.WriteLine($"[start] first AUDIO packet: qpcPosition={qpcPosition} " +
