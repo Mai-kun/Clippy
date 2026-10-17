@@ -136,40 +136,6 @@ internal sealed partial class ScreenCapture : IDisposable
         var videoPackets = DiskSpooler.SliceHybrid(videoRing, videoSpool, from, to);
         var audioPackets = DiskSpooler.SliceHybrid(audioRing, audioSpool, from, to);
 
-        // ---- audio-tract diagnostics for every export --------------------------------------------
-        try
-        {
-            var logDir = logsDirectory;
-            Directory.CreateDirectory(logDir);
-            var vCount = videoPackets.Count;
-            var aCount = audioPackets.Count;
-            var lines = new List<string>
-            {
-                $"[export] Video packets: {vCount}, Audio packets: {aCount}",
-            };
-            if (audio is not null)
-            {
-                lines.Add($"[export] WASAPI: buffersReceived={audio.BufferCount}, bytesReceived={audio.BytesReceived}, " +
-                    $"device='{audio.SelectedDeviceName ?? "(default)"}'");
-                if (aCount == 0)
-                {
-                    lines.Add(
-                        $"[export] WARNING: No audio in clip! WASAPI received {audio.BytesReceived} bytes " +
-                        $"from '{audio.SelectedDeviceName ?? "(default)"}'. " +
-                        "If sound is playing, check if audio is routed to another device/channel in Windows " +
-                        "(e.g. game vs voice channel).");
-                }
-            }
-            File.AppendAllText(
-                Path.Combine(logDir, "audio.log"),
-                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {string.Join(Environment.NewLine, lines)}{Environment.NewLine}{Environment.NewLine}");
-        }
-        catch
-        {
-            // A diagnostic that cannot be written must never take the capture down with it.
-        }
-        // -----------------------------------------------------------------------------------------
-
         // Raw ring data first, so a bad slice is visible here and not as an ffprobe error later.
         var (captured, accessUnits) = encoder.TimingCounts;
 
@@ -320,12 +286,15 @@ internal sealed partial class ScreenCapture : IDisposable
 
         if (leadIn > 0.0005 && finalAudio.Count > 0)
         {
-            // A real ADTS frame with a zeroed payload is a valid silent frame, and reusing the first
-            // frame's own header keeps the sample rate and channel count exactly right.
-            var frameLength = finalAudio[0].Length;
+            // A zeroed payload is NOT silence: it is invalid AAC ("Invalid data found when processing
+            // input"), and strict players mute the whole track over it. This is the canonical silent
+            // stereo AAC-LC raw block (what ffmpeg's encoder emits for digital silence); the first
+            // frame's header still supplies the sample rate and channel count.
             const int headerLength = 7;
-            var silentFrame = new byte[frameLength];
+            byte[] silentPayload = [0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C];
+            var silentFrame = new byte[headerLength + silentPayload.Length];
             finalAudio[0].AsSpan(0, headerLength).CopyTo(silentFrame);
+            silentPayload.CopyTo(silentFrame, headerLength);
             var secondsPerFrame = 1024.0 / 48000.0;
             var frames = (int)Math.Ceiling(leadIn / secondsPerFrame);
             Console.WriteLine($"Export: padding audio head with {leadIn * 1000:F0} ms of silence " +
@@ -1194,12 +1163,11 @@ internal sealed partial class ScreenCapture : IDisposable
 
                 // SystemRelativeTime is Windows' own capture timestamp: the same clock ffmpeg reads
                 // -use_wallclock_as_timestamps against, so it is the reference for PTS verification.
-                var firstFrameByCounter = currentFrame == 1;
 
                 // Startup cross-check: the compositor's own QPC for the first video frame, against
                 // the first audio packet's QPC. Their difference is the whole A/V offset, measured
                 // directly on the hardware clock, with no alignment or muxer in the way.
-                if (firstFrameByCounter)
+                if (isFirstFrame)
                 {
                     Console.WriteLine($"[start] first VIDEO frame: sysRelTicks={frame.SystemRelativeTime.Ticks} " +
                         $"qpc={(frame.SystemRelativeTime.Ticks / 1e7):F6} " +

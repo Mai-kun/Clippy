@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -74,16 +74,6 @@ internal sealed class AudioCapture : IDisposable
     {
         get { lock (captureSync) { return capture.WaveFormat.BlockAlign; } }
     }
-
-    /// <summary>WASAPI buffers delivered to the callback since the capture started.</summary>
-    public int BufferCount => bufferCount;
-
-    /// <summary>Total bytes delivered by WASAPI to the callback since the capture started.</summary>
-    public long BytesReceived => totalBytes;
-
-    /// <summary>The endpoint the user asked for (config AudioDevice / tray Audio Device menu):
-    /// null, empty or \"default\" means the system default, anything else is an endpoint ID or friendly name.</summary>
-    public string? SelectedDeviceName => preferredDevice;
     private int packetsSeen;
     private double silencePrependedMs;
     private volatile bool disposed;
@@ -95,6 +85,12 @@ internal sealed class AudioCapture : IDisposable
     /// following the system default into a monitor or a virtual cable.
     /// </summary>
     private string? preferredDevice;
+
+    /// <summary>Set when the endpoint's volume is software-only; see CreateRecorder.</summary>
+    private volatile AudioEndpointVolume? softwareVolume;
+
+    // ponytail: 40 dB cap so a near-zero slider does not turn the noise floor into a roar.
+    private const float MaxVolumeCompensationDb = 40f;
 
     public AudioCapture(Stopwatch stopwatch, double videoStartSeconds, string? targetDeviceIdOrName = null)
     {
@@ -114,7 +110,7 @@ internal sealed class AudioCapture : IDisposable
     /// warns and falls back to the default rather than killing the capture -- a headset unplugged
     /// between the menu being drawn and the click must not end the recording in silence.
     /// </summary>
-    private static WasapiRecorder CreateRecorder(CaptureDataAvailableHandler handler, string? targetDeviceIdOrName, string reason)
+    private WasapiRecorder CreateRecorder(CaptureDataAvailableHandler handler, string? targetDeviceIdOrName, string reason)
     {
         var render = ResolveDevice(targetDeviceIdOrName);
         // WasapiRecorderBuilder is the supported path in NAudio 3.1; the older
@@ -128,6 +124,15 @@ internal sealed class AudioCapture : IDisposable
             // which removes the buffer age from the timeline instead of trying to shrink it.
             .Build();
         recorder.DataAvailable += handler;
+
+        // An endpoint with no hardware volume (common on USB headsets) applies the Windows slider in
+        // software BEFORE loopback, so the clip inherited the listening volume: 23% on the slider was
+        // -21 dB in every clip. Kept only for those endpoints; hardware-volume ones already loop back
+        // at full level and must not be boosted.
+        var endpoint = render.AudioEndpointVolume;
+        softwareVolume = !endpoint.HardwareSupport.HasFlag(EEndpointHardwareSupport.Volume) && IsFloat(recorder.WaveFormat)
+            ? endpoint
+            : null;
 
         // The one line that answers "what exactly is being captured". Every audio bug report starts
         // with a device whose rate or channel count nobody logged, and a 44.1 kHz or 5.1 endpoint
@@ -380,12 +385,46 @@ internal sealed class AudioCapture : IDisposable
 
     // WasapiRecorder hands over a ReadOnlySpan that is only valid for this callback, plus the
     // packet's QPC position. The span is copied because the queued write outlives the callback.
+    /// <summary>
+    /// Divides the Windows slider back out of a software-volume endpoint's float samples, so the clip
+    /// records what the application played rather than what the user chose to hear. Read per packet
+    /// because the slider can move during a recording. Integer mix formats are left alone: shared-mode
+    /// loopback is float32 on every endpoint seen so far.
+    /// </summary>
+    private void UndoSoftwareVolume(byte[] samples)
+    {
+        var volume = softwareVolume;
+        if (volume is null)
+            return;
+
+        float levelDb;
+        try
+        {
+            if (volume.Mute)
+                return;
+            levelDb = volume.MasterVolumeLevel;
+        }
+        catch (COMException)
+        {
+            return; // device going away; the reconnect path rebuilds everything
+        }
+
+        if (levelDb >= -0.01f)
+            return;
+
+        var gain = MathF.Pow(10f, Math.Min(-levelDb, MaxVolumeCompensationDb) / 20f);
+        var floats = MemoryMarshal.Cast<byte, float>(samples.AsSpan());
+        for (var i = 0; i < floats.Length; i++)
+            floats[i] *= gain;
+    }
+
     private void OnDataAvailable(ReadOnlySpan<byte> buffer, long qpcPosition)
     {
         // Captured in capture-only mode too, where nothing is written anywhere: the callback still
         // runs on the MMCSS thread, and that thread's activity is what this trace has to expose.
         EventLog.Mark("AUDIO_CB", buffer.Length.ToString());
         var copy = buffer.ToArray();
+        UndoSoftwareVolume(copy);
         Interlocked.Increment(ref bufferCount);
         Interlocked.Add(ref totalBytes, copy.Length);
         if (firstBufferHundredNanos == 0)
