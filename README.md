@@ -155,7 +155,7 @@ Settings apply on the fly and `config.json` is rewritten on disk automatically.
 - **Runtime:** none — the binary is pure Native AOT, no .NET install needed.
 - **GPU:** NVIDIA GeForce (GTX 900+ / GTX 10xx / RTX) for hardware Direct NVENC (0-copy VRAM). On AMD/Intel graphics a software x264 mode is available when an external ffmpeg is present.
 - **Bridge library:** `clippy_nvenc.dll` ships in the release and must sit next to `Clippy.exe`.
-- **Audio:** no microphone needed — recording captures the system output device (exactly what you hear in your headphones or speakers).
+- **Audio:** no microphone needed — recording captures the system output device (exactly what you hear in your headphones or speakers). Studio endpoints (24-bit / 48 kHz PCM) are converted to 16-bit before encoding, so high-end sound cards record with sound instead of silence.
 
 ---
 
