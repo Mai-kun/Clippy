@@ -26,11 +26,14 @@ namespace Clippy;
 ///    and the input queue holds a single frame, so the loop must drain before it feeds.
 ///    MF_E_NOTACCEPTING on ProcessInput is that queue, not an error.
 ///
-/// ponytail: WASAPI delivers float32 and the MFT wants integer PCM, so there is a conversion here, and
-/// there is no resampler -- the endpoint's own rate (48 kHz or 44.1 kHz, chosen per device at startup)
-/// is what the MFT is configured for. A device at any other rate is rejected loudly rather than
-/// silently pitch-shifted. Multichannel endpoints (quad/5.1/7.1 on gaming headsets) are downmixed to
-/// stereo inside the same conversion, because the input type promises the MFT exactly 2 channels.
+/// ponytail: WASAPI delivers float32 and the MFT wants integer PCM, so there is a conversion here.
+/// A studio-format endpoint (e.g. 24-bit / 48 kHz) delivers 24-bit integer instead of float32 --
+/// packed into 3 bytes, or with 24 valid bits padded into a 32-bit container -- and ToInt16 takes
+/// the top 16 bits of every sample in either layout. There is no resampler -- the endpoint's own rate
+/// (48 kHz or 44.1 kHz, chosen per device at startup) is what the MFT is configured for. A device at
+/// any other rate is rejected loudly rather than silently pitch-shifted. Multichannel endpoints
+/// (quad/5.1/7.1 on gaming headsets) are downmixed to stereo inside the same conversion, because the
+/// input type promises the MFT exactly 2 channels.
 /// </summary>
 internal sealed class MfAudioEncoder : IAudioEncoder
 {
@@ -77,6 +80,12 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     private readonly int sourceRate;
     private readonly int sourceChannels;
     private readonly bool sourceIsFloat;
+    // Layout of one source sample, fixed once from the endpoint's real format. Loopback is float32 on
+    // most machines, but a studio-format endpoint delivers 24-bit integer -- packed in 3 bytes, or 24
+    // valid bits padded into a 32-bit container. Reading either as 16-bit integer shifts every sample
+    // and the encoder rejects the garbage: that was the "no sound" report on those machines.
+    private readonly int sourceValidBits;      // 16 or 24 for integer sources; 0 for float32.
+    private readonly int sourceBytesPerSample; // 2 (int16), 3 (packed 24), 4 (float32 or 24-in-32).
     private readonly double masterZeroSeconds;
 
     // Derived from the endpoint's real rate, not a constant: 1024 samples last 213333.3.. hundred-ns
@@ -111,18 +120,25 @@ internal sealed class MfAudioEncoder : IAudioEncoder
         int sourceRate,
         int sourceChannels,
         bool sourceIsFloat,
+        int sourceValidBits,
+        int sourceBytesPerSample,
         double masterZeroSeconds)
     {
         this.transform = transform;
         this.sourceRate = sourceRate;
         this.sourceChannels = sourceChannels;
         this.sourceIsFloat = sourceIsFloat;
+        this.sourceValidBits = sourceValidBits;
+        this.sourceBytesPerSample = sourceBytesPerSample;
         this.masterZeroSeconds = masterZeroSeconds;
         frameDuration100ns = SamplesPerFrame * 10_000_000L / sourceRate;
     }
 
-    /// <summary>Bytes per source sample: loopback is float32, but an integer endpoint stays honest.</summary>
-    private int SourceBytesPerSample => sourceIsFloat ? 4 : 2;
+    /// <summary>
+    /// Bytes per source sample: 4 for float32, 2 for 16-bit integer, 3 for packed 24-bit, 4 for
+    /// 24 valid bits padded into a 32-bit container.
+    /// </summary>
+    private int SourceBytesPerSample => sourceBytesPerSample;
 
     /// <summary>The ring is where encoded frames go; nothing is encoded before this is set.</summary>
     public void StartDrain(RingBuffer target)
@@ -192,6 +208,26 @@ internal sealed class MfAudioEncoder : IAudioEncoder
                 throw new NotSupportedException(
                     $"endpoint is {format.SampleRate} Hz; the MFT path supports {Rate48k} and {Rate44k} Hz only.");
 
+            // The sample layout decides which conversion ToInt16 applies. Everything outside this list
+            // used to be read as 16-bit integer silently -- samples shifted by a byte or two, the
+            // encoder fed garbage, the clip recorded with no sound. Refused outright instead; the
+            // caller falls back to ffmpeg and logs this reason.
+            if (format.IsFloat32)
+            {
+                if (format.BitsPerSample != 32)
+                    throw new NotSupportedException(
+                        $"endpoint is {format.BitsPerSample}-bit float; the MFT path supports 32-bit float only.");
+            }
+            else if (format.BitsPerSample is not (16 or 24)
+                     && !(format.BitsPerSample == 32 && format.ValidBitsPerSample == 24))
+            {
+                var valid = format.ValidBitsPerSample;
+                throw new NotSupportedException(
+                    $"endpoint is {format.BitsPerSample}-bit integer" +
+                    (valid == format.BitsPerSample ? "" : $" with {valid} valid bits") +
+                    "; the MFT path supports 16-bit, 24-bit packed, and 24-bit in a 32-bit container.");
+            }
+
             // Channel count is NOT a reason to refuse a device: anything above stereo is downmixed to
             // stereo in ToInt16, and mono is duplicated to both sides, so the MFT always receives the
             // 2-channel stream its input type promises. A 5.1/7.1 gaming headset used to end in
@@ -259,11 +295,17 @@ internal sealed class MfAudioEncoder : IAudioEncoder
         Console.WriteLine($"[mft] audio encoder {clsid}: {format.SampleRate} Hz, {Channels} ch{downmix}, " +
                           $"{bitrate / 1000} kbps AAC-LC, payload type {PayloadTypeAdts} (ADTS)");
 
+        // Layout of the source stream, per the check in Start: float32, 16-bit int, packed 24-bit, or
+        // 24 valid bits in a 32-bit container. The bytes-per-sample figure is the container width, so
+        // a packed 24-bit endpoint steps 3 bytes per sample (6 per stereo frame) through ToInt16.
+        var isFloat = format.IsFloat32;
         var encoder = new MfAudioEncoder(
             transform,
             format.SampleRate,
             format.Channels,
-            format.IsFloat32,
+            isFloat,
+            sourceValidBits: isFloat ? 0 : Math.Min(format.ValidBitsPerSample, 24),
+            sourceBytesPerSample: format.BitsPerSample / 8,
             masterZeroSeconds);
 
         encoder.running = true;
@@ -328,14 +370,17 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     /// device's raw channel count would not encode "surround" -- it would encode garbage against a
     /// stereo input contract, which is exactly the silence those machines used to record.
     ///
+    /// Stereo integer sources need no mix: 16-bit is copied bit-exact, and 24-bit sources (packed in
+    /// 3 bytes, or 24 valid bits in a 32-bit container) keep the top 16 bits of every sample. The
+    /// step is one whole source sample, so both channels of a frame land in the right place.
+    ///
     /// The leftover carries between packets because WASAPI packets do not divide 1024 (480 samples per
     /// packet at 48 kHz, so 2.13 packets per frame). Feeding only whole frames is what keeps the
     /// ordinal arithmetic exact -- and therefore the A/V alignment exact.
     /// </summary>
     private byte[] ToInt16(byte[] source, byte[] carry, ref int carryLength, out int frames)
     {
-        // float32 is 4 bytes per sample, 16-bit integer is 2. Loopback endpoints report float32 here,
-        // but an integer endpoint must not be silently read as float.
+        // float32 is 4 bytes per sample, 16-bit integer is 2, packed 24-bit is 3 and 24-in-32 is 4.
         var bytesPerSample = SourceBytesPerSample;
         var inputFrames = source.Length / (bytesPerSample * sourceChannels);
         var target = new byte[carryLength + inputFrames * OutputBytesPerFrame];
@@ -343,9 +388,23 @@ internal sealed class MfAudioEncoder : IAudioEncoder
 
         if (!sourceIsFloat && sourceChannels == Channels)
         {
-            // Stereo integer already IS the target format; copying it bit-exact beats a round-trip
-            // through float, which would shave an LSB off positive full-scale samples.
-            Buffer.BlockCopy(source, 0, target, carryLength, inputFrames * OutputBytesPerFrame);
+            if (sourceValidBits == 16)
+            {
+                // Stereo 16-bit integer already IS the target format; copying it bit-exact beats a
+                // round-trip through float, which would shave an LSB off positive full-scale samples.
+                Buffer.BlockCopy(source, 0, target, carryLength, inputFrames * OutputBytesPerFrame);
+            }
+            else
+            {
+                // Stereo 24-bit (packed or padded into 32 bits): take the top 16 bits of every sample.
+                for (var f = 0; f < inputFrames; f++)
+                {
+                    var src = f * bytesPerSample * sourceChannels;
+                    var dst = carryLength + f * OutputBytesPerFrame;
+                    WriteS16(target, dst, ReadTop16(source, src));
+                    WriteS16(target, dst + 2, ReadTop16(source, src + bytesPerSample));
+                }
+            }
         }
         else
         {
@@ -380,9 +439,7 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     {
         if (sourceChannels == 1)
         {
-            var mono = sourceIsFloat
-                ? BitConverter.ToSingle(source, offset)
-                : BitConverter.ToInt16(source, offset) / 32768f;
+            var mono = ReadNormalized(source, offset);
             left = mono;
             right = mono;
             return;
@@ -392,9 +449,7 @@ internal sealed class MfAudioEncoder : IAudioEncoder
         right = 0f;
         for (var ch = 0; ch < sourceChannels; ch++)
         {
-            var value = sourceIsFloat
-                ? BitConverter.ToSingle(source, offset + ch * 4)
-                : BitConverter.ToInt16(source, offset + ch * 2) / 32768f;
+            var value = ReadNormalized(source, offset + ch * bytesPerSample);
 
             switch (ch)
             {
@@ -420,6 +475,45 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     }
 
     /// <summary>
+    /// One source sample's top 16 bits as a signed short. 16-bit is a straight read; packed 24-bit is
+    /// bytes 1 (low) and 2 (high, holding the sign bit); 24 valid bits in a 32-bit container live in
+    /// bytes 2 and 3, because WAVEFORMATEXTENSIBLE aligns the valid bits to the most significant end.
+    /// </summary>
+    private short ReadTop16(byte[] source, int offset)
+    {
+        if (sourceValidBits == 16)
+            return BitConverter.ToInt16(source, offset);
+        if (sourceBytesPerSample == 3)
+            return (short)(source[offset + 1] | (source[offset + 2] << 8));
+        return (short)(source[offset + 2] | (source[offset + 3] << 8));
+    }
+
+    /// <summary>One source sample as [-1, 1), for the downmix sum.</summary>
+    private float ReadNormalized(byte[] source, int offset)
+    {
+        if (sourceIsFloat)
+            return BitConverter.ToSingle(source, offset);
+        if (sourceValidBits == 16)
+            return BitConverter.ToInt16(source, offset) / 32768f;
+
+        int value;
+        if (sourceBytesPerSample == 3)
+        {
+            value = source[offset] | (source[offset + 1] << 8) | (source[offset + 2] << 16);
+            if ((value & 0x00800000) != 0) // sign-extend bit 23 into the int32
+                value |= unchecked((int)0xFF000000);
+        }
+        else
+        {
+            // 24 valid bits, MSB-aligned in the 32-bit container: bytes 1..3, sign bit already at 31.
+            // Shifting down 8 puts them on the same 2^23 scale as the packed branch -- without it the
+            // value is 256x too large and a full-scale sample would come out as -256.0f.
+            value = ((source[offset + 1] << 8) | (source[offset + 2] << 16) | (source[offset + 3] << 24)) >> 8;
+        }
+        return value / 8388608f;
+    }
+
+    /// <summary>
     /// Clamped, then scaled, never a bare cast: (short)3.5f is undefined, and loopback data does
     /// overshoot 1.0 often enough that the wrap would be audible as a click.
     /// </summary>
@@ -431,6 +525,13 @@ internal sealed class MfAudioEncoder : IAudioEncoder
         var s16 = ToS16(value);
         target[offset] = (byte)(s16 & 0xFF);
         target[offset + 1] = (byte)((s16 >> 8) & 0xFF);
+    }
+
+    /// <summary>Little-endian store of an already-16-bit sample (the 24-bit conversion's output path).</summary>
+    private static void WriteS16(byte[] target, int offset, short value)
+    {
+        target[offset] = (byte)(value & 0xFF);
+        target[offset + 1] = (byte)((value >> 8) & 0xFF);
     }
 
     /// <summary>Hands one 1024-sample frame to the encoder. False means the pipeline has stopped.</summary>
@@ -548,7 +649,7 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     /// The 16-bit PCM input type at the endpoint's own rate, stereo because everything above is
     /// downmixed before it gets here. The bits check reads "absent or 16": a type that does not state
     /// a width is the same one this encoder has always accepted, while one that states 24 or 32 is
-    /// one ToInt16 cannot feed.
+    /// not what the conversion emits -- sources of any width are reduced to 16-bit before feeding.
     /// </summary>
     private static IMFMediaType? FindInput(IMFTransform transform, int sampleRate)
     {

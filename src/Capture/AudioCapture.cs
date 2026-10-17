@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
@@ -17,6 +18,10 @@ internal sealed class AudioCapture : IDisposable
 {
     private static readonly Guid PcmSubtype = new("00000001-0000-0010-8000-00aa00389b71");
     private static readonly Guid IeeeFloatSubtype = new("00000003-0000-0010-8000-00aa00389b71");
+
+    // WAVEFORMATEX is 18 bytes; wValidBitsPerSample is the first field of the extensible tail that
+    // follows it in memory (WaveFormatExtensible is sequential, Pack=2).
+    private const int ValidBitsOffset = 18;
 
     private readonly Stopwatch stopwatch;
     // Not readonly: Phase 7 scenario B. When the output device disappears, WASAPI fails the capture
@@ -179,10 +184,16 @@ internal sealed class AudioCapture : IDisposable
     /// </summary>
     private static void LogDeviceDiagnostic(string reason, MMDevice device, WaveFormat format)
     {
-        var sampleKind = IsFloat(format) ? "float" : "int";
+        var isFloat = IsFloat(format);
+        var sampleKind = isFloat ? "float" : "int";
+        // The line every "no sound" bug report needs: rate, channels, container width and whether the
+        // samples are float. Valid bits appear when they differ from the container, because a 24-bit
+        // studio format padded into a 32-bit container would otherwise read as a plain 32-bit one.
+        var validBits = ReadValidBits(format);
+        var validNote = !isFloat && validBits != format.BitsPerSample ? $", valid={validBits}" : "";
         Console.WriteLine(
             $"[audio] {reason}: '{device.FriendlyName}' ({device.ID}), " +
-            $"{format.SampleRate} Hz, {format.Channels} ch, {format.BitsPerSample} bit {sampleKind}");
+            $"{format.SampleRate}Hz, {format.Channels}ch, {format.BitsPerSample}bit{validNote} (Float={isFloat})");
 
         var lines = new List<string>
         {
@@ -250,6 +261,7 @@ internal sealed class AudioCapture : IDisposable
             if (extensible.SubFormat == PcmSubtype)
                 return format.BitsPerSample switch
                 {
+                    24 => "s24le",   // packed 3-byte samples, exactly as the endpoint delivers them
                     > 16 => "s32le",
                     _ => "s16le",
                 };
@@ -260,6 +272,7 @@ internal sealed class AudioCapture : IDisposable
         return format.Encoding switch
         {
             WaveFormatEncoding.IeeeFloat => "f32le",
+            WaveFormatEncoding.Pcm when format.BitsPerSample == 24 => "s24le",
             WaveFormatEncoding.Pcm when format.BitsPerSample > 16 => "s32le",
             WaveFormatEncoding.Pcm => "s16le",
             _ => throw new NotSupportedException($"Unsupported WASAPI sample encoding {format.Encoding}."),
@@ -296,6 +309,35 @@ internal sealed class AudioCapture : IDisposable
         if (format.Encoding == WaveFormatEncoding.Extensible && format is WaveFormatExtensible extensible)
             return extensible.SubFormat == IeeeFloatSubtype;
         return format.Encoding == WaveFormatEncoding.IeeeFloat;
+    }
+
+    /// <summary>Container width in bits: 24 for a packed studio format, 32 for float32 or 24-in-32.</summary>
+    public int BitsPerSample => capture.WaveFormat.BitsPerSample;
+
+    /// <summary>Bits of real precision in one sample (WAVEFORMATEXTENSIBLE's wValidBitsPerSample).</summary>
+    public int ValidBitsPerSample => ReadValidBits(capture.WaveFormat);
+
+    /// <summary>
+    /// wValidBitsPerSample, or BitsPerSample for formats that state no separate precision. NAudio
+    /// keeps the field private, so it is read from the marshalled layout: WaveFormatExtensible is
+    /// sequential (Pack=2) and wValidBitsPerSample sits right after WAVEFORMATEX's 18 bytes.
+    /// </summary>
+    private static int ReadValidBits(WaveFormat format)
+    {
+        if (format is not WaveFormatExtensible extensible)
+            return format.BitsPerSample;
+
+        var handle = GCHandle.Alloc(extensible, GCHandleType.Pinned);
+        try
+        {
+            var validBits = Marshal.ReadInt16(handle.AddrOfPinnedObject(), ValidBitsOffset);
+            // 0 appears on drivers that leave the field blank; the container width is the honest answer.
+            return validBits > 0 ? validBits : format.BitsPerSample;
+        }
+        finally
+        {
+            handle.Free();
+        }
     }
 
     /// <summary>Isolates the loopback from ffmpeg: proves whether WASAPI delivers buffers at all.</summary>
