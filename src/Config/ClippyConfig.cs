@@ -163,6 +163,15 @@ public sealed class ClippyConfig
     public string AudioEncoder { get; set; } = "media_foundation";
 
     /// <summary>
+    /// The audio render device whose loopback gets recorded. "default" (the default) follows the
+    /// system's default output; any other value is the endpoint's ID or exact friendly name, as
+    /// offered by the tray's Audio Device menu. An unknown value falls back to the default with a
+    /// warning, because a stale id in the config must not cost the user their audio. The full
+    /// endpoint list with IDs is logged to logs/audio.log at startup and on every switch.
+    /// </summary>
+    public string AudioDevice { get; set; } = "default";
+
+    /// <summary>
     /// Ask GitHub on startup whether a newer release exists. On by default: the check is one small
     /// request that fails silently, and a recorder that only tells you about updates when you go
     /// looking for them is a recorder most people never update at all.

@@ -80,6 +80,7 @@ Next to `Clippy.exe` you'll find `config.example.json` — a commented sample of
 | `VideoBitrateMbps` | `6` | Target video bitrate in Mbps (2–50) |
 | `MaxClipsFolderSizeGB` | `0` | Disk quota for clips in GB. `0` = unlimited (10 / 20 / 30 / 50) |
 | `AudioEncoder` | `media_foundation` | Audio codec: `media_foundation` (Windows AAC) / `ffmpeg` |
+| `AudioDevice` | `default` | Which system output to capture: `default` (follows Windows) or an exact device name/ID from the tray **Audio Device** menu |
 
 ### Disk-space guard
 
@@ -139,6 +140,7 @@ Right-click the tray icon next to the clock:
 | **Long Clip Hotkey** | independent hotkey (F1–F12, NumPad 0–9) |
 | **Select Clips Folder...** | pick the clips folder via the system dialog |
 | **Clips Storage Limit** | disk quota: Unlimited / 10 / 20 / 30 / 50 GB |
+| **Audio Device** | which system output to capture: Default (System) or any active device — for multi-device setups where the default is not what you hear |
 | **Check for Updates** | check GitHub for a new version and update in one click |
 | **Restart** | soft-restart Clippy |
 | **Exit** | quit safely |

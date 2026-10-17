@@ -88,6 +88,13 @@ public sealed partial class TrayIcon : IDisposable
     private const uint IDC_QUOTA_20 = 1612;
     private const uint IDC_QUOTA_30 = 1613;
     private const uint IDC_QUOTA_50 = 1614;
+
+    // The audio-device submenu gets its own id block, far from every setting above: 5000 is
+    // "Default (System)" and each enumerated render endpoint takes the next id. A machine with more
+    // than 99 output devices keeps the first 99, which no real system has.
+    private const uint IDC_AUDIO_DEFAULT = 5000;
+    private const uint AudioDeviceIdBase = 5001;
+    private const int MaxAudioDevices = 99;
     private const uint IDC_ENCODER_NVENC = 1401;
     private const uint IDC_ENCODER_X264 = 1402;
     private const uint IDC_CODEC_HEVC = 1404;
@@ -348,6 +355,15 @@ public sealed partial class TrayIcon : IDisposable
     private static WndProcDelegate? wndProc;
 
     private readonly ClippyConfig config;
+
+    /// <summary>Set by ScreenCapture.RunVideo so a pick from the Audio Device menu retargets the
+    /// live loopback, not just the config file. Invoked with the endpoint's ID.</summary>
+    public Action<string>? switchAudioDevice;
+
+    /// <summary>The render endpoints drawn in the Audio Device submenu, rebuilt on every menu open.
+    /// The returned menu ids index into this same list, so a device unplugged after the menu was
+    /// drawn still resolves to the row the user actually saw.</summary>
+    private List<(string Id, string Name)> audioDevices = [];
     private readonly Action onExit;
     private readonly string outputFolder;
     private Thread? thread;
@@ -601,6 +617,22 @@ public sealed partial class TrayIcon : IDisposable
                 return;
             }
 
+            // The audio-device block is a range too, not individual cases: 5000 is
+            // "Default (System)" and 5001.. index into audioDevices exactly as drawn when the menu
+            // opened, so a device unplugged since then still resolves to the row the user saw.
+            if (id == IDC_AUDIO_DEFAULT)
+            {
+                ApplyAudioDeviceChoice("default", "Default (System)");
+                return;
+            }
+
+            if (id >= AudioDeviceIdBase && id - AudioDeviceIdBase < (uint)Math.Min(audioDevices.Count, MaxAudioDevices))
+            {
+                var (deviceId, deviceName) = audioDevices[(int)(id - AudioDeviceIdBase)];
+                ApplyAudioDeviceChoice(deviceId, deviceName);
+                return;
+            }
+
             switch (id)
             {
                 case IDC_OPEN_FOLDER:
@@ -792,10 +824,13 @@ public sealed partial class TrayIcon : IDisposable
             (IDC_QUOTA_30, "30 GB", config.MaxClipsFolderSizeGB == 30),
             (IDC_QUOTA_50, "50 GB", config.MaxClipsFolderSizeGB == 50));
 
+        var audioDevicesMenu = AppendAudioSubmenu(menu);
+
         // Keep the handles alive until after the parent menu is shown; the OS reads them during
         // TrackPopupMenuEx, not during AppendMenu.
         _ = shortClip; _ = longClip; _ = bitrate; _ = encoder; _ = codec;
         _ = notifications; _ = shortKey; _ = longKey; _ = quota;
+        _ = audioDevicesMenu;
     }
 
     /// <summary>
@@ -823,6 +858,50 @@ public sealed partial class TrayIcon : IDisposable
         }
 
         AppendMenu(parent, MF_POPUP, (nuint)sub, $"{title} (now {current})");
+        return sub;
+    }
+
+    /// <summary>
+    /// The audio-device submenu: "Default (System)", a separator, then every active render endpoint.
+    /// The list is rebuilt on every open so a USB headset plugged in since the last time shows up
+    /// without a restart, and the same list is kept for the menu-return ids, which index into it.
+    /// </summary>
+    private nint AppendAudioSubmenu(nint parent)
+    {
+        var current = config.AudioDevice;
+        var isDefault = string.IsNullOrWhiteSpace(current)
+            || string.Equals(current, "default", StringComparison.OrdinalIgnoreCase);
+
+        var sub = CreatePopupMenu();
+        AppendMenu(sub, MF_STRING | (isDefault ? MF_CHECKED : 0), IDC_AUDIO_DEFAULT, "Default (System)");
+        AppendMenu(sub, MF_SEPARATOR, 0, "");
+
+        try
+        {
+            audioDevices = AudioCapture.GetActivePlaybackDevices();
+        }
+        catch (Exception ex)
+        {
+            // A menu that kills the process because COM hiccuped would be worse than a short menu;
+            // the Default row alone still lets the user get back to a working configuration.
+            audioDevices = [];
+            Console.WriteLine($"Settings: could not list audio devices ({ex.GetType().Name}); showing Default only.");
+        }
+
+        var count = Math.Min(audioDevices.Count, MaxAudioDevices);
+        for (var i = 0; i < count; i++)
+        {
+            var (id, name) = audioDevices[i];
+            // Matched against both forms on purpose: the config now stores the ID, but a hand-edited
+            // file or an older selection may hold the friendly name, and a check mark that silently
+            // goes missing is how a setting starts looking broken.
+            var isCurrent = !isDefault
+                && (string.Equals(current, id, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(current, name, StringComparison.OrdinalIgnoreCase));
+            AppendMenu(sub, MF_STRING | (isCurrent ? MF_CHECKED : 0), AudioDeviceIdBase + (uint)i, name);
+        }
+
+        AppendMenu(parent, MF_POPUP, (nuint)sub, "Audio Device");
         return sub;
     }
 
@@ -872,6 +951,21 @@ public sealed partial class TrayIcon : IDisposable
             },
             live: true,
             notification: $"{action} hotkey set to {label}");
+    }
+
+    /// <summary>
+    /// Applies a device chosen from the Audio Device menu: persist it, retarget the live capture,
+    /// say so. The ID goes into the config rather than the display name -- friendly names are not
+    /// unique across vendors and translate with the language of Windows, while the ID survives
+    /// reboots and renames. "default" is the one exception, by design.
+    /// </summary>
+    private void ApplyAudioDeviceChoice(string deviceId, string deviceName)
+    {
+        config.AudioDevice = deviceId;
+        config.Save();
+        Console.WriteLine($"Settings: audio device set to '{deviceName}' ({deviceId}).");
+        switchAudioDevice?.Invoke(deviceId);
+        ShowNotification("Clippy", $"Audio device set to: {deviceName}");
     }
 
     private nint Submenu(nint parent, string title, params (uint Id, string Text, bool Checked)[] items)

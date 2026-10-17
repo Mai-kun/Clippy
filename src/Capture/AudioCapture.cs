@@ -21,7 +21,7 @@ internal sealed class AudioCapture : IDisposable
     private readonly Stopwatch stopwatch;
     // Not readonly: Phase 7 scenario B. When the output device disappears, WASAPI fails the capture
     // with AUDCLNT_E_DEVICE_INVALIDATED and the recorder cannot be restarted -- a new one has to be
-    // built on whatever device is the default render endpoint now.
+    // built on the configured device (the current default endpoint when none was chosen).
     private WasapiRecorder capture;
     private readonly object captureSync = new();
     // Wallclock reading (same Stopwatch as the video) of the first video frame written. Audio that
@@ -73,20 +73,35 @@ internal sealed class AudioCapture : IDisposable
     private double silencePrependedMs;
     private volatile bool disposed;
 
-    public AudioCapture(Stopwatch stopwatch, double videoStartSeconds)
+    /// <summary>
+    /// The endpoint the user asked for (config AudioDevice / tray Audio Device menu): null, empty
+    /// or "default" means the system default, anything else is an endpoint ID or friendly name.
+    /// Kept so a reconnect after a device loss returns to the CHOSEN device instead of silently
+    /// following the system default into a monitor or a virtual cable.
+    /// </summary>
+    private string? preferredDevice;
+
+    public AudioCapture(Stopwatch stopwatch, double videoStartSeconds, string? targetDeviceIdOrName = null)
     {
         this.stopwatch = stopwatch;
         this.videoStartSeconds = videoStartSeconds;
+        preferredDevice = targetDeviceIdOrName;
 
         handler = (buffer, flags, devicePosition, qpcPosition) => OnDataAvailable(buffer, qpcPosition);
-        capture = CreateRecorder(handler);
+        capture = CreateRecorder(handler, preferredDevice, "capture start");
         capture.RecordingStopped += OnRecordingStopped;
     }
 
-    /// <summary>Builds a loopback recorder on the CURRENT default render endpoint.</summary>
-    private static WasapiRecorder CreateRecorder(CaptureDataAvailableHandler handler)
+    /// <summary>
+    /// Builds a loopback recorder on the chosen render endpoint. <paramref name="targetDeviceIdOrName"/>
+    /// is the raw config/tray value: null, empty or "default" follows the system default output;
+    /// anything else is matched against the active endpoints' ID or friendly name. An unknown device
+    /// warns and falls back to the default rather than killing the capture -- a headset unplugged
+    /// between the menu being drawn and the click must not end the recording in silence.
+    /// </summary>
+    private static WasapiRecorder CreateRecorder(CaptureDataAvailableHandler handler, string? targetDeviceIdOrName, string reason)
     {
-        var render = new MMDeviceEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+        var render = ResolveDevice(targetDeviceIdOrName);
         // WasapiRecorderBuilder is the supported path in NAudio 3.1; the older
         // WasapiLoopbackCapture type delivered zero buffers when its WaveFormat was overridden.
         var recorder = new WasapiRecorderBuilder()
@@ -101,12 +116,110 @@ internal sealed class AudioCapture : IDisposable
 
         // The one line that answers "what exactly is being captured". Every audio bug report starts
         // with a device whose rate or channel count nobody logged, and a 44.1 kHz or 5.1 endpoint
-        // looks identical to a 48 kHz stereo one from the outside.
-        var mixFormat = recorder.WaveFormat;
-        Console.WriteLine(
-            $"[audio] Device: '{render.FriendlyName}', Format: {mixFormat.SampleRate}Hz, " +
-            $"{mixFormat.Channels}ch, {mixFormat.BitsPerSample}bit (Float={IsFloat(mixFormat)})");
+        // looks identical to a 48 kHz stereo one from the outside. That line, plus the full endpoint
+        // list, goes to disk in logs/audio.log -- see LogDeviceDiagnostic.
+        LogDeviceDiagnostic(reason, render, recorder.WaveFormat);
         return recorder;
+    }
+
+    /// <summary>
+    /// The endpoint behind the user's choice. "default" (or nothing) is the system default render
+    /// endpoint; anything else is matched, case-insensitively, against the ID first (stable across
+    /// reboots and Windows language changes) and then the friendly name (what a hand-edited config
+    /// may hold). No match falls back to the default with a warning: a stale value in the config
+    /// must cost at most one device, not the whole soundtrack.
+    /// </summary>
+    private static MMDevice ResolveDevice(string? targetDeviceIdOrName)
+    {
+        var enumerator = new MMDeviceEnumerator();
+
+        if (string.IsNullOrWhiteSpace(targetDeviceIdOrName)
+            || string.Equals(targetDeviceIdOrName, "default", StringComparison.OrdinalIgnoreCase))
+        {
+            return enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+        }
+
+        using (var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+        {
+            foreach (var dev in devices)
+            {
+                if (string.Equals(dev.ID, targetDeviceIdOrName, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(dev.FriendlyName, targetDeviceIdOrName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return dev;
+                }
+            }
+        }
+
+        Console.WriteLine(
+            $"[wasapi] audio device '{targetDeviceIdOrName}' is not among the active render endpoints; falling back to the system default.");
+        return enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+    }
+
+    /// <summary>All active sound-output endpoints, as (ID, friendly name) -- for the tray menu and the log.</summary>
+    public static List<(string Id, string Name)> GetActivePlaybackDevices()
+    {
+        var result = new List<(string, string)>();
+        using var enumerator = new MMDeviceEnumerator();
+        using var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
+        foreach (var dev in devices)
+        {
+            result.Add((dev.ID, dev.FriendlyName));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The audio diagnostic trail, written at capture start and at every device switch: which
+    /// endpoint was chosen (name and ID), the stream format it delivers, and every OTHER active
+    /// render endpoint. On a machine where the browser plays into the headphones while the default
+    /// endpoint is a monitor or a virtual cable, this file is the whole bug report -- and the
+    /// console is hidden once the recorder lives in the tray, so it is also mirrored through
+    /// UpdateService.LogDiagnostic (update.log + event log + crash log).
+    /// </summary>
+    private static void LogDeviceDiagnostic(string reason, MMDevice device, WaveFormat format)
+    {
+        var sampleKind = IsFloat(format) ? "float" : "int";
+        Console.WriteLine(
+            $"[audio] {reason}: '{device.FriendlyName}' ({device.ID}), " +
+            $"{format.SampleRate} Hz, {format.Channels} ch, {format.BitsPerSample} bit {sampleKind}");
+
+        var lines = new List<string>
+        {
+            $"=== {reason} ===",
+            $"Selected device: '{device.FriendlyName}' ({device.ID})",
+            $"Stream format: {format.SampleRate} Hz, {format.Channels} ch, {format.BitsPerSample} bit {sampleKind} ({format.Encoding})",
+            "Other active render endpoints:",
+        };
+
+        var others = 0;
+        foreach (var (id, name) in GetActivePlaybackDevices())
+        {
+            if (string.Equals(id, device.ID, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            lines.Add($"  - '{name}' ({id})");
+            others++;
+        }
+        if (others == 0)
+            lines.Add("  (none)");
+
+        try
+        {
+            var logDir = LogPaths.LogsDirectory;
+            Directory.CreateDirectory(logDir);
+            File.AppendAllText(
+                Path.Combine(logDir, "audio.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {string.Join(Environment.NewLine, lines)}{Environment.NewLine}{Environment.NewLine}");
+        }
+        catch
+        {
+            // A diagnostic that cannot be written must never take the capture down with it.
+        }
+
+        UpdateService.LogDiagnostic(
+            $"Audio ({reason}): '{device.FriendlyName}' ({device.ID}), {format.SampleRate} Hz, " +
+            $"{format.Channels} ch, {format.BitsPerSample} bit {sampleKind}, {others} other render endpoints");
     }
 
     /// <summary>ffmpeg input arguments for the endpoint's real PCM layout, e.g. "-f f32le -ar 48000 -ac 2".</summary>
@@ -309,9 +422,10 @@ internal sealed class AudioCapture : IDisposable
     /// the stream with AUDCLNT_E_DEVICE_INVALIDATED (0x88890004).
     ///
     /// Unplugging headphones must not kill the capture or the process, so a new recorder is built on
-    /// whatever is the default render endpoint now and the sink carries on. The gap is left to the
-    /// existing gap-filling path in OnDataAvailable: it is detected from qpcPosition, which keeps
-    /// the timeline honest, and re-anchoring here would discard the sample count so far.
+    /// the CHOSEN device (the current default endpoint when none was selected) and the sink carries
+    /// on. The gap is left to the existing gap-filling path in OnDataAvailable: it is detected from
+    /// qpcPosition, which keeps the timeline honest, and re-anchoring here would discard the sample
+    /// count so far.
     /// </summary>
     private void OnRecordingStopped(object? sender, StoppedEventArgs e)
     {
@@ -329,7 +443,7 @@ internal sealed class AudioCapture : IDisposable
                 var hresult = failure.HResult & 0xFFFFFFFF;
                 var invalidated = hresult == 0x88890004 || hresult == 0x88890008;
                 Console.WriteLine(invalidated
-                    ? "[wasapi] device invalidated -- reconnecting to the default render endpoint"
+                    ? "[wasapi] device invalidated -- reconnecting to the preferred render endpoint"
                     : "[wasapi] unexpected failure -- not reconnecting, capture stays dead");
 
                 if (!invalidated)
@@ -338,18 +452,9 @@ internal sealed class AudioCapture : IDisposable
 
             try
             {
-                capture.DataAvailable -= handler;
-                capture.RecordingStopped -= OnRecordingStopped;
-                try
-                {
-                    capture.Dispose();
-                }
-                catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException)
-                {
-                    // Already torn down by the OS; nothing left to release.
-                }
+                DetachRecorder();
 
-                var replacement = CreateRecorder(handler);
+                var replacement = CreateRecorder(handler, preferredDevice, "reconnect after device loss");
                 replacement.RecordingStopped += OnRecordingStopped;
                 capture = replacement;
                 capture.StartRecording();
@@ -361,6 +466,86 @@ internal sealed class AudioCapture : IDisposable
                 // the process alive: video recording continues, and the video ring still exports.
                 Console.WriteLine($"[wasapi] reconnect failed: {ex.GetType().Name}: {ex.Message}");
             }
+        }
+    }
+
+    /// <summary>
+    /// Retargets the loopback onto another render endpoint while the recording keeps running --
+    /// the tray's Audio Device menu calls this after the config has been updated.
+    ///
+    /// The timeline anchors (anchorQpcSeconds, samplesSoFar, gapAnchorSet) are deliberately left
+    /// untouched, and so is the caller's masterZero: qpcPosition is one global hardware clock
+    /// shared by every endpoint, so packets from the new device land on the same timeline, and the
+    /// existing gap-filling path in OnDataAvailable absorbs the switch as if the stream had paused.
+    /// </summary>
+    public void SwitchDevice(string targetDeviceIdOrName)
+    {
+        lock (captureSync)
+        {
+            if (disposed)
+                return;
+
+            var previousTarget = preferredDevice;
+            var oldFormat = capture.WaveFormat;
+
+            try
+            {
+                DetachRecorder();
+                preferredDevice = targetDeviceIdOrName;
+                capture = CreateRecorder(handler, preferredDevice, "device switch");
+                capture.RecordingStopped += OnRecordingStopped;
+                capture.StartRecording();
+
+                // The audio encoder was configured with the FIRST device's layout. A device that
+                // disagrees on rate or channels would be fed frames it was never set up for, which
+                // sounds wrong rather than failing loudly -- so say it where the user will look.
+                var newFormat = capture.WaveFormat;
+                if (newFormat.SampleRate != oldFormat.SampleRate || newFormat.Channels != oldFormat.Channels)
+                {
+                    var warning =
+                        $"Audio: switched device but the mix format changed " +
+                        $"({oldFormat.SampleRate} Hz/{oldFormat.Channels} ch -> {newFormat.SampleRate} Hz/{newFormat.Channels} ch); " +
+                        "the encoder keeps the layout it started with, audio after the switch may sound off.";
+                    Console.WriteLine(warning);
+                    UpdateService.LogDiagnostic(warning);
+                }
+            }
+            catch (Exception ex)
+            {
+                // The menu snapshot can go stale between opening and clicking (headset unplugged).
+                // The old recorder is already gone, so rebuild the previous device rather than leave
+                // the recording without any sound at all.
+                preferredDevice = previousTarget;
+                Console.WriteLine(
+                    $"[wasapi] switch to '{targetDeviceIdOrName}' failed: {ex.GetType().Name}: {ex.Message}; restoring '{previousTarget ?? "default"}'");
+                try
+                {
+                    capture = CreateRecorder(handler, preferredDevice, "fallback after failed switch");
+                    capture.RecordingStopped += OnRecordingStopped;
+                    capture.StartRecording();
+                }
+                catch (Exception fallbackEx)
+                {
+                    UpdateService.LogDiagnostic(
+                        $"Audio: switch to '{targetDeviceIdOrName}' failed ({ex.GetType().Name}: {ex.Message}) " +
+                        $"and the fallback device is gone too ({fallbackEx.GetType().Name}); audio capture is dead until restart.");
+                }
+            }
+        }
+    }
+
+    /// <summary>Unsubscribes and releases the current recorder; the caller holds captureSync.</summary>
+    private void DetachRecorder()
+    {
+        capture.DataAvailable -= handler;
+        capture.RecordingStopped -= OnRecordingStopped;
+        try
+        {
+            capture.Dispose();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException)
+        {
+            // Already torn down by the OS; nothing left to release.
         }
     }
 

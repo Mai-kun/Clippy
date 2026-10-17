@@ -66,6 +66,14 @@ internal sealed partial class ScreenCapture : IDisposable
     private bool audioCaptureOnly;
     private int discardedAudioBuffers;
     private double videoStartSeconds;
+
+    /// <summary>
+    /// Retargets the live loopback to another render endpoint, from the tray's Audio Device menu.
+    /// The capture is built lazily at the first frame, so a choice made before that simply joins
+    /// the config the recorder reads when it opens the device; after that it switches in place.
+    /// </summary>
+    public void SwitchAudioDevice(string deviceIdOrName) => audio?.SwitchDevice(deviceIdOrName);
+
     /// <summary>
     /// Writes the last <paramref name="durationSeconds"/> still held in the rings to an MP4 file.
     /// Called from the phase 6 hotkey worker thread, so it must not assume it owns the rings.
@@ -731,6 +739,9 @@ internal sealed partial class ScreenCapture : IDisposable
         {
             capture.tray = trayIcon;
 
+            // The Audio Device menu has to reach the live loopback, not just the config file.
+            trayIcon.switchAudioDevice = capture.SwitchAudioDevice;
+
             if (updated)
             {
                 trayIcon.ShowNotification("Clippy", $"Program successfully updated to version {UpdateService.CurrentVersion}!");
@@ -1121,7 +1132,7 @@ internal sealed partial class ScreenCapture : IDisposable
                         videoOnlyPath = Path.ChangeExtension(videoPath, ".video.h264");
                         if (audioCaptureOnly)
                         {
-                            audio = new AudioCapture(stopwatch, videoStartSeconds);
+                            audio = new AudioCapture(stopwatch, videoStartSeconds, config.AudioDevice);
                             audio.Sink = (buffer, qpc) => Interlocked.Increment(ref discardedAudioBuffers);
                             audioEncoder = null;
                             audioOnlyPath = null;
@@ -1130,7 +1141,7 @@ internal sealed partial class ScreenCapture : IDisposable
                         else
                         {
                             audioOnlyPath = Path.ChangeExtension(videoPath, ".audio.aac");
-                            audio = new AudioCapture(stopwatch, videoStartSeconds);
+                            audio = new AudioCapture(stopwatch, videoStartSeconds, config.AudioDevice);
                             ArgumentNullException.ThrowIfNull(audioRing);
                             audioEncoder = StartAudioEncoder(config, audio, audioOnlyPath, stopwatch, audioRing, masterZeroSeconds, logsDirectory);
                             audio.Sink = (buffer, qpc) => audioEncoder!.Write(buffer, qpc);
