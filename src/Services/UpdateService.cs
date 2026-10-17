@@ -25,7 +25,7 @@ internal readonly record struct UpdateInfo(bool Available, string Tag, string Do
 /// </summary>
 internal static class UpdateService
 {
-    public const string CurrentVersion = "v1.4.0";
+    public const string CurrentVersion = "v1.4.1";
     private const string ApiUrl = "https://api.github.com/repos/Mai-kun/Clippy/releases/latest";
 
     /// <summary>Installer, used when the running copy was installed by the setup.</summary>
@@ -353,6 +353,30 @@ internal static class UpdateService
 
         EventLog.Mark("UPDATE", message);
         CrashLog.Write($"Update: {message}");
+    }
+
+    /// <summary>
+    /// Writes a non-update startup failure (the audio encoder refusing to start, and friends) into
+    /// the same diagnostics the updater owns: logs/update.log and logs/clippy-error.log. The console
+    /// is hidden by the tray, and a fallback that "still works" is exactly how a machine ends up
+    /// recording video with no sound and no file anywhere that says why.
+    /// </summary>
+    public static void LogDiagnostic(string message)
+    {
+        try
+        {
+            var logDir = LogPaths.LogsDirectory;
+            Directory.CreateDirectory(logDir);
+            File.AppendAllText(
+                Path.Combine(logDir, "update.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
+        }
+        catch
+        {
+        }
+
+        EventLog.Mark("DIAG", message);
+        CrashLog.Write(message);
     }
 
     /// <summary>

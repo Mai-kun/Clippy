@@ -7,11 +7,11 @@ namespace Clippy;
 /// <summary>
 /// System audio via WASAPI loopback, on the same capture clock as the video.
 ///
-/// ponytail: raw PCM goes to ffmpeg's audio stdin, so there is no WAV header and nothing to patch.
-/// The endpoint's own mix format is passed through to ffmpeg verbatim rather than resampling: the
-/// smoke test shows it is float32 48 kHz stereo here, and converting it would add a resampler and
-/// its own latency to the A/V comparison. Upgrade path: insert a resampler if a non-48 kHz device
-/// must be supported, and keep the -f/-ar/-ac arguments derived from Format.
+/// ponytail: raw PCM goes to the encoder, so there is no WAV header and nothing to patch. The
+/// endpoint's own mix format is passed through verbatim rather than resampled: typical endpoints are
+/// float32 48 kHz stereo, and 44.1 kHz or multichannel devices are handled by the MFT path (rate
+/// chosen per device, downmix to stereo) instead of a resampler here. The -f/-ar/-ac arguments stay
+/// derived from Format for the ffmpeg fallback.
 /// </summary>
 internal sealed class AudioCapture : IDisposable
 {
@@ -98,6 +98,14 @@ internal sealed class AudioCapture : IDisposable
             // which removes the buffer age from the timeline instead of trying to shrink it.
             .Build();
         recorder.DataAvailable += handler;
+
+        // The one line that answers "what exactly is being captured". Every audio bug report starts
+        // with a device whose rate or channel count nobody logged, and a 44.1 kHz or 5.1 endpoint
+        // looks identical to a 48 kHz stereo one from the outside.
+        var mixFormat = recorder.WaveFormat;
+        Console.WriteLine(
+            $"[audio] Device: '{render.FriendlyName}', Format: {mixFormat.SampleRate}Hz, " +
+            $"{mixFormat.Channels}ch, {mixFormat.BitsPerSample}bit (Float={IsFloat(mixFormat)})");
         return recorder;
     }
 
@@ -167,15 +175,14 @@ internal sealed class AudioCapture : IDisposable
     /// Are the callback's bytes 32-bit float? The MFT wants integer PCM, so the encoder has to know
     /// which conversion to apply, and guessing produces noise rather than an error.
     /// </summary>
-    public bool IsFloat32
+    public bool IsFloat32 => IsFloat(capture.WaveFormat);
+
+    /// <summary>Sub-format decides under WAVE_FORMAT_EXTENSIBLE; the encoding alone is not enough.</summary>
+    private static bool IsFloat(WaveFormat format)
     {
-        get
-        {
-            var format = capture.WaveFormat;
-            if (format.Encoding == WaveFormatEncoding.Extensible && format is WaveFormatExtensible extensible)
-                return extensible.SubFormat == IeeeFloatSubtype;
-            return format.Encoding == WaveFormatEncoding.IeeeFloat;
-        }
+        if (format.Encoding == WaveFormatEncoding.Extensible && format is WaveFormatExtensible extensible)
+            return extensible.SubFormat == IeeeFloatSubtype;
+        return format.Encoding == WaveFormatEncoding.IeeeFloat;
     }
 
     /// <summary>Isolates the loopback from ffmpeg: proves whether WASAPI delivers buffers at all.</summary>

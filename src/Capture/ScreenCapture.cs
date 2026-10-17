@@ -1567,9 +1567,14 @@ internal sealed partial class ScreenCapture : IDisposable
             }
             catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
             {
-                Console.WriteLine($"[audio] Media Foundation encoder unavailable ({ex.GetType().Name}: {ex.Message})");
-                Console.WriteLine("[audio] falling back to ffmpeg for audio -- the recording still works, " +
-                                  "it just needs the ffmpeg process again.");
+                // The console alone is not evidence: the tray hides it. update.log + clippy-error.log
+                // are where a "my clips have no sound" report gets its first real clue, so the exact
+                // reason is written there before the fallback takes over.
+                var reason = $"[audio] Media Foundation encoder unavailable ({ex.GetType().Name}: {ex.Message}); " +
+                             "falling back to ffmpeg for audio -- the recording still works, it just needs " +
+                             "the ffmpeg process again.";
+                Console.WriteLine(reason);
+                UpdateService.LogDiagnostic(reason);
             }
         }
 
