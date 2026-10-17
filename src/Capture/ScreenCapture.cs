@@ -505,6 +505,8 @@ internal sealed partial class ScreenCapture : IDisposable
     private IVideoEncoder? encoder;
     /// <summary>True once the audio side has been wired on the first frame.</summary>
     private bool audioInitialised;
+    /// <summary>True once the first frame has reached the encoder (after any calibration).</summary>
+    private bool firstFrameEncoded;
 
     // Phase 4: the encoders feed these in-memory rings instead of writing files, and a clip is
     // produced by slicing them. The only thing the two share is the capture clock on each packet.
@@ -1133,7 +1135,11 @@ internal sealed partial class ScreenCapture : IDisposable
                 // The video origin on the shared Stopwatch, taken before anything else in this frame.
                 // AudioCapture needs it at construction to prepend the right amount of silence, and the
                 // GPU copy below costs milliseconds that would otherwise land in the measured gap.
-                if (currentFrame == 1)
+                // NOT currentFrame == 1: the direct NVENC calibration drops the first ~40 frames, so
+                // frame 1 never gets here and audio.Start() below was never called -- silent clips.
+                var isFirstFrame = !firstFrameEncoded;
+                firstFrameEncoded = true;
+                if (isFirstFrame)
                     videoStartSeconds = stopwatch.Elapsed.TotalSeconds;
 
                 // Hand the frame over the way this encoder can take it.
