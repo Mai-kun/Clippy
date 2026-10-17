@@ -1194,12 +1194,12 @@ internal sealed partial class ScreenCapture : IDisposable
 
                 // SystemRelativeTime is Windows' own capture timestamp: the same clock ffmpeg reads
                 // -use_wallclock_as_timestamps against, so it is the reference for PTS verification.
-                var isFirstFrame = currentFrame == 1;
+                var firstFrameByCounter = currentFrame == 1;
 
                 // Startup cross-check: the compositor's own QPC for the first video frame, against
                 // the first audio packet's QPC. Their difference is the whole A/V offset, measured
                 // directly on the hardware clock, with no alignment or muxer in the way.
-                if (isFirstFrame)
+                if (firstFrameByCounter)
                 {
                     Console.WriteLine($"[start] first VIDEO frame: sysRelTicks={frame.SystemRelativeTime.Ticks} " +
                         $"qpc={(frame.SystemRelativeTime.Ticks / 1e7):F6} " +
