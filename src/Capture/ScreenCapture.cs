@@ -136,6 +136,40 @@ internal sealed partial class ScreenCapture : IDisposable
         var videoPackets = DiskSpooler.SliceHybrid(videoRing, videoSpool, from, to);
         var audioPackets = DiskSpooler.SliceHybrid(audioRing, audioSpool, from, to);
 
+        // ---- audio-tract diagnostics for every export --------------------------------------------
+        try
+        {
+            var logDir = logsDirectory;
+            Directory.CreateDirectory(logDir);
+            var vCount = videoPackets.Count;
+            var aCount = audioPackets.Count;
+            var lines = new List<string>
+            {
+                $"[export] Video packets: {vCount}, Audio packets: {aCount}",
+            };
+            if (audio is not null)
+            {
+                lines.Add($"[export] WASAPI: buffersReceived={audio.BufferCount}, bytesReceived={audio.BytesReceived}, " +
+                    $"device='{audio.SelectedDeviceName ?? "(default)"}'");
+                if (aCount == 0)
+                {
+                    lines.Add(
+                        $"[export] WARNING: No audio in clip! WASAPI received {audio.BytesReceived} bytes " +
+                        $"from '{audio.SelectedDeviceName ?? "(default)"}'. " +
+                        "If sound is playing, check if audio is routed to another device/channel in Windows " +
+                        "(e.g. game vs voice channel).");
+                }
+            }
+            File.AppendAllText(
+                Path.Combine(logDir, "audio.log"),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {string.Join(Environment.NewLine, lines)}{Environment.NewLine}{Environment.NewLine}");
+        }
+        catch
+        {
+            // A diagnostic that cannot be written must never take the capture down with it.
+        }
+        // -----------------------------------------------------------------------------------------
+
         // Raw ring data first, so a bad slice is visible here and not as an ffprobe error later.
         var (captured, accessUnits) = encoder.TimingCounts;
 

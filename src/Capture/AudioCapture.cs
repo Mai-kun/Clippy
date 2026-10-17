@@ -74,6 +74,16 @@ internal sealed class AudioCapture : IDisposable
     {
         get { lock (captureSync) { return capture.WaveFormat.BlockAlign; } }
     }
+
+    /// <summary>WASAPI buffers delivered to the callback since the capture started.</summary>
+    public int BufferCount => bufferCount;
+
+    /// <summary>Total bytes delivered by WASAPI to the callback since the capture started.</summary>
+    public long BytesReceived => totalBytes;
+
+    /// <summary>The endpoint the user asked for (config AudioDevice / tray Audio Device menu):
+    /// null, empty or \"default\" means the system default, anything else is an endpoint ID or friendly name.</summary>
+    public string? SelectedDeviceName => preferredDevice;
     private int packetsSeen;
     private double silencePrependedMs;
     private volatile bool disposed;
