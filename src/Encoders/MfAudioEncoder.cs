@@ -537,8 +537,11 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     /// <summary>Hands one 1024-sample frame to the encoder. False means the pipeline has stopped.</summary>
     private bool Feed(ReadOnlySpan<byte> pcm)
     {
+        // Both wrappers are disposed: AddBuffer takes the sample's OWN reference, so ours must still
+        // be released. Leaving the buffer undisposed leaked ~12 KB of native memory per AAC frame
+        // (with the output buffer below) -- ~2 GB of commit per hour, never touched again.
         using var sample = MediaFactory.MFCreateSample();
-        var buffer = MediaFactory.MFCreateMemoryBuffer(pcm.Length);
+        using var buffer = MediaFactory.MFCreateMemoryBuffer(pcm.Length);
         buffer.Lock(out var dst, out _, out _);
         Marshal.Copy(pcm.ToArray(), 0, dst, pcm.Length);
         buffer.Unlock();
@@ -572,7 +575,8 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     {
         using var sample = MediaFactory.MFCreateSample();
         // The pre-allocated buffer is not optional: without it this encoder answers E_INVALIDARG.
-        sample.AddBuffer(MediaFactory.MFCreateMemoryBuffer(8192));
+        using var outputBuffer = MediaFactory.MFCreateMemoryBuffer(8192);
+        sample.AddBuffer(outputBuffer);
         var data = new OutputDataBuffer { StreamID = 0, Sample = sample };
 
         try
