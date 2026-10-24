@@ -297,6 +297,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
                 {
                     try { transform.ProcessInput(0, pending, 0); }
                     catch (SharpGenException) { /* the MFT is finished asking; the tail is lost */ }
+                    finally { pending.Dispose(); }
                 }
                 transform.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero);
                 for (var spin = 0; spin < 2000; spin++)
@@ -372,6 +373,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         {
             transform.ProcessInput(0, sample, 0);
             Interlocked.Increment(ref captured);
+            sample.Dispose(); // the MFT took its own reference; ours is done
         }
         catch (SharpGenException ex) when (ex.HResult == NotAccepting)
         {
@@ -381,6 +383,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         }
         catch (SharpGenException ex)
         {
+            sample.Dispose();
             Interlocked.Increment(ref refusedCount);
             Console.WriteLine($"[mf-video] ProcessInput refused a frame: 0x{ex.HResult:x8} {ex.Message}");
         }
@@ -388,10 +391,15 @@ internal sealed class MfVideoEncoder : IVideoEncoder
 
     private void DrainOnce()
     {
-        var sample = MediaFactory.MFCreateSample();
+        // Every wrapper here is disposed: AddBuffer/ProcessOutput hold their own references, and an
+        // undisposed one strands its native memory (4 MB per frame for the output buffer).
+        using var sample = MediaFactory.MFCreateSample();
         var data = new OutputDataBuffer { StreamID = 0, Sample = providesSamples ? null : sample };
         if (!providesSamples)
-            sample.AddBuffer(MediaFactory.MFCreateMemoryBuffer(4 * 1024 * 1024));
+        {
+            using var outputBuffer = MediaFactory.MFCreateMemoryBuffer(4 * 1024 * 1024);
+            sample.AddBuffer(outputBuffer);
+        }
 
         try
         {
@@ -405,8 +413,8 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         }
 
         var produced = data.Sample ?? sample;
-        if (produced is null)
-            return;
+        // An MFT-allocated sample is handed to us with a reference we now own.
+        using var mftSample = ReferenceEquals(produced, sample) ? null : produced;
 
         byte[] bytes;
         using (var contiguous = produced.ConvertToContiguousBuffer())
