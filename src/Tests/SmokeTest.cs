@@ -30,6 +30,7 @@ internal static class SmokeTest
         failures += Check("Overlay: text block is centred and the border is a hairline", OverlayLayout);
         failures += Check("Overlay: rendered card has a neutral hairline and symmetric insets", OverlayPixels);
         failures += Check("Clip stamp: duration rounds to the nearest second", ClipDurationRounding);
+        failures += Check("Logs: no file grows past the size ceiling", LogSizeCap);
 
         Console.WriteLine(failures == 0 ? "SMOKE: OK" : $"SMOKE: FAILED ({failures})");
         return failures;
@@ -239,6 +240,49 @@ private static void FolderPickerApartment()
     /// Two clips inside one second is the other failure: same name, and the second silently
     /// overwrote a recording the user had asked for.
     /// </summary>
+    /// <summary>
+    /// Both log shapes, written well past the ceiling: the appended logs (update.log and friends) and
+    /// the per-session writers (ffmpeg debug/timing). Either one growing unbounded is how the logs
+    /// folder once reached gigabytes, so each must stay at or under MaxFileBytes and keep the newest
+    /// line.
+    /// </summary>
+    private static void LogSizeCap()
+    {
+        var folder = Path.Combine(Path.GetTempPath(), $"clippy-logcap-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var line = new string('x', 1000) + Environment.NewLine;
+            var lines = (int)(LogPaths.MaxFileBytes * 3 / line.Length);
+
+            var appended = Path.Combine(folder, "append.log");
+            for (var i = 0; i < lines; i++)
+                LogPaths.AppendCapped(appended, line);
+            LogPaths.AppendCapped(appended, "last" + Environment.NewLine);
+
+            var streamed = Path.Combine(folder, "stream.log");
+            using (var writer = LogPaths.CreateCapped(streamed))
+            {
+                for (var i = 0; i < lines; i++)
+                    writer.Write(line);
+                writer.Write("last" + Environment.NewLine);
+            }
+
+            foreach (var path in new[] { appended, streamed })
+            {
+                var length = new FileInfo(path).Length;
+                if (length > LogPaths.MaxFileBytes)
+                    throw new InvalidOperationException($"{Path.GetFileName(path)} is {length} bytes, over the ceiling");
+                if (File.ReadAllLines(path)[^1] != "last")
+                    throw new InvalidOperationException($"{Path.GetFileName(path)} lost its newest line");
+            }
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
+
     private static void ClipNaming()
     {
         var folder = Path.Combine(Path.GetTempPath(), $"clippy-naming-{Guid.NewGuid():N}");

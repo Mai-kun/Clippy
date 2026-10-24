@@ -770,10 +770,6 @@ internal sealed partial class ScreenCapture : IDisposable
         Console.WriteLine($"Capture output: {outputDirectory}");
         Console.WriteLine("Waiting for frames from Windows.Graphics.Capture.");
 
-        // One trace for every thread of this recording, all stamped from the same Stopwatch.
-        EventLog.Clock = stopwatch;
-        EventLog.Start(Path.Combine(logsDirectory, $"events-{DateTime.Now:yyyyMMdd-HHmmssfff}.csv"));
-
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
         {
             eventArgs.Cancel = true;
@@ -1033,8 +1029,6 @@ internal sealed partial class ScreenCapture : IDisposable
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object _)
     {
-        EventLog.Mark("FB_ENTER");
-
         // This runs on a WinRT-dispatched thread the CLR does not own, and an unhandled exception
         // there takes the WHOLE process down with no message and no exit code worth reading. That is
         // what "it recorded for a while and then simply vanished" looked like: one COM failure inside
@@ -1055,7 +1049,6 @@ internal sealed partial class ScreenCapture : IDisposable
     {
         lock (sync)
         {
-            EventLog.Mark("FB_LOCK");
             if (disposed)
                 return;
 

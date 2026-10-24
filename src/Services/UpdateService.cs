@@ -334,32 +334,13 @@ internal static class UpdateService
         }
     }
 
-    /// <summary>
-    /// Logs messages to logs/update.log, logs/clippy-error.log, EventLog and Console.
-    /// </summary>
-    private static void Log(string message)
-    {
-        try
-        {
-            var logDir = LogPaths.LogsDirectory;
-            Directory.CreateDirectory(logDir);
-            File.AppendAllText(
-                Path.Combine(logDir, "update.log"),
-                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
-        }
-        catch
-        {
-        }
-
-        EventLog.Mark("UPDATE", message);
-        CrashLog.Write($"Update: {message}");
-    }
+    private static void Log(string message) => LogDiagnostic($"Update: {message}");
 
     /// <summary>
-    /// Writes a non-update startup failure (the audio encoder refusing to start, and friends) into
-    /// the same diagnostics the updater owns: logs/update.log and logs/clippy-error.log. The console
-    /// is hidden by the tray, and a fallback that "still works" is exactly how a machine ends up
-    /// recording video with no sound and no file anywhere that says why.
+    /// Writes a diagnostic (update checks, the audio encoder refusing to start, and friends) into
+    /// logs/update.log. The console is hidden by the tray, and a fallback that "still works" is
+    /// exactly how a machine ends up recording video with no sound and no file anywhere that says
+    /// why. clippy-error.log is kept for real failures, so it is not copied there.
     /// </summary>
     public static void LogDiagnostic(string message)
     {
@@ -367,16 +348,13 @@ internal static class UpdateService
         {
             var logDir = LogPaths.LogsDirectory;
             Directory.CreateDirectory(logDir);
-            File.AppendAllText(
+            LogPaths.AppendCapped(
                 Path.Combine(logDir, "update.log"),
                 $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
         }
         catch
         {
         }
-
-        EventLog.Mark("DIAG", message);
-        CrashLog.Write(message);
     }
 
     /// <summary>

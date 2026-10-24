@@ -13,6 +13,54 @@ internal static class LogPaths
     public const int KeepFiles = 10;
 
     /// <summary>
+    /// Size ceiling for any single log file. A tray recorder runs for days, and a log with no ceiling
+    /// is how the logs folder once reached gigabytes.
+    /// </summary>
+    public const long MaxFileBytes = 10 * 1024 * 1024;
+
+    /// <summary>
+    /// Appends to a long-lived log (update.log, audio.log, clippy-error.log), starting the file over
+    /// once it has reached <see cref="MaxFileBytes"/>.
+    /// ponytail: start-over, not roll-to-.old -- the oldest history is dropped at the ceiling. Keep
+    /// one previous file if a report ever needs what came just before the reset.
+    /// </summary>
+    public static void AppendCapped(string path, string text)
+    {
+        if (new FileInfo(path) is { Exists: true, Length: >= MaxFileBytes })
+            File.Delete(path);
+        File.AppendAllText(path, text);
+    }
+
+    /// <summary>
+    /// A per-session log writer (the ffmpeg debug and timing logs) that starts over at
+    /// <see cref="MaxFileBytes"/> instead of growing for as long as the recorder runs.
+    /// </summary>
+    public static StreamWriter CreateCapped(string path) =>
+        new(new CappedFileStream(path)) { AutoFlush = true };
+
+    private sealed class CappedFileStream(string path)
+        : FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read)
+    {
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            StartOverIfFull(buffer.Length);
+            base.Write(buffer);
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            StartOverIfFull(count);
+            base.Write(buffer, offset, count);
+        }
+
+        private void StartOverIfFull(int incoming)
+        {
+            if (Position + incoming > MaxFileBytes)
+                SetLength(0); // also moves Position back to 0
+        }
+    }
+
+    /// <summary>
     /// The absolute log directory for a config: beside the exe, never the working directory.
     ///
     /// One definition, used by both the recorder and the tray's "Open Logs Folder": two separate

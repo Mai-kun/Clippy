@@ -112,7 +112,7 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
         // frame arrived, swWriteDoneMs is when the last byte hit ffmpeg's stdin, systemTimeMs is the
         // WGC SystemRelativeTime (Windows' own capture clock), so pipeline delay is measurable.
         var timingPath = TimingLogPath(outputPath, logDirectory);
-        var timingLog = new StreamWriter(timingPath, append: false) { AutoFlush = true };
+        var timingLog = LogPaths.CreateCapped(timingPath);
         timingLog.WriteLine("frame,swCaptureMs,swWriteDoneMs,systemTimeMs,payloadBytes");
 
         var startInfo = new ProcessStartInfo
@@ -183,10 +183,7 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
         // the same helper Dispose reads it back with, or teardown looks for a file nobody wrote.
         // The handler must be attached before BeginErrorReadLine, and the async reader owns stderr
         // from then on, so Dispose must not call ReadToEnd.
-        var debugLog = new StreamWriter(DebugLogPath(outputPath, logDirectory), append: false)
-        {
-            AutoFlush = true,
-        };
+        var debugLog = LogPaths.CreateCapped(DebugLogPath(outputPath, logDirectory));
         var gate = new FfmpegStartupGate();
         process.ErrorDataReceived += (_, e) =>
         {
@@ -408,17 +405,13 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
         timingLog!.WriteLine(string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
             $"{index},{captureMs:F3},0,{systemTimeMs:F3},{bgraPixels.Length}"));
-        EventLog.Mark("WRITE_ENTER", index.ToString());
-        EventLog.Mark("STDIN_BEFORE", index.ToString());
 
         stdin.Write(bgraPixels);
 
-        EventLog.Mark("STDIN_AFTER", index.ToString());
         frameCount++;
         timingLog.WriteLine(string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
             $"{index},{captureMs:F3},{stopwatch.Elapsed.TotalMilliseconds:F3},{systemTimeMs:F3},{bgraPixels.Length}"));
-        EventLog.Mark("WRITE_DONE", index.ToString());
     }
 
     public void Dispose()
