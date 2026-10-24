@@ -100,7 +100,7 @@ internal sealed class FfmpegAudioEncoder : IAudioEncoder
         // audio logs used to be the same file: the second StreamWriter opened with append:false
         // truncated what the first had just written, and the audio ffmpeg log was lost every run.
         var debugLogPath = LogPaths.Resolve(logDirectory, path, ".audio-ffmpeg-debug.log");
-        var debugLog = new StreamWriter(debugLogPath, append: false) { AutoFlush = true };
+        var debugLog = LogPaths.CreateCapped(debugLogPath);
         var gate = new FfmpegStartupGate();
         process.ErrorDataReceived += (_, e) =>
         {
@@ -112,7 +112,7 @@ internal sealed class FfmpegAudioEncoder : IAudioEncoder
         };
         process.BeginErrorReadLine();
 
-        var timingLog = new StreamWriter(LogPaths.Resolve(logDirectory, path, ".audio-timing.csv"), append: false) { AutoFlush = true };
+        var timingLog = LogPaths.CreateCapped(LogPaths.Resolve(logDirectory, path, ".audio-timing.csv"));
         var encoder = new FfmpegAudioEncoder(
             process,
             process.StandardInput.BaseStream,

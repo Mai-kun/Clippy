@@ -29,7 +29,7 @@ internal static class CrashLog
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
 
-                File.AppendAllText(
+                LogPaths.AppendCapped(
                     Path,
                     $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}{Environment.NewLine}");
             }

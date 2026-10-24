@@ -170,12 +170,11 @@ public sealed class HotkeyService : IDisposable
                 continue;
             }
 
-            // Breadcrumbs, because a failure here used to end the process with nothing on screen.
-            CrashLog.Write($"hotkey: export of {seconds / 1000.0:F0}s starting");
+            // Only the failure is logged: a failure here used to end the process with nothing on
+            // screen. A normal export already leaves its "Export:" line in update.log.
             try
             {
                 export(seconds / 1000.0);
-                CrashLog.Write("hotkey: export returned normally");
             }
             catch (Exception ex)
             {

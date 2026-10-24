@@ -254,7 +254,7 @@ internal sealed class AudioCapture : IDisposable
         {
             var logDir = LogPaths.LogsDirectory;
             Directory.CreateDirectory(logDir);
-            File.AppendAllText(
+            LogPaths.AppendCapped(
                 Path.Combine(logDir, "audio.log"),
                 $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {string.Join(Environment.NewLine, lines)}{Environment.NewLine}{Environment.NewLine}");
         }
@@ -470,9 +470,6 @@ internal sealed class AudioCapture : IDisposable
 
     private void OnDataAvailable(ReadOnlySpan<byte> buffer, long qpcPosition)
     {
-        // Captured in capture-only mode too, where nothing is written anywhere: the callback still
-        // runs on the MMCSS thread, and that thread's activity is what this trace has to expose.
-        EventLog.Mark("AUDIO_CB", buffer.Length.ToString());
         var copy = buffer.ToArray();
         UndoSoftwareVolume(copy);
         Interlocked.Increment(ref bufferCount);
