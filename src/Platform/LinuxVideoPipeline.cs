@@ -549,7 +549,14 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
                     try { process.Kill(entireProcessTree: true); } catch (Exception) { /* already gone */ }
             }
             if (gst is { HasExited: false } g)
-                try { g.Kill(entireProcessTree: true); } catch (Exception) { /* already gone */ }
+            {
+                try
+                {
+                    g.Kill(entireProcessTree: true);
+                    g.WaitForExit(3000); // reap: a killed-but-unwaited child stays a zombie
+                }
+                catch (Exception) { /* already gone */ }
+            }
         }
         finally
         {
