@@ -1,4 +1,5 @@
 #if LINUX
+using System.Diagnostics;
 using System.IO.Compression;
 
 namespace Clippy;
@@ -96,6 +97,170 @@ internal static class LinuxDesktopIntegration
     /// </summary>
     public static byte[] TrayIconArgb(int size) => RenderPaperclip(size);
 
+    // --- Autostart toggle (the tray's "Start with System" checkbox) ---
+    //
+    // Two backends, checked in install order: a systemd --user unit when the session runs one
+    // (KDE Plasma, most Wayland compositors), else an XDG autostart entry. install.sh creates
+    // the same shapes; these methods let the tray flip it without the user opening a terminal.
+
+    private static string AutostartDesktopPath =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".config", "autostart", "clippy.desktop");
+
+    private static string ServiceUnitPath =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".config", "systemd", "user", "clippy.service");
+
+    /// <summary>True when the unit is enabled or the XDG autostart entry exists.</summary>
+    public static bool IsAutostartEnabled()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("systemctl")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("--user");
+            psi.ArgumentList.Add("is-enabled");
+            psi.ArgumentList.Add("clippy.service");
+            using var probe = Process.Start(psi);
+            if (probe is not null)
+            {
+                probe.StandardOutput.ReadToEnd();
+                probe.WaitForExit(3000);
+                if (probe.ExitCode == 0)
+                    return true;
+            }
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            // No systemctl on PATH: fall through to the XDG check.
+        }
+        return File.Exists(AutostartDesktopPath);
+    }
+
+    /// <summary>
+    /// Flips autostart for the current binary. Enabling writes the user unit and enables it for
+    /// future sessions (starting it here would launch a second recorder next to the running one);
+    /// disabling stops nothing, it just removes the boot hook.
+    /// </summary>
+    public static void SetAutostart(bool enabled)
+    {
+        var exe = Environment.ProcessPath ?? AppContext.BaseDirectory;
+        if (enabled)
+        {
+            EnsureDesktopFile(); // the menu entry and the portal identification, same install
+            if (SystemdUserAvailable())
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(ServiceUnitPath)!);
+                File.WriteAllText(ServiceUnitPath, ServiceUnitText(exe));
+                RunSystemctl("daemon-reload");
+                RunSystemctl("enable clippy.service");
+                Console.WriteLine("Autostart: systemd --user clippy.service enabled (starts on the next login).");
+            }
+            else
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(AutostartDesktopPath)!);
+                File.WriteAllText(AutostartDesktopPath, AutostartDesktopText(exe));
+                Console.WriteLine("Autostart: XDG autostart entry created (systemd --user unavailable).");
+            }
+        }
+        else
+        {
+            RunSystemctl("disable clippy.service");
+            try { if (File.Exists(ServiceUnitPath)) File.Delete(ServiceUnitPath); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* best effort */ }
+            RunSystemctl("daemon-reload");
+            try { if (File.Exists(AutostartDesktopPath)) File.Delete(AutostartDesktopPath); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* best effort */ }
+            Console.WriteLine("Autostart: disabled.");
+        }
+    }
+
+    /// <summary>True when the session actually runs a systemd user instance.</summary>
+    private static bool SystemdUserAvailable()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("systemctl")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("--user");
+            psi.ArgumentList.Add("is-system-running");
+            using var probe = Process.Start(psi);
+            if (probe is null)
+                return false;
+            var state = probe.StandardOutput.ReadToEnd().Trim();
+            probe.WaitForExit(3000);
+            // "running" and "degraded" both mean a live user instance; "offline"/"starting" do not.
+            return state is "running" or "degraded";
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static void RunSystemctl(string arguments)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("systemctl")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("--user");
+            foreach (var part in arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                psi.ArgumentList.Add(part);
+            using var process = Process.Start(psi);
+            process?.WaitForExit(5000);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            // The toggle state is the file system; a failed systemctl call only means the unit
+            // stays as-is and the next toggle reports the real state.
+        }
+    }
+
+    /// <summary>The unit text, matching installer/linux/install.sh byte for byte in shape.</summary>
+    private static string ServiceUnitText(string exePath)
+    {
+        var appDir = Path.GetDirectoryName(exePath);
+        return $@"
+[Unit]
+Description=Clippy Instant Replay Recorder
+After=graphical-session.target pipewire.service pipewire-pulse.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory={appDir}
+ExecStart={exePath}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target default.target
+";
+    }
+
+    private static string AutostartDesktopText(string exePath) =>
+        $@"
+[Desktop Entry]
+Type=Application
+Name=Clippy
+Exec={exePath}
+Icon=clippy
+Terminal=false
+X-GNOME-Autostart-enabled=true
+";
+
+    // --- The icon renderer ---
+
     /// <summary>
     /// Renders the paperclip as ARGB (little-endian-friendly) bytes, row-major, top-down: one byte
     /// per channel in A, R, G, B order. <see cref="TrayIconArgb"/> is the same layout.
@@ -142,7 +307,7 @@ internal static class LinuxDesktopIntegration
                     continue;
 
                 var offset = (y * size + x) * 4;
-                pixels[offset] = (byte)(255 * coverage);      // A
+                pixels[offset] = (byte)(255 * coverage);        // A
                 pixels[offset + 1] = (byte)(metalR * coverage); // R -- premultiplied, which is
                 pixels[offset + 2] = (byte)(metalG * coverage); // what ARGB32 wants here anyway
                 pixels[offset + 3] = (byte)(metalB * coverage); // B

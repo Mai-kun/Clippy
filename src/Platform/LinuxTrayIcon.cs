@@ -57,6 +57,7 @@ internal sealed class LinuxTrayIcon : IDisposable
     private const int IdBitrate = 18;
     private const int IdCodec = 26;
     private const int IdAudioDevice = 29;
+    private const int IdStartWithSystem = 99;
     private const int IdSepBeforeExit = 100;
     private const int IdExit = 101;
     private const int FirstSinkId = 1000;
@@ -370,6 +371,13 @@ internal sealed class LinuxTrayIcon : IDisposable
             Children = AudioDeviceEntries(config),
         });
 
+        root.Children.Add(new MenuEntry
+        {
+            Id = IdStartWithSystem,
+            Label = "Start with System",
+            ToggleType = "checkmark",
+            ToggleState = LinuxDesktopIntegration.IsAutostartEnabled() ? 1 : 0,
+        });
         root.Children.Add(new MenuEntry { Id = IdSepBeforeExit, Separator = true });
         root.Children.Add(new MenuEntry { Id = IdExit, Label = "Exit" });
         return root;
@@ -565,6 +573,16 @@ internal sealed class LinuxTrayIcon : IDisposable
             case IdBitrate + 7: config.VideoBitrateMbps = 50; SaveConfig("Video bitrate 50 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
             case IdCodec + 1: config.VideoCodec = "hevc"; SaveConfig("Video codec HEVC"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
             case IdCodec + 2: config.VideoCodec = "h264"; SaveConfig("Video codec H.264"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdStartWithSystem:
+            {
+                // Autostart lives outside config.json: nothing to save, just flip the boot hook
+                // and refresh the checkbox.
+                var now = !LinuxDesktopIntegration.IsAutostartEnabled();
+                LinuxDesktopIntegration.SetAutostart(now);
+                Console.WriteLine($"Tray: Start with System {(now ? "enabled" : "disabled")}.");
+                BumpMenu();
+                break;
+            }
             case IdExit:
                 host.RequestExit();
                 break;
