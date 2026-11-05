@@ -30,6 +30,7 @@ internal sealed class LinuxAudioPipeline : IDisposable
     public (int FramesIn, int FramesOut) Counts => (framesIn, framesIn);
 
     private Process? ffmpeg;
+    private StreamWriter? debugLog;
     private readonly Stopwatch stopwatch;
     private volatile bool stopped;
     private int framesIn;
@@ -131,7 +132,7 @@ internal sealed class LinuxAudioPipeline : IDisposable
             return false;
         }
 
-        var debugLog = LogPaths.CreateCapped(LogPaths.Resolve(logDirectory, "clippy-audio", ".ffmpeg-debug.log"));
+        debugLog = LogPaths.CreateCapped(LogPaths.Resolve(logDirectory, "clippy-audio", ".ffmpeg-debug.log"));
         ffmpeg.ErrorDataReceived += (_, e) =>
         {
             if (e.Data is null)
@@ -202,7 +203,11 @@ internal sealed class LinuxAudioPipeline : IDisposable
             if (!process.WaitForExit(5000))
                 try { process.Kill(entireProcessTree: true); } catch (Exception) { /* already gone */ }
         }
+        // WaitForExit reaps the child: without it a killed ffmpeg would sit as a zombie until we
+        // exit. The debug log's descriptor follows.
         ffmpeg?.Dispose();
+        debugLog?.Dispose();
+        debugLog = null;
     }
 }
 #endif
