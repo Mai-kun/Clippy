@@ -2,7 +2,7 @@
 
 **[English](README.md) | Русский**
 
-> **Сверхлёгкий, бескомпромиссный instant replay рекордер для Windows.**  
+> **Сверхлёгкий, бескомпромиссный instant replay рекордер для Windows 10/11 и Linux (Wayland).**  
 > Замена GeForce Experience / ShadowPlay и Medal без гигабайтов Electron, без обязательных аккаунтов, рекламы и фоновой нагрузки на процессор.
 
 [![GitHub Release](https://img.shields.io/github/v/release/Mai-kun/Clippy?style=flat-square&color=blue)](https://github.com/Mai-kun/Clippy/releases)

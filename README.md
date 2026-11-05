@@ -2,7 +2,7 @@
 
 **English | [Русский](README_RU.md)**
 
-> **A featherweight, no-compromise instant replay recorder for Windows.**  
+> **A featherweight, no-compromise instant replay recorder for Windows 10/11 and Linux (Wayland).**  
 > A ShadowPlay and Medal replacement with none of the Electron bloat, none of the mandatory logins, and none of the background CPU tax.
 
 [![GitHub Release](https://img.shields.io/github/v/release/Mai-kun/Clippy?style=flat-square&color=blue)](https://github.com/Mai-kun/Clippy/releases)
