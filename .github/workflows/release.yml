@@ -218,6 +218,7 @@ jobs:
             ### Installation Options
             - **Installer (`Clippy-Setup.exe`):** Recommended. Installs Clippy with desktop/start menu shortcuts, autostart support, and silent one-click updates.
             - **Portable archive (`Clippy-win-x64.zip`):** Standalone zero-install folder. Extract anywhere and launch `Clippy.exe`.
+            - **Linux (`Clippy-linux-x64.tar.gz`):** Native AOT build for Wayland (KDE Plasma, Niri) with PipeWire capture and NVENC. Unpack and run `install.sh` -- installs to `~/.local/share/Clippy` without sudo.
 
             NVENC + Media Foundation work out of the box with no third-party dependencies (ffmpeg is not required).
 
@@ -226,3 +227,68 @@ jobs:
           draft: false
           generate_release_notes: true
 
+  # The Linux release builds AFTER the Windows job: that job creates the GitHub Release (its
+  # softprops step runs first), this one only appends its archive to it. Building in parallel
+  # would race two jobs into creating the same release.
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # Native AOT on linux-x64 needs a C compiler for the link step and zlib headers for the
+      # compression backing .NET's own zlib usage. ubuntu-latest ships ffmpeg (the --test-mp4
+      # selftest shells out to ffprobe), so nothing extra is needed for the selftests.
+      - name: Enable AOT prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang zlib1g-dev
+          ffmpeg -version | head -1
+
+      - name: Publish (Native AOT)
+        run: >
+          dotnet publish src/Clippy.csproj
+          -c Release
+          -r linux-x64
+          -p:PublishAot=true
+          -o publish-linux
+
+      - name: Verify the selftests
+        run: |
+          test -x publish-linux/Clippy || { echo "publish-linux/Clippy is missing"; exit 1; }
+          # The same four selftests the Windows binary passes: they run against the published
+          # native binary, so AOT trimming shows up here too.
+          for t in --test-parsers --test-ring --test-mp4 --test-audio-timeline; do
+            ./publish-linux/Clippy "$t"
+            if [ $? -ne 0 ]; then echo "$t failed"; exit 1; fi
+            echo "ok  $t"
+          done
+
+      - name: Package Clippy-linux-x64.tar.gz
+        run: |
+          # A stale archive from an earlier run would be uploaded as if it were this release's.
+          rm -f Clippy-linux-x64.tar.gz
+          mkdir -p pkg
+          cp publish-linux/Clippy pkg/Clippy
+          cp config.example.json pkg/config.example.json
+          cp installer/linux/install.sh pkg/install.sh
+          cp installer/linux/uninstall.sh pkg/uninstall.sh
+          chmod +x pkg/Clippy pkg/install.sh pkg/uninstall.sh
+          # Only the four files ship: the test fixtures and the .dbg symbols stay out.
+          tar -czf Clippy-linux-x64.tar.gz -C pkg .
+          tar -tzf Clippy-linux-x64.tar.gz
+          "archive: $(du -h Clippy-linux-x64.tar.gz | cut -f1)"
+
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # The Windows job above already created the release and its body; this step only
+          # appends the Linux archive to it.
+          files: Clippy-linux-x64.tar.gz
+          fail_on_unmatched_files: true
