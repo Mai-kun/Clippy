@@ -1,32 +1,86 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- Dual-targeting, decided before anything else: a win-* RuntimeIdentifier (or a build on a
+       Windows host with no explicit RID) gets the full Windows app; a linux-* RID (or any other
+       RID, or a build on a non-Windows host) gets the portable net10.0 target, which compiles only
+       the platform-neutral sources behind the IPlatformBackend shell. Exactly one of WINDOWS /
+       LINUX is defined and PlatformFactory switches on it. -->
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <IsWindowsTarget Condition="'$(IsWindowsTarget)' == '' and '$(RuntimeIdentifier)' != ''">$([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win'))</IsWindowsTarget>
+    <IsWindowsTarget Condition="'$(IsWindowsTarget)' == '' and '$(RuntimeIdentifier)' == ''">$([MSBuild]::IsOSPlatform('Windows'))</IsWindowsTarget>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <TargetFramework Condition="'$(IsWindowsTarget)' == 'true'">net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetFramework Condition="'$(IsWindowsTarget)' != 'true'">net10.0</TargetFramework>
+    <OutputType Condition="'$(IsWindowsTarget)' == 'true'">WinExe</OutputType>
+    <OutputType Condition="'$(IsWindowsTarget)' != 'true'">Exe</OutputType>
+    <!-- Only needed to cross-compile the Windows target off-Windows; harmless where it is true. -->
+    <EnableWindowsTargeting Condition="'$(IsWindowsTarget)' == 'true'">true</EnableWindowsTargeting>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Clippy</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PublishAot>true</PublishAot>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- The Windows app has always shipped win-x64; the portable target leaves the RID to the
+         caller (-r linux-x64) so it can run anywhere dotnet can. -->
+    <RuntimeIdentifier Condition="'$(IsWindowsTarget)' == 'true'">win-x64</RuntimeIdentifier>
     <!-- Reflection-based JSON and any other trimmed-away metadata should fail the build loudly in
          CI rather than throwing at runtime on a user's machine. -->
     <TrimMode>partial</TrimMode>
+    <DefineConstants Condition="'$(IsWindowsTarget)' == 'true'">$(DefineConstants);WINDOWS</DefineConstants>
+    <DefineConstants Condition="'$(IsWindowsTarget)' != 'true'">$(DefineConstants);LINUX</DefineConstants>
+  </PropertyGroup>
 
-    <!-- The icon for the executable, and the source for the taskbar, the Alt-Tab entry and the tray:
-         TrayIcon reads it back out of this binary with ExtractIconExW, so all four show the same
-         thing. It has to be a real size set, not one image: the tray needs the 16x16 drawn verbatim
-         rather than a 128x128 scaled down. -->
+  <!-- The icon for the executable, and the source for the taskbar, the Alt-Tab entry and the tray:
+       TrayIcon reads it back out of this binary with ExtractIconExW, so all four show the same
+       thing. It has to be a real size set, not one image: the tray needs the 16x16 drawn verbatim
+       rather than a 128x128 scaled down. -->
+  <PropertyGroup Condition="'$(IsWindowsTarget)' == 'true'">
     <ApplicationIcon>assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' != 'net10.0'">
     <PackageReference Include="NAudio.Wasapi" Version="3.1.0" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
     <PackageReference Include="Vortice.DirectX" Version="3.8.3" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
     <PackageReference Include="Vortice.Win32.Graphics.Imaging" Version="2.5.0" />
+  </ItemGroup>
+
+  <!-- On the portable target the Windows capture, encoder and UI stack is not compiled at all:
+       the sources stay on disk untouched, they just do not take part in the build. The Windows
+       backend is excluded for the same reason in reverse: it is the only file that may reach
+       those classes. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <Compile Remove="Capture\ScreenCapture.cs" />
+    <Compile Remove="Capture\AudioCapture.cs" />
+    <Compile Remove="Encoders\MfAudioEncoder.cs" />
+    <Compile Remove="Encoders\MfVideoEncoder.cs" />
+    <Compile Remove="Encoders\NvencDirectVideoEncoder.cs" />
+    <Compile Remove="Encoders\NvencNative.cs" />
+    <Compile Remove="UI\TrayIcon.cs" />
+    <Compile Remove="UI\OverlayNotification.cs" />
+    <Compile Remove="UI\HotkeyService.cs" />
+    <Compile Remove="UI\FolderPicker.cs" />
+    <Compile Remove="UI\ExportNotification.cs" />
+    <Compile Remove="Tests\MfAudioPrototype.cs" />
+    <Compile Remove="Tests\MfVideoPrototype.cs" />
+    <Compile Remove="Tests\SmokeTest.cs" />
+    <Compile Remove="Platform\WindowsPlatformBackend.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' != 'net10.0'">
+    <Compile Remove="Platform\LinuxPlatformBackend.cs" />
+    <Compile Remove="Platform\LinuxDbus.cs" />
+    <Compile Remove="Platform\LinuxPortal.cs" />
+    <Compile Remove="Platform\LinuxVideoPipeline.cs" />
+    <Compile Remove="Platform\LinuxAudioPipeline.cs" />
+    <Compile Remove="Platform\LinuxNotifications.cs" />
+    <Compile Remove="Platform\LinuxHotkeyService.cs" />
+    <Compile Remove="Platform\LinuxDesktopIntegration.cs" />
+    <Compile Remove="Platform\LinuxTrayIcon.cs" />
   </ItemGroup>
 
   <!-- The default notification sound, compiled INTO the exe so a portable install ships one file

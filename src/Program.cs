@@ -1,46 +1,13 @@
 using System.Globalization;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Clippy;
 
-// The build is WinExe: on a normal start Windows creates no console window at all, which is the
-// whole point -- under Windows 11 the default terminal is Windows Terminal, so the old
-// ShowWindow(GetConsoleWindow(), SW_HIDE) trick only left its icon parked on the taskbar. Every
-// Console.WriteLine below therefore goes nowhere unless a developer asks for a console with
-// --console / --debug, and that request has to be honoured before the first such write.
-if (args.Contains("--console", StringComparer.OrdinalIgnoreCase) ||
-    args.Contains("--debug", StringComparer.OrdinalIgnoreCase))
-{
-    // Attach to the launching terminal when it has one -- "Clippy.exe --console --test-mp4" from
-    // PowerShell should print there -- and allocate a fresh console only when there is none to
-    // attach to (double-click with the flag).
-    if (!NativeConsole.AttachConsole(NativeConsole.AttachParentProcess))
-        NativeConsole.AllocConsole();
-
-    // Console.Out is a writer cached before the console existed, so both streams are re-pointed at
-    // the handles the calls above just produced. One writer for both: same screen buffer, and two
-    // separate ones would interleave out of order.
-    var consoleOut = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
-    Console.SetOut(consoleOut);
-    Console.SetError(consoleOut);
-}
-
-// The whole UI assumes it gets real pixel coordinates from Windows, which it only does once this
-// process declares itself DPI-aware. Unaware (the default for a WinExe with no manifest), Windows
-// scales every coordinate by 96/monitor-DPI on the way out and back: rcWork comes back as a
-// virtualized desktop, GetDpiForMonitor reports 96, and a card laid out at 320 px is stretched by
-// the compositor instead of drawn at its intended size -- the blurry-toast problem in reverse.
-//
-// V2 (rather than V1) because it is the only mode that reports a DPI change for a window already
-// sitting on a monitor: WM_DPICHANGED arrives when the game is dragged to another screen, which is
-// what lets the overlay re-layout mid-run instead of waiting for the next process start.
-//
-// -4 is DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. Failure is not fatal (Win7, or an app compat
-// setting): every measurement then just falls back to 96 DPI, which is exactly the old behaviour.
-var dpiAware = NativeDpi.SetProcessDpiAwarenessContext(new IntPtr(-4));
-Console.WriteLine(dpiAware
-    ? "DPI: per-monitor-v2 awareness enabled."
-    : $"DPI: awareness not set (error {Marshal.GetLastWin32Error()}); layout assumes 96 DPI.");
+// The backend owns every OS-specific startup ritual and run mode. It is created first so the
+// console/DPI setup below can be delegated instead of inlined here: on Windows this is a WinExe
+// where nothing prints unless a developer asked for a console, on Linux the terminal is simply
+// already there.
+var platform = PlatformFactory.Create();
+platform.InitializeConsole(args);
+platform.InitializeDpi();
 
 // Installed before anything else can fail. In tray mode there is no console at all, so a crash
 // leaves the user with a vanished tray icon and no explanation on screen -- and no way to report
@@ -78,26 +45,26 @@ var nonOptionArgs = args.Where(a => !a.Equals("--updated", StringComparison.Ordi
 if (nonOptionArgs.Length == 0)
 {
     var defaults = ClippyConfig.Load();
-    return Clippy.ScreenCapture.RunVideo(
+    return platform.RunVideo(new PlatformRecordingOptions(
         // No timeout: this mode runs until the user quits it from the tray, which is what an instant
         // replay is for. A duration would silently stop the recorder at an arbitrary moment.
-        duration: null,
+        Duration: null,
         // One helper owns the clip-name format, so the tray path and the hotkey path cannot drift
         // apart into two different naming schemes in the same folder.
-        Clippy.ScreenCapture.ClipPath(
+        OutputPath: PlatformClipPath.ClipPath(
             Path.Combine(AppContext.BaseDirectory, defaults.OutputFolder), DateTime.Now),
-        defaults.VideoEncoder,
-        "passthrough",
-        withAudio: true,
-        audioCaptureOnly: false,
-        hotkeys: true,
-        exportAt: null,
-        exportDuration: null,
-        config: defaults,
+        EncoderName: defaults.VideoEncoder,
+        FpsMode: "passthrough",
+        WithAudio: true,
+        AudioCaptureOnly: false,
+        Hotkeys: true,
+        ExportAt: null,
+        ExportDuration: null,
+        Config: defaults,
         // The tray owns the process lifetime. Without an icon there would be no way back to this
         // window and no way to quit except killing it from Task Manager.
-        tray: true,
-        updated: isUpdated);
+        Tray: true,
+        Updated: isUpdated));
 }
 
 if (args.Contains("--self-update"))
@@ -126,29 +93,12 @@ if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
     return PrintUsage();
 }
 
-  if (args.Contains("--test-mft-video-wgc"))
-      return MfVideoPrototype.RunWithLiveCapture();
-
-  if (args.Contains("--test-nvenc-native"))
-      return NvencNativeSpike.Run();
-
-  if (args.Contains("--test-mft-video"))
-      return MfVideoPrototype.Run();
-
-if (args.Contains("--test-mft-audio"))
-{
-    return MfAudioPrototype.Run();
-}
-
-if (args.Contains("--smoke"))
-{
-    return Clippy.SmokeTest.Run();
-}
-
-if (args.Contains("--audio-probe"))
-{
-    return Clippy.AudioCapture.RunAudioProbe();
-}
+// The platform's own diagnostics (--smoke, --test-nvenc-native, --test-mft-*, --audio-probe).
+// A backend that cannot run a flag reports that and takes the exit code; handled = false means
+// none of its flags matched, so parsing continues below.
+var platformResult = platform.RunPlatformCommand(args, out var platformHandled);
+if (platformHandled)
+    return platformResult;
 
 if (args.Contains("--test-parsers"))
 {
@@ -165,18 +115,6 @@ if (args.Contains("--test-mp4"))
     return Clippy.Mp4WriterSelfTest.Run();
 }
 
-if (args is ["--capture"])
-{
-    return Clippy.ScreenCapture.Run(null);
-}
-
-if (args is ["--capture", var durationText] &&
-    double.TryParse(durationText, CultureInfo.InvariantCulture, out var durationSeconds) &&
-    durationSeconds > 0)
-{
-    return Clippy.ScreenCapture.Run(TimeSpan.FromSeconds(durationSeconds));
-}
-
 if (args.FirstOrDefault() == "--record")
 {
     // Loaded once here and passed down, so the output folder, the hotkey bindings and the sound
@@ -185,7 +123,7 @@ if (args.FirstOrDefault() == "--record")
     var videoSeconds = args.Length > 1 && double.TryParse(args[1], CultureInfo.InvariantCulture, out var parsed) && parsed > 0
         ? parsed
         : 60;
-    var videoPath = Clippy.ScreenCapture.ClipPath(
+    var videoPath = PlatformClipPath.ClipPath(
         Path.Combine(Environment.CurrentDirectory, config.OutputFolder), DateTime.Now);
     // The config file is the default; an explicit --encoder= on the command line overrides it for
     // one run, which is how you test a different GPU without editing anything.
@@ -220,16 +158,28 @@ if (args.FirstOrDefault() == "--record")
         || args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase)
                       || a.Equals("--minimized", StringComparison.OrdinalIgnoreCase));
 
-    return Clippy.ScreenCapture.RunVideo(
+    return platform.RunVideo(new PlatformRecordingOptions(
         TimeSpan.FromSeconds(videoSeconds), videoPath, videoEncoder, fpsMode, withAudio || audioCaptureOnly, audioCaptureOnly,
         args.Any(a => a.Equals("--hotkeys", StringComparison.OrdinalIgnoreCase)), exportAt?.TotalSeconds, exportDuration, config,
         trayRequested,
-        updated: isUpdated);
+        Updated: isUpdated));
 }
 
 if (args.FirstOrDefault() == "--test-audio-timeline")
 {
     return Clippy.FfmpegAudioEncoder.SelfTest() ? 0 : 1;
+}
+
+if (args is ["--capture"])
+{
+    return platform.RunCaptureOnly(null);
+}
+
+if (args is ["--capture", var durationText] &&
+    double.TryParse(durationText, CultureInfo.InvariantCulture, out var durationSeconds) &&
+    durationSeconds > 0)
+{
+    return platform.RunCaptureOnly(TimeSpan.FromSeconds(durationSeconds));
 }
 
 if (args.FirstOrDefault() == "--capture")
@@ -247,7 +197,7 @@ return PrintUsage();
 /// </summary>
 static int PrintUsage()
 {
-    Console.WriteLine("Clippy -- instant replay recorder for Windows");
+    Console.WriteLine("Clippy -- instant replay recorder");
     Console.WriteLine();
     Console.WriteLine("  Clippy.exe                 start recording; no arguments needed.");
     Console.WriteLine("                              Screen + system audio, hotkeys, tray icon. Runs until");
@@ -256,7 +206,7 @@ static int PrintUsage()
     Console.WriteLine("  --help, -h, --usage        this text");
     Console.WriteLine("  --self-update             check for and install an update, then exit");
     Console.WriteLine("  --updated                 launched after update; shows update notification");
-    Console.WriteLine("  --console, --debug        allocate a console for this run (the build is windowed)");
+    Console.WriteLine("  --console, --debug        allocate a console for this run (the Windows build is windowed)");
     Console.WriteLine();
     Console.WriteLine("Modes:");
     Console.WriteLine("  --record [seconds]         record to a file for a fixed time (default 60s)");
@@ -272,45 +222,21 @@ static int PrintUsage()
     Console.WriteLine("  --export-dur=SECONDS       its length in seconds");
     Console.WriteLine();
     Console.WriteLine("Diagnostics:");
-    Console.WriteLine("  --smoke                    end-to-end smoke test");
-    Console.WriteLine("  --audio-probe              list audio devices and capture from one");
+    Console.WriteLine("  --smoke                    end-to-end smoke test (Windows only)");
+    Console.WriteLine("  --audio-probe              list audio devices and capture from one (Windows only)");
     Console.WriteLine("  --test-parsers             H.264 / AAC parser self-test");
     Console.WriteLine("  --test-ring                ring buffer self-test");
     Console.WriteLine("  --test-mp4                 MP4 writer self-test");
-    Console.WriteLine("  --test-nvenc-native       spike: can the native NVENC bridge encode a BGRA texture?");
-    Console.WriteLine("  --test-mft-audio          spike: can the system AAC encoder emit ADTS?");
-    Console.WriteLine("  --test-mft-video          spike: can a system H.264 MFT be driven at all?");
-    Console.WriteLine("  --test-mft-video-wgc      the same spike, with a live capture session running");
+    Console.WriteLine("  --test-nvenc-native       spike: can the native NVENC bridge encode a BGRA texture? (Windows only)");
+    Console.WriteLine("  --test-mft-audio          spike: can the system AAC encoder emit ADTS? (Windows only)");
+    Console.WriteLine("  --test-mft-video          spike: can a system H.264 MFT be driven at all? (Windows only)");
+    Console.WriteLine("  --test-mft-video-wgc      the same spike, with a live capture session running (Windows only)");
+    Console.WriteLine();
+    Console.WriteLine("Clip saving (Linux; bind to compositor shortcuts on KDE/Niri):");
+    Console.WriteLine("  --save-short, --save      ask the running recorder to save the short clip");
+    Console.WriteLine("  --save-long               save the long clip");
+    Console.WriteLine("  --stop                    stop the recorder");
     Console.WriteLine();
     Console.WriteLine($"Config: {ClippyConfig.Path}");
     return 0;
-}
-
-/// <summary>
-/// The user32 entry point behind the DPI-awareness call at the top of this file. It lives here
-/// because top-level statements leave no class of their own to hang a LibraryImport on.
-/// </summary>
-internal static partial class NativeDpi
-{
-    [LibraryImport("user32.dll", EntryPoint = "SetProcessDpiAwarenessContext", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static partial bool SetProcessDpiAwarenessContext(nint value);
-}
-
-/// <summary>
-/// The kernel32 entry points behind --console. A separate type because top-level statements leave
-/// no class of their own to hang a LibraryImport on.
-/// </summary>
-internal static partial class NativeConsole
-{
-    /// <summary>ATTACH_PARENT_PROCESS: the console of whatever started us, when it has one.</summary>
-    internal const int AttachParentProcess = -1;
-
-    [LibraryImport("kernel32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static partial bool AttachConsole(int processId);
-
-    [LibraryImport("kernel32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static partial bool AllocConsole();
 }
