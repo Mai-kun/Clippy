@@ -273,6 +273,10 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
             Console.WriteLine("Video: no screen capture is possible, so the recorder cannot run.");
             return false;
         }
+        sessionFd = session.PipeWireFd;
+        sessionId = session.NodeId;
+        sessionWidth = session.Width;
+        sessionHeight = session.Height;
 
         video = new LinuxVideoPipeline(stopwatch);
         if (!video.Start(session.PipeWireFd, session.NodeId, session.Width, session.Height, config, logsDirectory, videoRing!))
@@ -673,6 +677,49 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     }
 
     private readonly object audioRestartGate = new();
+
+    /// <summary>
+    /// Applies bitrate/codec changes by restarting the video pipeline in place: the old gst dies
+    /// completely (Dispose waits for its exit, so the NVENC session and its VRAM are released)
+    /// before the new one starts, and the ring is reused -- the replay history and the shared
+    /// clock survive the switch, clips cut across it stay aligned.
+    /// </summary>
+    void LinuxTrayIcon.IHost.SetVideoEncoding(int bitrateMbps, string codec)
+    {
+        if (bitrateMbps == config.VideoBitrateMbps &&
+            string.Equals(codec, config.VideoCodec, StringComparison.OrdinalIgnoreCase) &&
+            video is not null)
+            return; // nothing changed
+
+        lock (videoRestartGate)
+        {
+            config.VideoBitrateMbps = bitrateMbps;
+            config.VideoCodec = codec;
+            video?.Dispose();
+            video = null;
+
+            if (sessionFd is null)
+            {
+                Console.WriteLine("Video: settings saved; the pipeline restarts with the next recording.");
+                return;
+            }
+
+            video = new LinuxVideoPipeline(stopwatch);
+            if (!video.Start(sessionFd.Value, sessionId, sessionWidth, sessionHeight, config, logsDirectory, videoRing!))
+            {
+                Console.WriteLine("Video: the restarted pipeline failed; recording continues without video.");
+                video.Dispose();
+                video = null;
+                return;
+            }
+            Console.WriteLine($"Video: restarted [{(config.UseHevc ? "HEVC" : "H.264")}] at {bitrateMbps} Mbit/s.");
+        }
+    }
+
+    private readonly object videoRestartGate = new();
+    private int? sessionFd;
+    private uint sessionId;
+    private int sessionWidth, sessionHeight;
 
     // The sink list feeds every menu rebuild, and Plasma re-queries the menu on a timer: without
     // a cache that is one pactl process per poll. Fifteen seconds is fresh enough for hotplugs.

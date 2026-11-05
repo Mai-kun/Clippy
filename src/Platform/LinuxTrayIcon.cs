@@ -25,6 +25,13 @@ internal sealed class LinuxTrayIcon : IDisposable
         string SaveClip(bool shortClip);
         /// <summary>Hot-swaps the captured audio device, restarting the audio pipeline.</summary>
         void SetAudioDevice(string device);
+
+        /// <summary>
+        /// Applies encoder settings (bitrate, codec), restarting the video pipeline when they
+        /// changed. The old gst process must be fully gone before the new one starts -- two live
+        /// NVENC sessions would sit in VRAM side by side.
+        /// </summary>
+        void SetVideoEncoding(int bitrateMbps, string codec);
         IReadOnlyList<(string Name, string Description)> ListAudioSinks();
         void RequestExit();
     }
@@ -549,15 +556,15 @@ internal sealed class LinuxTrayIcon : IDisposable
             case IdLongDuration + 5: config.LongClipSeconds = 120; SaveConfig("Long clip duration 2 m"); break;
             case IdLongDuration + 6: config.LongClipSeconds = 180; SaveConfig("Long clip duration 3 m"); break;
             case IdLongDuration + 7: config.LongClipSeconds = 300; SaveConfig("Long clip duration 5 m"); break;
-            case IdBitrate + 1: config.VideoBitrateMbps = 2; SaveConfig("Video bitrate 2 Mbps (applies from the next recording)"); break;
-            case IdBitrate + 2: config.VideoBitrateMbps = 4; SaveConfig("Video bitrate 4 Mbps (applies from the next recording)"); break;
-            case IdBitrate + 3: config.VideoBitrateMbps = 6; SaveConfig("Video bitrate 6 Mbps (applies from the next recording)"); break;
-            case IdBitrate + 4: config.VideoBitrateMbps = 8; SaveConfig("Video bitrate 8 Mbps (applies from the next recording)"); break;
-            case IdBitrate + 5: config.VideoBitrateMbps = 12; SaveConfig("Video bitrate 12 Mbps (applies from the next recording)"); break;
-            case IdBitrate + 6: config.VideoBitrateMbps = 20; SaveConfig("Video bitrate 20 Mbps (applies from the next recording)"); break;
-            case IdBitrate + 7: config.VideoBitrateMbps = 50; SaveConfig("Video bitrate 50 Mbps (applies from the next recording)"); break;
-            case IdCodec + 1: config.VideoCodec = "hevc"; SaveConfig("Video codec HEVC (applies from the next recording)"); break;
-            case IdCodec + 2: config.VideoCodec = "h264"; SaveConfig("Video codec H.264 (applies from the next recording)"); break;
+            case IdBitrate + 1: config.VideoBitrateMbps = 2; SaveConfig("Video bitrate 2 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdBitrate + 2: config.VideoBitrateMbps = 4; SaveConfig("Video bitrate 4 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdBitrate + 3: config.VideoBitrateMbps = 6; SaveConfig("Video bitrate 6 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdBitrate + 4: config.VideoBitrateMbps = 8; SaveConfig("Video bitrate 8 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdBitrate + 5: config.VideoBitrateMbps = 12; SaveConfig("Video bitrate 12 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdBitrate + 6: config.VideoBitrateMbps = 20; SaveConfig("Video bitrate 20 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdBitrate + 7: config.VideoBitrateMbps = 50; SaveConfig("Video bitrate 50 Mbps"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdCodec + 1: config.VideoCodec = "hevc"; SaveConfig("Video codec HEVC"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
+            case IdCodec + 2: config.VideoCodec = "h264"; SaveConfig("Video codec H.264"); host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec); break;
             case IdExit:
                 host.RequestExit();
                 break;
