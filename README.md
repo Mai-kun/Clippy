@@ -7,7 +7,7 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/Mai-kun/Clippy?style=flat-square&color=blue)](https://github.com/Mai-kun/Clippy/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-informational?style=flat-square)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20%26%20Linux%20Wayland%20x64-informational?style=flat-square)]()
 [![Build](https://img.shields.io/badge/Runtime-Native%20AOT%20(.NET%2010)-purple?style=flat-square)]()
 
 ---
@@ -29,13 +29,21 @@ Most modern game recorders (Medal, Outplayed) are built on Electron: 300–500 M
 
 ## Quick start
 
-Two simple ways to install:
+Three simple ways to install:
 
 ### 1. Installer (`Clippy-Setup.exe`)
 Grab `Clippy-Setup.exe` from the [releases page](https://github.com/Mai-kun/Clippy/releases). No admin rights needed: it installs to `AppData\Local\Programs\Clippy`, adds a Start menu shortcut, offers optional startup with Windows and supports one-click silent updates.
 
 ### 2. Portable (`Clippy-win-x64.zip`)
 Unzip anywhere and run `Clippy.exe`.
+
+### 3. Linux (`Clippy-linux-x64.tar.gz`)
+Unpack the archive and run `./install.sh`. No sudo needed: it installs to `~/.local/share/Clippy`, symlinks `~/.local/bin/clippy`, adds the icon to the application menu and sets up autostart via `systemd --user`.
+
+- **Wayland:** works on KDE Plasma, Niri, Hyprland and other compositors — capture goes through the XDG ScreenCast Portal + PipeWire.
+- **Hardware encoding:** NVIDIA NVENC (`nvh265enc` / `nvh264enc`) via CUDA DMA — 0% CPU on video conversion.
+- **Tray icon:** a `StatusNotifierItem` in the system tray (left click saves a short clip, right click opens the menu).
+- **Hotkeys:** F8/F9 are read directly through evdev (add yourself to the `input` group), or bind `clippy --save-short` / `clippy --save-long` in your compositor's shortcut settings instead.
 
 > `ffmpeg.exe` is **not** required: direct access to the NVENC chip (`clippy_nvenc.dll`) plus Windows Media Foundation for system-audio encoding make Clippy fully self-contained. If you ever need an ffmpeg fallback (e.g. AMD/Intel GPUs), drop `ffmpeg.exe` next to the exe or put it on your PATH.
 

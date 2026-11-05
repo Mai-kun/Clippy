@@ -25,7 +25,7 @@ internal readonly record struct UpdateInfo(bool Available, string Tag, string Do
 /// </summary>
 internal static class UpdateService
 {
-    public const string CurrentVersion = "v1.4.7";
+    public const string CurrentVersion = "v1.5.0";
     private const string ApiUrl = "https://api.github.com/repos/Mai-kun/Clippy/releases/latest";
 
     /// <summary>Installer, used when the running copy was installed by the setup.</summary>
@@ -39,6 +39,13 @@ internal static class UpdateService
     private const string AssetPortable = "Clippy-win-x64.zip";
 
     /// <summary>
+    /// Tarball of the Linux build. Releases ship it alongside the Windows assets, and it must stay
+    /// invisible to the asset picker on Windows: a tarball cannot be applied by either apply path
+    /// below, and the exact-name match is what keeps a Windows copy from ever choosing it.
+    /// </summary>
+    private const string AssetLinux = "Clippy-linux-x64.tar.gz";
+
+    /// <summary>
     /// Inno Setup drops unins000.exe in the application folder, so its presence is what tells the two
     /// installation shapes apart. There is no other reliable marker: a portable folder and an
     /// installed one contain the same Clippy.exe.
@@ -46,9 +53,16 @@ internal static class UpdateService
     public static bool IsInstalled =>
         File.Exists(Path.Combine(AppContext.BaseDirectory, "unins000.exe"));
 
-    /// <summary>The asset that updates THIS copy, or the other one when a release ships only that.</summary>
-    private static string WantedAsset => IsInstalled ? AssetSetup : AssetPortable;
-    private static string FallbackAsset => IsInstalled ? AssetPortable : AssetSetup;
+    /// <summary>
+    /// The asset that updates THIS copy, or the other one when a release ships only that. On Linux
+    /// there is no fallback: a release without the tarball (an older, Windows-only one) reads as
+    /// "no matching asset" and therefore no update, which is the honest answer -- a Linux copy
+    /// must never land on a Windows asset.
+    /// </summary>
+    private static string WantedAsset => !OperatingSystem.IsWindows() ? AssetLinux
+        : IsInstalled ? AssetSetup : AssetPortable;
+    private static string FallbackAsset => !OperatingSystem.IsWindows() ? ""
+        : IsInstalled ? AssetPortable : AssetSetup;
 
     public static string Version => CurrentVersion;
 
@@ -172,6 +186,17 @@ internal static class UpdateService
     {
         try
         {
+            // Both apply paths below are Windows machinery: an Inno Setup exe or a zip copied over
+            // with apply_update.cmd. Reaching here on Linux means a tarball URL, and unpacking it
+            // over the running binary is install.sh's job, not ours -- so the update stops short of
+            // launching anything and points at the manual step instead.
+            if (!OperatingSystem.IsWindows())
+            {
+                Log($"Auto-update is Windows-only; download {downloadUrl} and run install.sh from the archive.");
+                notify?.Invoke("Clippy Update", "Download the release and run install.sh from the archive.");
+                return;
+            }
+
             Log($"Starting update installation from: {downloadUrl}");
             if (IsInstalled)
             {
@@ -458,27 +483,36 @@ internal static class UpdateService
             failures++;
         }
 
-        // 4. Test installer command line syntax with cmd.exe /c start
-        try
+        // 4. Test installer command line syntax with cmd.exe /c start.
+        // Windows-only: the installer this exercises is an Inno Setup exe driven by cmd, and a
+        // Linux box has no cmd.exe to launch -- skipping there is the honest result, not a pass.
+        if (OperatingSystem.IsWindows())
         {
-            var dummyExe = "cmd.exe";
-            var dummyArgs = "/c exit 0";
-            var cmdLine = $"/c \"%SystemRoot%\\System32\\ping.exe -n 1 127.0.0.1 >nul & start \"\" \"{dummyExe}\" {dummyArgs}\"";
-            using var proc = Process.Start(new ProcessStartInfo("cmd.exe", cmdLine)
+            try
             {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-            });
-            proc?.WaitForExit(5000);
-            if (proc is null || proc.ExitCode != 0)
-                throw new InvalidOperationException($"cmd start test exited with code {proc?.ExitCode}");
+                var dummyExe = "cmd.exe";
+                var dummyArgs = "/c exit 0";
+                var cmdLine = $"/c \"%SystemRoot%\\System32\\ping.exe -n 1 127.0.0.1 >nul & start \"\" \"{dummyExe}\" {dummyArgs}\"";
+                using var proc = Process.Start(new ProcessStartInfo("cmd.exe", cmdLine)
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                });
+                proc?.WaitForExit(5000);
+                if (proc is null || proc.ExitCode != 0)
+                    throw new InvalidOperationException($"cmd start test exited with code {proc?.ExitCode}");
 
-            Console.WriteLine("[ OK ] Installer cmd.exe /c start command syntax succeeded.");
+                Console.WriteLine("[ OK ] Installer cmd.exe /c start command syntax succeeded.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[FAIL] Installer cmd syntax test: {ex.Message}");
+                failures++;
+            }
         }
-        catch (Exception ex)
+        else
         {
-            Console.WriteLine($"[FAIL] Installer cmd syntax test: {ex.Message}");
-            failures++;
+            Console.WriteLine("[SKIP] Installer cmd syntax test is Windows-only.");
         }
 
         Console.WriteLine(failures == 0 ? "UPDATE SELFTEST: OK" : $"UPDATE SELFTEST: FAILED ({failures})");

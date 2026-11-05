@@ -7,7 +7,7 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/Mai-kun/Clippy?style=flat-square&color=blue)](https://github.com/Mai-kun/Clippy/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-informational?style=flat-square)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20%26%20Linux%20Wayland%20x64-informational?style=flat-square)]()
 [![Build](https://img.shields.io/badge/Runtime-Native%20AOT%20(.NET%2010)-purple?style=flat-square)]()
 
 ---
@@ -28,13 +28,21 @@
 
 ## Быстрый старт
 
-Есть два простых способа установки:
+Есть три простых способа установки:
 
 ### 1. Установщик (`Clippy-Setup.exe`)
 Скачайте `Clippy-Setup.exe` из [раздела релизов](https://github.com/Mai-kun/Clippy/releases). Установщик не требует прав администратора, ставит программу в `AppData\Local\Programs\Clippy`, добавляет ярлык в меню «Пуск», опциональный автозапуск с Windows и поддерживает тихое обновление в 1 клик.
 
 ### 2. Портативная версия (`Clippy-win-x64.zip`)
 Распакуйте архив в любую удобную папку и запустите `Clippy.exe`.
+
+### 3. Linux (`Clippy-linux-x64.tar.gz`)
+Распакуйте архив и запустите `./install.sh`. Без sudo: скрипт устанавливает Clippy в `~/.local/share/Clippy`, создаёт симлинк `~/.local/bin/clippy`, добавляет иконку в меню приложений и настраивает автозапуск через `systemd --user`.
+
+- **Wayland:** работает на KDE Plasma, Niri, Hyprland и других композиторах — захват идёт через XDG ScreenCast Portal + PipeWire.
+- **Аппаратное кодирование:** NVIDIA NVENC (`nvh265enc` / `nvh264enc`) через CUDA DMA — 0% CPU на конвертации видео.
+- **Иконка в трее:** `StatusNotifierItem` в системном трее (левый клик сохраняет короткий клип, правый открывает меню).
+- **Горячие клавиши:** F8/F9 читаются напрямую через evdev (добавьте себя в группу `input`), либо назначьте `clippy --save-short` / `clippy --save-long` в настройках горячих клавиш композитора.
 
 > `ffmpeg.exe` **не требуется** в поставке: благодаря прямому доступу к аппаратному чипу NVENC (`clippy_nvenc.dll`) и системному кодированию звука через Windows Media Foundation, Clippy полностью автономен из коробки. При необходимости фолбэка на сторонний ffmpeg (например, для видеокарт AMD/Intel) достаточно положить `ffmpeg.exe` рядом или иметь его в системном PATH.
 
