@@ -9,6 +9,13 @@ var platform = PlatformFactory.Create();
 platform.InitializeConsole(args);
 platform.InitializeDpi();
 
+// The platform's own client-side flags (--save-short, --stop on Linux) must run BEFORE the disk
+// spool cleanup below: they are handled by an already-running recorder, and this process's
+// startup cleanup would wipe that recorder's disk tail out from under it.
+var platformResult = platform.RunPlatformCommand(args, out var platformHandled);
+if (platformHandled)
+    return platformResult;
+
 // Installed before anything else can fail. In tray mode there is no console at all, so a crash
 // leaves the user with a vanished tray icon and no explanation on screen -- and no way to report
 // it. This writes the reason to a file next to the exe where it can actually be found, and puts
@@ -28,7 +35,8 @@ TaskScheduler.UnobservedTaskException += (_, e) =>
 // Hybrid-buffer housekeeping. The disk spool under %TEMP%\Clippy\spool is a cache, never user data:
 // startup clears whatever a previous crash left behind, and a normal exit clears this run's segments.
 // Cleanup never throws, so neither path can take the process down. (Known ceiling: two instances
-// share the folder, so a second startup wipes the first instance's tail -- one recorder at a time.)
+// share the folder, so a second startup wipes the first instance's tail -- one recorder at a time.
+// The client-only flags above return before this point for exactly that reason.)
 AppDomain.CurrentDomain.ProcessExit += (_, _) => DiskSpooler.Cleanup();
 DiskSpooler.Cleanup();
 
@@ -92,13 +100,6 @@ if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
 {
     return PrintUsage();
 }
-
-// The platform's own diagnostics (--smoke, --test-nvenc-native, --test-mft-*, --audio-probe).
-// A backend that cannot run a flag reports that and takes the exit code; handled = false means
-// none of its flags matched, so parsing continues below.
-var platformResult = platform.RunPlatformCommand(args, out var platformHandled);
-if (platformHandled)
-    return platformResult;
 
 if (args.Contains("--test-parsers"))
 {
