@@ -613,7 +613,11 @@ internal sealed partial class LinuxDbus : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Tray: stopped serving ({ex.GetType().Name}: {ex.Message}).");
+                    // EBADF (9) is the NORMAL teardown path: Dispose closed the fd while this
+                    // thread sat in recvmsg. Only a bus failure while still serving is news.
+                    Console.WriteLine(dispatching
+                        ? $"Tray: stopped serving ({ex.GetType().Name}: {ex.Message})."
+                        : "Tray: shut down cleanly.");
                     return; // the session bus is gone; the tray has nowhere to live
                 }
 
@@ -645,7 +649,19 @@ internal sealed partial class LinuxDbus : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    SendError(message.Serial, message.Sender, "org.freedesktop.DBus.Error.Failed", ex.Message);
+                    // Teardown often races the dispatch: plasma keeps polling while Dispose
+                    // closes the fd, so the reply (and even the error about the reply) can hit a
+                    // closed socket. Unhandled, that exception aborts the whole process.
+                    if (!dispatching)
+                        return;
+                    try
+                    {
+                        SendError(message.Serial, message.Sender, "org.freedesktop.DBus.Error.Failed", ex.Message);
+                    }
+                    catch (Exception sendEx)
+                    {
+                        Console.WriteLine($"Tray: reply to {message.Member} failed twice ({sendEx.GetType().Name}).");
+                    }
                 }
             }
         })
@@ -778,6 +794,8 @@ internal sealed partial class LinuxDbus : IDisposable
 
     public void Dispose()
     {
+        // The flag first: the blocked recvmsg wakes with EBADF the moment the fd closes, and the
+        // dispatch loop must see "shutting down" rather than a bus failure.
         dispatching = false;
         if (fd >= 0)
             close(fd);
