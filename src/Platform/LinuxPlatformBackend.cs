@@ -134,7 +134,8 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
 
     private readonly PlatformRecordingOptions options;
     private readonly ClippyConfig config;
-    private readonly string outputDirectory;
+    // Not readonly: "Select Clips Folder..." re-points the recorder at the chosen directory live.
+    private string outputDirectory;
     private readonly string logsDirectory;
     private readonly Stopwatch stopwatch = Stopwatch.StartNew();
     private readonly ManualResetEventSlim stopped = new(false);
@@ -679,15 +680,18 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     private readonly object audioRestartGate = new();
 
     /// <summary>
-    /// Applies bitrate/codec changes by restarting the video pipeline in place: the old gst dies
-    /// completely (Dispose waits for its exit, so the NVENC session and its VRAM are released)
-    /// before the new one starts, and the ring is reused -- the replay history and the shared
-    /// clock survive the switch, clips cut across it stay aligned.
+    /// Applies bitrate/codec/encoder changes by restarting the video pipeline in place: the old
+    /// gst dies completely (Dispose waits for its exit, so the NVENC session and its VRAM are
+    /// released) before the new one starts, and the ring is reused -- the replay history and the
+    /// shared clock survive the switch, clips cut across it stay aligned. The encoder name is read
+    /// back from the config by the pipeline's own Start, so copying all three into the config
+    /// before restarting is what makes a live encoder switch possible at all.
     /// </summary>
-    void LinuxTrayIcon.IHost.SetVideoEncoding(int bitrateMbps, string codec)
+    void LinuxTrayIcon.IHost.SetVideoEncoding(int bitrateMbps, string codec, string encoder)
     {
         if (bitrateMbps == config.VideoBitrateMbps &&
             string.Equals(codec, config.VideoCodec, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(encoder, config.VideoEncoder, StringComparison.OrdinalIgnoreCase) &&
             video is not null)
             return; // nothing changed
 
@@ -695,6 +699,7 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         {
             config.VideoBitrateMbps = bitrateMbps;
             config.VideoCodec = codec;
+            config.VideoEncoder = encoder;
             video?.Dispose();
             video = null;
 
@@ -712,7 +717,8 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
                 video = null;
                 return;
             }
-            Console.WriteLine($"Video: restarted [{(config.UseHevc ? "HEVC" : "H.264")}] at {bitrateMbps} Mbit/s.");
+            Console.WriteLine($"Video: restarted [{(config.UseHevc ? "HEVC" : "H.264")}] at {bitrateMbps} Mbit/s " +
+                $"[{config.VideoEncoder}].");
         }
     }
 
@@ -727,20 +733,22 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     private DateTime sinkCacheTime = DateTime.MinValue;
     private static readonly TimeSpan SinkCacheTtl = TimeSpan.FromSeconds(15);
 
-    IReadOnlyList<(string Name, string Description)> LinuxTrayIcon.IHost.ListAudioSinks()
+    IReadOnlyList<(string Name, string Description)> LinuxTrayIcon.IHost.ListAudioSinks() =>
+        ListAudioSinksCached();
+
+    /// <summary>
+    /// The sink list feeds every menu rebuild, and Plasma re-queries the menu on a timer: without
+    /// a cache that is one pactl process per poll. Fifteen seconds is fresh enough for hotplugs.
+    /// The pairs come from `pactl list sinks` (LinuxAudioPipeline.ListSinks): the technical Name
+    /// for the config and the `-f pulse` monitor source, the Description for the menu label --
+    /// never the short table, whose third column is "PipeWire" for every device.
+    /// </summary>
+    private IReadOnlyList<(string Name, string Description)> ListAudioSinksCached()
     {
         if (sinkCache is not null && DateTime.UtcNow - sinkCacheTime < SinkCacheTtl)
             return sinkCache;
 
-        var sinks = new List<(string, string)>();
-        var output = RunPactlListSinks();
-        foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-        {
-            // "index\tname\tdescription..." -- name and description are what the menu needs.
-            var columns = line.Split('\t');
-            if (columns.Length >= 3)
-                sinks.Add((columns[1], columns[2]));
-        }
+        var sinks = LinuxAudioPipeline.ListSinks();
         if (sinks.Count == 0)
             return sinks; // a failed probe is not cached: the next menu open retries
         sinkCache = sinks;
@@ -748,37 +756,71 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         return sinks;
     }
 
-    private static string RunPactlListSinks()
+    void LinuxTrayIcon.IHost.RequestExit() => Stop("the tray asked for it");
+
+    /// <summary>
+    /// Points the recorder at the folder the user just picked. Exports write to it from the next
+    /// save on; the spoolers and rings keep running unchanged, so nothing about the replay depth
+    /// or the shared clock moves.
+    /// </summary>
+    void LinuxTrayIcon.IHost.SetClipsFolder(string folder)
     {
         try
         {
-            var startInfo = new ProcessStartInfo("pactl")
-            {
-                RedirectStandardOutput = true,
-                ArgumentList = { "list", "short", "sinks" },
-            };
-            using var process = Process.Start(startInfo);
-            if (process is null)
-                return "";
-            // ReadToEnd alone would wait for EOF forever on a wedged pactl, so the read itself
-            // gets the deadline; a hung run is killed and answered with an empty list.
-            var read = process.StandardOutput.ReadToEndAsync();
-            if (!read.Wait(2000))
-            {
-                try { process.Kill(entireProcessTree: true); } catch (Exception) { /* already gone */ }
-                Console.WriteLine("Audio: pactl did not answer within 2 s; the audio menu may be stale.");
-                return "";
-            }
-            process.WaitForExit(1000);
-            return read.Result;
+            Directory.CreateDirectory(folder);
         }
-        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return "";
+            Console.WriteLine($"Recording: could not create the clips folder {folder} ({ex.Message}).");
         }
+        outputDirectory = folder;
+        Console.WriteLine($"Recording: clips now go to {outputDirectory}.");
     }
 
-    void LinuxTrayIcon.IHost.RequestExit() => Stop("the tray asked for it");
+    /// <summary>The tray picked a new hotkey pair: push it into every live capture backend at once.</summary>
+    void LinuxTrayIcon.IHost.RebindHotkeys(string shortKey, string longKey)
+    {
+        if (hotkeys is null)
+        {
+            Console.WriteLine("Settings: no hotkey service to rebind; takes effect next session.");
+            return;
+        }
+        hotkeys.Rebind(shortKey, longKey);
+    }
+
+    /// <summary>
+    /// Starts a fresh copy of this executable with the same arguments, then quits this one -- the
+    /// same restart the Windows tray performs: the new process launches BEFORE this one stops, so
+    /// there is no window where nothing is recording, and the user's own arguments are replayed
+    /// verbatim.
+    /// </summary>
+    void LinuxTrayIcon.IHost.RestartProcess()
+    {
+        var exe = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exe))
+        {
+            Console.WriteLine("Tray: restart needs a real executable path, which this run does not have.");
+            return;
+        }
+
+        try
+        {
+            var startInfo = new ProcessStartInfo(exe) { UseShellExecute = false };
+            foreach (var argument in Environment.GetCommandLineArgs().Skip(1))
+                startInfo.ArgumentList.Add(argument);
+            Process.Start(startInfo);
+            Console.WriteLine("Tray: a new instance was started; this one is shutting down.");
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or InvalidOperationException)
+        {
+            // Staying alive is the right answer here: quitting after a failed launch would take
+            // the recorder away over a menu item that did not work.
+            Console.WriteLine($"Tray: could not start a new instance ({ex.Message}); still running.");
+            return;
+        }
+
+        Stop("Restart was chosen in the tray");
+    }
 
     public void Dispose()
     {
