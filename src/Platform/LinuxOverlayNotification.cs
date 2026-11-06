@@ -81,7 +81,10 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     private nint graphicsContext;
     private nint image;
     private nint frameBuffer;
-    private nint draw;               // XftDraw: Xft text rendered onto the ARGB window
+    private nint scratchPixmap;      // offscreen ARGB pixmap where text is baked into the card
+    private nint scratchImage;
+    private nint scratchBuffer;
+    private nint draw;               // XftDraw: Xft text rendered onto the scratch pixmap
     private nint titleFont;
     private nint messageFont;
     private nint visual;             // the 32-bit ARGB visual the window was created with
@@ -340,7 +343,17 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             return;
         }
 
-        draw = XftDrawCreate(display, window, visual, colormap);
+        // The scratch pixmap is where text gets baked into the card ONCE per show (Xft draws via
+        // XRender, which only targets drawables, not our byte buffer). Drawing the text directly
+        // onto the window every animation frame would need two X operations per frame -- the
+        // compositor catches the state between them and the card visibly re-paints, text popping
+        // in and out. With the composite pre-baked, every frame is ONE XPutImage: atomic.
+        scratchBuffer = Marshal.AllocHGlobal(Scaled(BaseWidth) * Scaled(BaseHeight) * 4);
+        scratchImage = XCreateImage(display, visual, 32, ZPixmap, 0, scratchBuffer,
+            (uint)Scaled(BaseWidth), (uint)Scaled(BaseHeight), 32, 0);
+        scratchPixmap = XCreatePixmap(display, window, (uint)Scaled(BaseWidth), (uint)Scaled(BaseHeight), 32);
+
+        draw = XftDrawCreate(display, scratchPixmap, visual, colormap);
         // Colours must be allocated against the window's own visual and colormap (the 32-bit ARGB
         // pair), not the screen defaults, or XRender blends the text with the wrong pixel format.
         titleColor = AllocColor(titleColorRef());
@@ -360,6 +373,8 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         if (titleFont != 0) { XftFontClose(display, titleFont); titleFont = 0; }
         if (messageFont != 0) { XftFontClose(display, messageFont); messageFont = 0; }
         if (image != 0) { XDestroyImage(image); image = 0; frameBuffer = 0; } // destroy_image frees the data
+        if (scratchImage != 0) { XDestroyImage(scratchImage); scratchImage = 0; scratchBuffer = 0; }
+        if (scratchPixmap != 0) { XFreePixmap(display, scratchPixmap); scratchPixmap = 0; }
         if (graphicsContext != 0) { XFreeGC(display, graphicsContext); graphicsContext = 0; }
         if (window != 0) { XDestroyWindow(display, window); window = 0; }
         if (colormap != 0) { XFreeColormap(display, colormap); colormap = 0; }
@@ -384,9 +399,11 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     /// <summary>
     /// Renders the card at full opacity into <see cref="cardBase"/>: premultiplied BGRA, rounded
-    /// rectangle with the hairline border and the green check circle, all anti-aliased by signed
-    /// distance coverage. Text is NOT in this buffer -- it is drawn per frame through Xft on top,
-    /// because fading it separately keeps it crisp while the card fades.
+    /// rectangle with the hairline border and the green check circle (anti-aliased by signed
+    /// distance coverage) with the two text lines baked in through Xft. The text is composited on
+    /// the scratch pixmap -- XPutImage of the shape, XRender of the text, XGetImage of the result
+    /// -- so the animation frames afterwards are a single atomic XPutImage each and the card can
+    /// never appear on screen without its text.
     /// </summary>
     private void RenderCardBase(string title, string message)
     {
@@ -444,8 +461,36 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             }
         }
 
-        cardBase = buffer;
         textLayout = ComputeTextLayout(title, message);
+
+        // Bake the text into the card while everything still sits at full opacity.
+        unsafe
+        {
+            buffer.CopyTo(new Span<byte>((void*)scratchBuffer, buffer.Length));
+        }
+        XPutImage(display, scratchPixmap, graphicsContext, scratchImage, 0, 0, 0, 0,
+            (uint)width, (uint)height);
+        if (textLayout is { } layout)
+        {
+            XftDrawStringUtf8(draw, ref titleColor, titleFont, layout.TitleX, layout.TitleBaseline, layout.Title, layout.Title.Length);
+            XftDrawStringUtf8(draw, ref messageColor, messageFont, layout.MessageX, layout.MessageBaseline, layout.Message, layout.Message.Length);
+        }
+        XFlush(display);
+
+        // Read the composite back. The returned image owns its own data buffer, which
+        // XDestroyImage frees -- our scratchBuffer stays ours.
+        cardBase = buffer;
+        var captured = XGetImage(display, scratchPixmap, 0, 0, (uint)width, (uint)height, AllPlanes, ZPixmap);
+        if (captured != 0)
+        {
+            unsafe
+            {
+                var head = (XImageHeader*)captured;
+                if (head->Data != 0)
+                    new Span<byte>((void*)head->Data, buffer.Length).CopyTo(cardBase);
+            }
+            XDestroyImage(captured);
+        }
     }
 
     /// <summary>Signed distance to the rounded rectangle's boundary; negative inside.</summary>
@@ -549,21 +594,14 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         var target = new Span<byte>((void*)frameBuffer, bytes);
         var source = cardBase;
         // Premultiplied pixels scale channel-wise: multiplying all four bytes by the fade keeps
-        // the colours exact at every alpha, corners included.
+        // the colours exact at every alpha, corners and text anti-aliasing included.
         for (var i = 0; i < bytes; i++)
             target[i] = (byte)(source[i] * alpha / 255);
 
+        // The single X operation per frame: no intermediate "card without text" state can ever
+        // reach the compositor, which is what made the card flicker.
         XPutImage(display, window, graphicsContext, image, 0, 0, 0, 0,
             (uint)Scaled(BaseWidth), (uint)Scaled(BaseHeight));
-
-        if (alpha > 0 && draw != 0 && textLayout is { } layout)
-        {
-            // alpha (0..255) to XRender's 0..65535; the text fades with the card.
-            var titleColor = this.titleColor with { alpha = (ushort)(alpha * 0x101) };
-            var messageColor = this.messageColor with { alpha = (ushort)(alpha * 0x101) };
-            XftDrawStringUtf8(draw, ref titleColor, titleFont, layout.TitleX, layout.TitleBaseline, layout.Title, layout.Title.Length);
-            XftDrawStringUtf8(draw, ref messageColor, messageFont, layout.MessageX, layout.MessageBaseline, layout.Message, layout.Message.Length);
-        }
         XFlush(display);
     }
 
@@ -610,6 +648,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     private const int ColormapAllocNone = 0;
     private const int True_ = 1;
     private const int ZPixmap = 2;
+    private const ulong AllPlanes = ulong.MaxValue; // plane_mask ~0: every plane of the drawable
     private const int PropModeReplace = 0;
 
     private const nuint CWBackPixel = 1 << 1;
@@ -676,6 +715,17 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         public ushort alpha;
     }
 
+    /// <summary>The head of XImage, far enough to reach the data pointer (offset 16 on LP64).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XImageHeader
+    {
+        public int Width;
+        public int Height;
+        public int XOffset;
+        public int Format;
+        public nint Data;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct XGlyphInfo
     {
@@ -736,6 +786,16 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     [LibraryImport("libX11.so.6", StringMarshalling = StringMarshalling.Utf8)]
     private static partial int XStoreName(nint display, nint window, string name);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial nint XCreatePixmap(nint display, nint drawable, uint width, uint height, uint depth);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial int XFreePixmap(nint display, nint pixmap);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial nint XGetImage(nint display, nint drawable, int x, int y,
+        uint width, uint height, ulong planeMask, int format);
 
     [LibraryImport("libX11.so.6")]
     private static partial nint XCreateGC(nint display, nint drawable, nuint valueMask, nint values);
