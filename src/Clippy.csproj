@@ -36,6 +36,18 @@
     <DefineConstants Condition="'$(IsWindowsTarget)' != 'true'">$(DefineConstants);LINUX</DefineConstants>
   </PropertyGroup>
 
+  <!-- The Linux release ships ONE binary, stripped, and nothing else. Native AOT's StripSymbols
+       (the ELF default) runs objcopy to peel the debug info off the executable, which is what
+       KEEPS the release binary at ~8 MB instead of ~18, but it drops the peeled-off copy next
+       to it as Clippy.dbg: a file heavier than the program itself and useless to a user. The
+       DropLinuxDebugSymbols target below deletes it after publish, so the shipped binary stays
+       stripped and the debug copy never reaches dist/. A developer who actually wants symbols
+       builds with StripSymbols=false and keeps the fat binary (or the dbg) to themselves. -->
+  <PropertyGroup Condition="'$(IsWindowsTarget)' != 'true'">
+    <DebugType>none</DebugType>
+    <StripSymbols>true</StripSymbols>
+  </PropertyGroup>
+
   <!-- The icon for the executable, and the source for the taskbar, the Alt-Tab entry and the tray:
        TrayIcon reads it back out of this binary with ExtractIconExW, so all four show the same
        thing. It has to be a real size set, not one image: the tray needs the 16x16 drawn verbatim
@@ -107,14 +119,18 @@
     <None Include="..\config.example.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <!-- A real capture, committed deliberately. Mp4WriterSelfTest parses REAL SPS/PPS and compares
          real PTS against ffprobe; invented codec parameters would not exercise the paths that matter.
-         Without this copied, the mp4 test fails on a published binary with FileNotFoundException. -->
-    <None Include="Tests\mp4-selftest-frames.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    <None Include="Tests\mp4-selftest-audio.aac" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+         These land in $(OutDir) on every build, so the local test-mp4 selftest works off a plain dotnet
+         build; they are deliberately NOT published (CopyToPublishDirectory=Never): they are test
+         fixtures, not user files, and a release must not carry 3 MB of them. The CI workflow copies
+         them next to the published binary itself, runs the mp4 selftest, and its clean step removes them
+         again. Without the OutDir copy the mp4 test fails with FileNotFoundException. -->
+    <None Include="Tests\mp4-selftest-frames.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
+    <None Include="Tests\mp4-selftest-audio.aac" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
 <!-- The HEVC counterpart of the fixture above: a real VPS/SPS/PPS and twelve real pictures from
          libx265. Synthetic parameter sets were tried first and ffprobe refused the resulting track,
          because it parses the SPS out of hvcC before it will name a stream, so this container test
          needs the real thing for the same reason the H.264 one does. -->
-    <None Include="Tests\mp4-selftest-hevc.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="Tests\mp4-selftest-hevc.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
   </ItemGroup>
 
   <!-- The native NVENC bridge, built by src\native\build.cmd. -->
@@ -123,19 +139,25 @@
   <!-- P/Invoke name is bare and is resolved against the application directory. The encoder treats a -->
   <!-- missing DLL as "no hardware encoder on this machine" and falls back to ffmpeg, so a build -->
   <!-- machine without MSVC still produces a working binary. -->
-  <Target Name="CopyNvencBridge" AfterTargets="Build;Publish">
+  <!-- WINDOWS ONLY: the DLL is a PE image; on a Linux target it is dead weight that turns the
+       release folder into junk. The mp4 fixtures are not copied here at all: the None items above
+       own the $(OutDir) copy, and a publish copy is deliberately nobody's job in this project,
+       because the release workflow stages them for its selftests and cleans them up again. -->
+  <Target Name="CopyNvencBridge" AfterTargets="Build;Publish"
+          Condition="'$(IsWindowsTarget)' == 'true'">
     <Copy SourceFiles="$(MSBuildProjectDirectory)\native\clippy_nvenc.dll"
           DestinationFolder="$(OutDir)"
           Condition="Exists('$(MSBuildProjectDirectory)\native\clippy_nvenc.dll') AND '$(OutDir)' != ''" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\native\clippy_nvenc.dll"
           DestinationFolder="$(PublishDir)"
           Condition="Exists('$(MSBuildProjectDirectory)\native\clippy_nvenc.dll') AND '$(PublishDir)' != ''" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\Tests\mp4-selftest-frames.bin;$(MSBuildProjectDirectory)\Tests\mp4-selftest-audio.aac;$(MSBuildProjectDirectory)\Tests\mp4-selftest-hevc.bin"
-          DestinationFolder="$(OutDir)"
-          Condition="'$(OutDir)' != ''" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\Tests\mp4-selftest-frames.bin;$(MSBuildProjectDirectory)\Tests\mp4-selftest-audio.aac;$(MSBuildProjectDirectory)\Tests\mp4-selftest-hevc.bin"
-          DestinationFolder="$(PublishDir)"
-          Condition="'$(PublishDir)' != ''" />
+  </Target>
+  <!-- Peel-off debug copy from StripSymbols (see the property group above): released, never
+       shipped. Deleting it here means every publish lands clean, not only the CI one. -->
+  <Target Name="DropLinuxDebugSymbols" AfterTargets="Publish"
+          Condition="'$(IsWindowsTarget)' != 'true'">
+    <Delete Files="$(PublishDir)$(AssemblyName).dbg"
+            Condition="'$(PublishDir)' != '' AND Exists('$(PublishDir)$(AssemblyName).dbg')" />
   </Target>
 
 </Project>

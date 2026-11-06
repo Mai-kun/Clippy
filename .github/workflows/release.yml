@@ -94,6 +94,16 @@ jobs:
           -p:PublishAot=true
           -o publish
 
+      # The csproj deliberately does NOT publish the mp4 fixtures (they are test payloads, never
+      # user files), so the selftest step brings its own and the clean step below takes them back
+      # out before anything is packaged.
+      - name: Stage the mp4 fixtures next to the published binary
+        shell: pwsh
+        run: |
+          Copy-Item src/Tests/mp4-selftest-frames.bin publish/
+          Copy-Item src/Tests/mp4-selftest-audio.aac publish/
+          Copy-Item src/Tests/mp4-selftest-hevc.bin publish/
+
       # Runs immediately after publish, BEFORE anything is deleted, moved or copied. The selftests
       # must judge the binary exactly as dotnet produced it, not a folder this workflow has been
       # rearranging underneath them. ffprobe comes from the runner's PATH (setup-ffmpeg above), so
@@ -246,6 +256,15 @@ jobs:
           -r linux-x64
           -p:PublishAot=true
           -o publish-linux
+
+      # Same as the Windows job: the fixtures are not part of a publish (and with StripSymbols off
+      # there is no Clippy.dbg either), so the selftests bring their own payloads.
+      - name: Stage the mp4 fixtures next to the published binary
+        run: |
+          cp src/Tests/mp4-selftest-frames.bin \
+             src/Tests/mp4-selftest-audio.aac \
+             src/Tests/mp4-selftest-hevc.bin \
+             publish-linux/
 
       - name: Verify the selftests
         run: |
