@@ -251,7 +251,10 @@ internal sealed class LinuxTrayIcon : IDisposable
         bus.AddMethodHandler(MenuPath, MenuInterface, "GetLayout", ServeGetLayout, "u(ia{sv}av)");
         bus.AddMethodHandler(MenuPath, MenuInterface, "GetGroupProperties", ServeGetGroupProperties, "a(ia{sv})");
         bus.AddMethodHandler(MenuPath, MenuInterface, "Event", ServeEvent);
-        bus.AddMethodHandler(MenuPath, MenuInterface, "AboutToShow", _ => WriteBody(w => w.UInt32(0)), "b");
+        bus.AddMethodHandler(MenuPath, MenuInterface, "AboutToShow", _ => WriteBody(w => w.UInt32(1)), "b");
+        // Always "yes, refresh": the menu is rebuilt from the live config on every query anyway,
+        // and a forced refetch before each submenu open is what un-sticks the radio marks --
+        // Plasma otherwise keeps rendering the toggle-state it cached from the first fetch.
         bus.AddMethodHandler(MenuPath, MenuInterface, "GetItemProperty", _ => []);
         bus.AddMethodHandler(MenuPath, MenuInterface, "GetItemsProperty", _ => []);
 
@@ -374,6 +377,7 @@ internal sealed class LinuxTrayIcon : IDisposable
               "<method name='Event'><arg type='i' direction='in'/><arg type='s' direction='in'/><arg type='v' direction='in'/><arg type='u' direction='in'/></method>" +
               "<method name='AboutToShow'><arg type='i' direction='in'/><arg type='b' direction='out'/></method>" +
               "<signal name='LayoutUpdated'><arg type='u'/><arg type='i'/></signal>" +
+              "<signal name='ItemsPropertiesUpdated'><arg type='a(ia{sv})' direction='out'/><arg type='a(ias)' direction='out'/></signal>" +
               $"<property name='Version' type='u' access='read'/><property name='Status' type='s' access='read'/></interface>" +
               $"<interface name='{PropertiesInterface}'><method name='Get'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='v' direction='out'/></method>" +
               "<method name='GetAll'><arg type='s' direction='in'/><arg type='a{{sv}}' direction='out'/></method></interface>" +
@@ -952,11 +956,50 @@ internal sealed class LinuxTrayIcon : IDisposable
         if (!registered || bus is null)
             return;
         menuRevision++;
+
         bus.SendSignal(MenuPath, MenuInterface, "LayoutUpdated", "ui", w =>
         {
             w.UInt32(menuRevision);
             w.Int32(0);
         });
+
+        // LayoutUpdated alone is not enough for the radio marks: Plasma keeps rendering the
+        // toggle-state it cached at the first fetch. ItemsPropertiesUpdated carries the fresh
+        // properties to a menu that is open RIGHT NOW (e.g. the Notifications submenu right
+        // after a click); the refetch that AboutToShow=true triggers covers the next open.
+        bus.SendSignal(MenuPath, MenuInterface, "ItemsPropertiesUpdated", "a(ia{sv})a(ias)", w =>
+        {
+            var (updatedLength, updatedStart) = w.BeginArray(8);
+            foreach (var entry in FlattenMenu(BuildMenu()))
+            {
+                if (entry.Separator)
+                    continue;
+                w.Align(8);
+                w.Int32(entry.Id);
+                var (propsLength, propsStart) = w.BeginArray(8);
+                WriteEntryProperties(w, entry);
+                w.EndArray(propsLength, propsStart);
+            }
+            w.EndArray(updatedLength, updatedStart);
+
+            var (removedLength, removedStart) = w.BeginArray(8);
+            w.EndArray(removedLength, removedStart); // nothing is ever removed from this menu
+        });
+    }
+
+    /// <summary>Every item of the tree, root excluded -- the flat list the property update wants.</summary>
+    private static IEnumerable<MenuEntry> FlattenMenu(MenuEntry root)
+    {
+        var stack = new Stack<MenuEntry>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var entry = stack.Pop();
+            if (entry.Id != 0)
+                yield return entry;
+            foreach (var child in entry.Children)
+                stack.Push(child);
+        }
     }
 
     public void Dispose()
