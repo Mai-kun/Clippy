@@ -103,37 +103,43 @@ internal static class LinuxNotifications
     }
 
     /// <summary>
-    /// The visual announcement, routed by config.NotificationType -- exactly the branches the
-    /// Windows ScreenCapture walks:
-    /// <list type="bullet">
-    /// <item>"overlay" -- the custom Medal-style card (LinuxOverlayNotification, the Linux port of
-    /// UI/OverlayNotification.cs). When X11 is unavailable (no DISPLAY / no XWayland / no libXft),
-    /// the desktop toast is the fallback rather than silence.</item>
-    /// <item>"windows_toast" -- the session's own notification through the freedesktop
-    /// org.freedesktop.Notifications D-Bus interface, so KDE shows it as a system toast.</item>
-    /// <item>"none" -- nothing visual at all; the sound (PlayExportSaved) already announced it.</item>
-    /// </list>
-    /// Every path is fire-and-forget: a missing daemon must never fail an export that already
-    /// wrote its bytes.
+    /// The visual announcement of a SAVED CLIP, routed by config.NotificationType -- exactly the
+    /// branches the Windows ScreenCapture walks. Sound Only shows nothing.
     /// </summary>
-    public static void ShowClipSaved(ClippyConfig config, string title, string body)
+    public static void ShowClipSaved(ClippyConfig config, string title, string body) =>
+        ShowStatus(config, title, body);
+
+    /// <summary>
+    /// A status announcement -- update checks, notification previews, update progress. Same
+    /// routing as the clip card with two differences:
+    ///
+    /// <list type="bullet">
+    /// <item><paramref name="forceVisual"/> makes Sound Only still show the visual: the result of
+    /// "Check for Updates" must reach the user even when clip notifications are off -- in the
+    /// overlay card when it can come up, in the desktop toast otherwise.</item>
+    /// <item>the overlay's failure ALWAYS falls back to the desktop toast here: an update status
+    /// that vanishes because X11 was unavailable is worse than no status at all.</item>
+    /// </list>
+    /// Every path is fire-and-forget: a missing daemon must never fail the caller.
+    /// </summary>
+    public static void ShowStatus(ClippyConfig config, string title, string message, bool forceVisual = false)
     {
         var type = config.NotificationType;
-        if (string.Equals(type, "none", StringComparison.OrdinalIgnoreCase))
-            return;
+        var isOverlay = string.Equals(type, "overlay", StringComparison.OrdinalIgnoreCase);
+        var isNone = string.Equals(type, "none", StringComparison.OrdinalIgnoreCase);
 
-        if (string.Equals(type, "overlay", StringComparison.OrdinalIgnoreCase))
+        if (isNone && !forceVisual)
+            return; // Sound Only: nothing visual unless the caller insists.
+
+        if (isOverlay || (isNone && forceVisual))
         {
             var overlay = AcquireOverlay();
-            if (overlay is not null)
-            {
-                overlay.Show(title, body);
+            if (overlay is not null && overlay.Show(title, message))
                 return;
-            }
-            // X11 unavailable: the desktop notification is what the session has instead.
+            // The card could not come up (no X11, no Xft): the desktop toast takes over.
         }
 
-        SendDesktopNotification(title, body);
+        SendDesktopNotification(title, message);
     }
 
     // The overlay is process-wide: one X11 connection and window, reused by every export.

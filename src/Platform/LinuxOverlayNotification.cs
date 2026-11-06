@@ -50,8 +50,6 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     private const int TitleFontPx = 16;
     private const int MessageFontPx = 13;
-    private const int TitleMaxChars = 24;
-    private const int MessageMaxChars = 32;
 
     // Animation timings, identical to the Windows overlay.
     private const int FadeInMs = 120;
@@ -99,6 +97,11 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     // alpha, so the hold frames do not re-render the shape at all.
     private byte[]? cardBase;
 
+    // The card's CURRENT pixel width: 240 design px, grown per show when a status line is longer
+    // than the card (see ComputeTextLayout). The window, both XImages and the scratch pixmap are
+    // all sized to this and rebuilt by EnsureWidth whenever it changes.
+    private int cardWidth = BaseWidth;
+
     /// <summary>True once the overlay window exists and text can be drawn. Checked after Start.</summary>
     public bool IsReady { get; private set; }
 
@@ -114,12 +117,13 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     /// <summary>
     /// Queues a card. Thread-safe, called from the export thread; a card already on screen is
-    /// re-timed by the pump loop rather than flickered.
+    /// re-timed by the pump loop rather than flickered. True when the card was queued for display
+    /// (the overlay is ready); false means the caller should fall back to the desktop toast.
     /// </summary>
-    public void Show(string title, string message)
+    public bool Show(string title, string message)
     {
         if (disposed || !IsReady)
-            return;
+            return false;
 
         lock (queueGate)
         {
@@ -129,6 +133,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             queue.Enqueue((title, message));
         }
         kick.Set();
+        return true;
     }
 
     public void Dispose()
@@ -246,6 +251,40 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     /// <summary>Alpha of the card on screen, read and written only on the overlay thread.</summary>
     private int CurrentAlpha;
+
+    /// <summary>
+    /// Resizes every size-dependent resource to <paramref name="width"/>: the override-redirect
+    /// window (its RIGHT edge stays anchored at the margin, so the card keeps hanging in the
+    /// top-right corner), the frame image the animation pushes, and the scratch pixmap/image pair
+    /// the text is baked on. Called per show before rendering, only when the width actually
+    /// changes, so the common clip card never rebuilds anything.
+    /// </summary>
+    private void EnsureWidth(int width)
+    {
+        if (width == cardWidth || window == 0)
+            return;
+
+        var height = Scaled(BaseHeight);
+        var x = XDisplayWidth(display, screen) - width - Scaled(BaseMargin);
+        XResizeWindow(display, window, (uint)width, (uint)height);
+        XMoveWindow(display, window, x, Scaled(BaseMargin));
+
+        if (image != 0) { XDestroyImage(image); image = 0; frameBuffer = 0; }
+        frameBuffer = Marshal.AllocHGlobal(width * height * 4);
+        image = XCreateImage(display, visual, 32, ZPixmap, 0, frameBuffer, (uint)width, (uint)height, 32, 0);
+
+        // The XftDraw targets the scratch pixmap, so it is rebuilt with it.
+        if (draw != 0) { XftDrawDestroy(draw); draw = 0; }
+        if (scratchImage != 0) { XDestroyImage(scratchImage); scratchImage = 0; scratchBuffer = 0; }
+        if (scratchPixmap != 0) { XFreePixmap(display, scratchPixmap); scratchPixmap = 0; }
+        scratchBuffer = Marshal.AllocHGlobal(width * height * 4);
+        scratchImage = XCreateImage(display, visual, 32, ZPixmap, 0, scratchBuffer, (uint)width, (uint)height, 32, 0);
+        scratchPixmap = XCreatePixmap(display, window, (uint)width, (uint)height, 32);
+        draw = XftDrawCreate(display, scratchPixmap, visual, colormap);
+
+        cardWidth = width;
+        XFlush(display);
+    }
 
     // --- X11 setup / teardown ---
 
@@ -410,7 +449,10 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     /// </summary>
     private void RenderCardBase(string title, string message)
     {
-        var width = Scaled(BaseWidth);
+        // Layout first: it measures the lines and grows the card when a status message is wider
+        // than the 240 px design width -- every width below then reads the new cardWidth.
+        textLayout = ComputeTextLayout(title, message);
+        var width = cardWidth;
         var height = Scaled(BaseHeight);
         var tailRadius = Scaled(BaseCornerRadius);
         var border = Scaled(BaseBorder);
@@ -479,8 +521,6 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
                 buffer[i + 3] = (byte)alpha;
             }
         }
-
-        textLayout = ComputeTextLayout(title, message);
 
         // Bake the text into the card while everything still sits at full opacity.
         unsafe
@@ -562,18 +602,27 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     private (byte[] Title, byte[] Message, int TitleX, int TitleBaseline, int MessageX, int MessageBaseline)
         ComputeTextLayout(string title, string message)
     {
-        var width = Scaled(BaseWidth);
         var height = Scaled(BaseHeight);
         var textX = Scaled(BaseTextX);
-        var maxWidth = width - textX - Scaled(BaseTextRightInset);
+        var inset = Scaled(BaseTextRightInset);
 
-        var titleBytes = Utf8(Fit(title, TitleMaxChars));
-        var messageBytes = Utf8(Fit(message, MessageMaxChars));
+        var titleBytes = Utf8(title);
+        var messageBytes = Utf8(message);
         XftTextExtentsUtf8(display, titleFont, titleBytes, titleBytes.Length, out var titleExtents);
         XftTextExtentsUtf8(display, messageFont, messageBytes, messageBytes.Length, out var messageExtents);
 
-        // Shrink by measured width rather than a char budget: Xft metrics differ per font, and a
-        // long device name must ellipsize at the border, never spill past it.
+        // GROW, don't truncate: a status line like "You are on the latest version (v1.6.1)" is
+        // wider than the 240 px design card, and clipping it would defeat the announcement. The
+        // card widens to the longest line plus the badge band and the right inset; the screen
+        // width (margin on both sides) is the only hard ceiling, and past it the lines
+        // ellipsize as before.
+        var textWidth = Math.Max(titleExtents.width, messageExtents.width);
+        var screenRoom = XDisplayWidth(display, screen) - 2 * Scaled(BaseMargin) - textX - inset;
+        var wanted = Math.Clamp(textX + textWidth + inset,
+            Scaled(BaseWidth), Math.Max(Scaled(BaseWidth), textX + Math.Max(0, screenRoom) + inset));
+        EnsureWidth(wanted);
+
+        var maxWidth = cardWidth - textX - inset;
         while (titleExtents.width > maxWidth && titleBytes.Length > 1)
         {
             titleBytes = TruncateWithEllipsis(titleBytes);
@@ -607,7 +656,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         if (cardBase is null || image == 0 || frameBuffer == 0 || !IsReady)
             return;
 
-        var bytes = Scaled(BaseWidth) * Scaled(BaseHeight) * 4;
+        var bytes = cardWidth * Scaled(BaseHeight) * 4;
         var target = new Span<byte>((void*)frameBuffer, bytes);
         var source = cardBase;
         // Premultiplied pixels scale channel-wise: multiplying all four bytes by the fade keeps
@@ -618,7 +667,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         // The single X operation per frame: no intermediate "card without text" state can ever
         // reach the compositor, which is what made the card flicker.
         XPutImage(display, window, graphicsContext, image, 0, 0, 0, 0,
-            (uint)Scaled(BaseWidth), (uint)Scaled(BaseHeight));
+            (uint)cardWidth, (uint)Scaled(BaseHeight));
         XFlush(display);
     }
 
@@ -634,9 +683,6 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         var kept = bytes[..Math.Max(1, cut)];
         return [.. kept, .. Utf8("\u2026")];
     }
-
-    private static string Fit(string text, int max) =>
-        text.Length <= max ? text : string.Concat(text.AsSpan(0, max - 1), "\u2026");
 
     private int Scaled(int design) => design; // the per-display scale factor lands here
 
@@ -790,6 +836,12 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     [LibraryImport("libX11.so.6")]
     private static partial int XMapWindow(nint display, nint window);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial int XResizeWindow(nint display, nint window, uint width, uint height);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial int XMoveWindow(nint display, nint window, int x, int y);
 
     [LibraryImport("libX11.so.6")]
     private static partial int XDestroyWindow(nint display, nint window);
