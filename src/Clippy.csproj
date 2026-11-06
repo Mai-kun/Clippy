@@ -90,6 +90,9 @@
        MessageBeep, and the "embedded default sound" smoke check is what catches it. -->
   <ItemGroup>
     <EmbeddedResource Include="assets\sounds\sound.wav" LogicalName="DefaultSound.wav" />
+    <!-- The tray pixmap and the Linux hicolor icon come from the same app.ico the Windows
+         build uses for its executable: LinuxIconAssets extracts its frames at runtime. -->
+    <EmbeddedResource Include="assets\app.ico" LogicalName="app.ico" />
   </ItemGroup>
 
   <!-- A portable folder: ffmpeg.exe dropped next to the binary is used in preference to PATH, and
