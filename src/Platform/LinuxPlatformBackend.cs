@@ -180,6 +180,14 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         // unidentifiable application"; it is only written when missing or moved.
         LinuxDesktopIntegration.EnsureDesktopFile();
 
+        // Launched with --updated by the update flow's restart: confirm the new version visibly,
+        // even for a Sound Only user -- this is the one notification the update itself owes them.
+        if (options.Updated)
+        {
+            LinuxNotifications.ShowStatus(config, "Clippy",
+                $"Updated to version {UpdateService.Version}!", forceVisual: true);
+        }
+
         Console.WriteLine($"Recording [{config.VideoEncoder}] into a hybrid ring: " +
             $"{LinuxVideoPipeline.RamHeadSeconds:F0}s RAM head + disk spool to {LinuxVideoPipeline.RingSeconds:F0}s total.");
         Console.WriteLine("Nothing is written until an export happens (--save-short saves " +

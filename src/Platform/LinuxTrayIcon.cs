@@ -773,10 +773,16 @@ internal sealed class LinuxTrayIcon : IDisposable
             case IdNotifyOverlay:
                 config.NotificationType = "overlay";
                 SaveConfig("Notifications: Game Overlay");
+                // A live preview of what was just picked: the card itself, or the desktop toast
+                // when the card could not come up.
+                LinuxNotifications.ShowStatus(config, "Overlay Enabled",
+                    "Clip notifications will appear here", forceVisual: true);
                 break;
             case IdNotifyToast:
                 config.NotificationType = "windows_toast";
                 SaveConfig("Notifications: Windows Toast");
+                LinuxNotifications.ShowStatus(config, "System Toast Enabled",
+                    "Clip notifications will appear here");
                 break;
             case IdNotifyNone:
                 config.NotificationType = "none";
@@ -785,6 +791,12 @@ internal sealed class LinuxTrayIcon : IDisposable
             case IdNotifySound:
                 config.PlaySoundNotification = !config.PlaySoundNotification;
                 SaveConfig($"Play sound notification {(config.PlaySoundNotification ? "on" : "off")}");
+                if (config.PlaySoundNotification)
+                {
+                    // Let the user hear exactly what a saved clip will play, straight from the
+                    // toggle that turns it on.
+                    LinuxNotifications.PlayExportSaved(config.CustomSoundPath, Path.GetTempPath());
+                }
                 break;
             case IdQuota0: config.MaxClipsFolderSizeGB = 0; SaveConfig("Clips storage limit Unlimited"); break;
             case IdQuota10: config.MaxClipsFolderSizeGB = 10; SaveConfig("Clips storage limit 10 GB"); break;
@@ -878,9 +890,11 @@ internal sealed class LinuxTrayIcon : IDisposable
 
     private void CheckForUpdates()
     {
-        // Fire and forget: the check is a network call, and the tray must not stall on it. An
-        // available update is applied right away -- the tarball path swaps the binary and restarts
-        // this process, exactly what the Windows tray's Check for Updates does.
+        // Fire and forget: the check is a network call, and the tray must not stall on it. The
+        // result is ALWAYS announced with forceVisual: even a Sound Only user who explicitly asked
+        // for the check must see its outcome (overlay card, or the desktop toast as the fallback).
+        // An available update is applied right away -- the tarball path swaps the binary and
+        // restarts this process, exactly what the Windows tray's Check for Updates does.
         _ = Task.Run(async () =>
         {
             try
@@ -888,15 +902,15 @@ internal sealed class LinuxTrayIcon : IDisposable
                 var found = await UpdateService.CheckForUpdateAsync();
                 if (!found.Available)
                 {
-                    LinuxNotifications.ShowClipSaved(host.Config, "Clippy Update",
-                        $"{UpdateService.Version} is current; nothing to install.");
+                    LinuxNotifications.ShowStatus(host.Config, "Clippy Update",
+                        $"{UpdateService.Version} is current; nothing to install.", forceVisual: true);
                     return;
                 }
 
-                LinuxNotifications.ShowClipSaved(host.Config, "Clippy Update",
-                    $"{found.Tag} is available. Updating...");
+                LinuxNotifications.ShowStatus(host.Config, "Clippy Update",
+                    $"{found.Tag} is available. Updating...", forceVisual: true);
                 await UpdateService.ApplyUpdateAsync(found.DownloadUrl,
-                    (title, body) => LinuxNotifications.ShowClipSaved(host.Config, title, body));
+                    (title, body) => LinuxNotifications.ShowStatus(host.Config, title, body));
             }
             catch (Exception ex)
             {
