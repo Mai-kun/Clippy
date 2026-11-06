@@ -56,6 +56,19 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
     private volatile bool stopped;
     private int accessUnits;
 
+    // The arguments Start() was given, kept so the pipeline can rebuild itself after the child
+    // processes die on their own (suspend/resume, a PipeWire restart, a monitor mode change).
+    private int startFd;
+    private uint startNode;
+    private ClippyConfig startConfig = null!;
+    private string? startLogDirectory;
+    private RingBuffer startRing = null!;
+
+    // Consecutive self-restarts without a single frame in between: the backoff grows 2 s, 4 s,
+    // 8 s, 10 s, 10 s... A pipeline that dies the moment the machine wakes is retried politely,
+    // not hammered. Reset to zero the moment the new pipeline delivers a frame.
+    private int restartAttempts;
+
     public LinuxVideoPipeline(Stopwatch stopwatch) => this.stopwatch = stopwatch;
 
     /// <summary>
@@ -124,24 +137,43 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
     /// <returns>false when no pipeline could be started at all.</returns>
     public bool Start(int pipeWireFd, uint nodeId, int width, int height, ClippyConfig config, string? logDirectory, RingBuffer ring)
     {
+        startFd = pipeWireFd;
+        startNode = nodeId;
+        startConfig = config;
+        startLogDirectory = logDirectory;
+        startRing = ring;
         IsHevc = config.UseHevc;
         Width = width;
         Height = height;
+        Framerate = 60;
 
         // The inherited descriptor must not be closed on exec, or the gst child would inherit a
         // number pointing at nothing. Received without MSG_CMSG_CLOEXEC it is already clear; this
         // is the belt to that brace.
         ClearCloseOnExec(pipeWireFd);
 
+        return StartPipeline();
+    }
+
+    /// <summary>
+    /// Builds the two-path pipeline against the remembered start arguments. Runs on the caller
+    /// thread for the initial start and on the (ended) drain thread for every automatic restart,
+    /// which is why it must never touch the ring's construction state -- the ring is reused as-is.
+    /// </summary>
+    private bool StartPipeline()
+    {
+        var pipeWireFd = startFd;
+        var config = startConfig;
+
         // Path 1: single-process hardware encoding. A config that explicitly asks for a software
         // encoder ("libx...") skips straight to the ffmpeg fallback.
         var nvencElement = DesiredNvencElement(config);
         if (nvencElement is not null && GstHasElement(nvencElement))
         {
-            gst = StartGstEncoder(pipeWireFd, nodeId, nvencElement, config);
+            gst = StartGstEncoder(pipeWireFd, startNode, nvencElement, config);
             if (gst is not null)
             {
-                StartDrain(gst.StandardOutput.BaseStream, ring);
+                StartDrain(gst.StandardOutput.BaseStream, startRing);
                 // A pipeline that failed to negotiate (bad GPU state, rejected encoder) exits
                 // within a couple of seconds; a live one blocks on stdout. Same probe window the
                 // Windows StartWithFallback uses.
@@ -167,7 +199,7 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
         // Path 2: capture and encode in two processes, pixels through a FIFO.
         MakeVideoFifo();
         var fifo = fifoPath!;
-        gst = StartGstCapture(pipeWireFd, nodeId, fifo);
+        gst = StartGstCapture(pipeWireFd, startNode, fifo);
         if (gst is null || gst.HasExited)
         {
             Console.WriteLine("Video: gst-launch could not be started -- is gst-launch-1.0 installed?");
@@ -189,7 +221,7 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
         Console.WriteLine($"Video: capture {Width}x{Height} at {Framerate:F0} fps via pipewiresrc fd={pipeWireFd}.");
 
         var encoderName = DesiredFfmpegEncoder(config);
-        ffmpeg = StartFfmpeg(encoderName, config.VideoBitrateMbps, fifo, logDirectory);
+        ffmpeg = StartFfmpeg(encoderName, config.VideoBitrateMbps, fifo, startLogDirectory);
         if (ffmpeg is null)
             return false;
 
@@ -205,7 +237,7 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
                 Console.WriteLine($"Video: {failed} is not available on this machine (ffmpeg exited with " +
                     $"{ffmpeg.ExitCode}). Falling back to {encoderName}.");
                 ffmpeg.Dispose();
-                ffmpeg = StartFfmpeg(encoderName, config.VideoBitrateMbps, fifo, logDirectory);
+                ffmpeg = StartFfmpeg(encoderName, config.VideoBitrateMbps, fifo, startLogDirectory);
                 if (ffmpeg is null)
                     return false;
             }
@@ -213,7 +245,7 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
 
         Console.WriteLine($"Video: encoding {Width}x{Height} [{encoderName}] at {config.VideoBitrateMbps} Mbit/s, " +
             $"GOP 1 s, no B-frames, codec {(IsHevc ? "HEVC" : "H.264")}.");
-        StartDrain(ffmpeg.StandardOutput.BaseStream, ring);
+        StartDrain(ffmpeg.StandardOutput.BaseStream, startRing);
         return true;
     }
 
@@ -450,11 +482,14 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
             // therefore advances at least 1 ms past the previous one -- far below the pipe latency
             // the arrival time already carries, and enough to keep every PTS strictly increasing.
             double lastStamp = -1;
+            var endReason = "stdout closed";
             try
             {
-                int read;
+                var read = 0;
                 while (!stopped && (read = stdout.Read(buffer, 0, buffer.Length)) > 0)
                 {
+                    // Data flows again: whatever killed the previous pipeline, this one lives.
+                    Interlocked.Exchange(ref restartAttempts, 0);
                     var arrival = stopwatch.Elapsed.TotalSeconds;
                     parser.Append(buffer.AsSpan(0, read), arrival, (nal, length, isIdr, captureSeconds) =>
                     {
@@ -474,14 +509,86 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
                         Interlocked.Increment(ref accessUnits);
                     });
                 }
+                if (read == 0)
+                    endReason = "stdout reached EOF";
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException)
             {
+                endReason = $"{ex.GetType().Name}: {ex.Message}";
                 // ffmpeg closed stdout on shutdown; what was pushed stays in the ring.
             }
+
+            // An EOF we did NOT cause (stopped stays false during our own Dispose) means the
+            // children died underneath us -- suspend, a PipeWire restart, a mode change. Rebuild
+            // the pipeline instead of silently recording nothing while the tray still shows life.
+            if (!stopped)
+                HandlePipelineEnd(endReason);
         })
         { IsBackground = true, Name = "clippy-video-drain" };
         thread.Start();
+    }
+
+    /// <summary>
+    /// The pipeline ended on its own: wait out the backoff, kill whatever is left of the old
+    /// children, and rebuild. Runs on the ended drain thread, so Run() keeps going undisturbed;
+    /// repeated failures back off 2 s, 4 s, 8 s and then hold at 10 s until the machine (or
+    /// PipeWire) is really back.
+    /// </summary>
+    private void HandlePipelineEnd(string reason)
+    {
+        if (stopped)
+            return;
+
+        var attempt = Interlocked.Increment(ref restartAttempts);
+        var delayMs = Math.Min(10_000, 2000 << Math.Min(attempt - 1, 3));
+        Console.WriteLine($"Video: the capture pipeline closed on its own ({reason}); " +
+            $"restarting in {delayMs / 1000.0:F0} s (attempt {attempt}).");
+        Thread.Sleep(delayMs);
+        if (stopped)
+            return;
+
+        KillChildren();
+        if (StartPipeline())
+            Console.WriteLine("Video: the capture pipeline is back; the replay ring kept its history.");
+        else
+            Console.WriteLine("Video: the restart failed; the next drain end retries with a longer backoff.");
+    }
+
+    /// <summary>The child processes and the FIFO, without the stopped flag or the debug log -- shared by Dispose and the restart.</summary>
+    private void KillChildren()
+    {
+        try
+        {
+            // Closing ffmpeg's stdin makes it finalise and flush the elementary stream, exactly as
+            // the Windows encoder's teardown does. The gst side dies with the pipe.
+            if (ffmpeg is { HasExited: false } process)
+            {
+                try { process.StandardInput.Close(); } catch (Exception) { /* already gone */ }
+                if (!process.WaitForExit(3000))
+                    try { process.Kill(entireProcessTree: true); } catch (Exception) { /* already gone */ }
+            }
+            if (gst is { HasExited: false } g)
+            {
+                try
+                {
+                    g.Kill(entireProcessTree: true);
+                    g.WaitForExit(3000); // reap: a killed-but-unwaited child stays a zombie
+                }
+                catch (Exception) { /* already gone */ }
+            }
+        }
+        finally
+        {
+            ffmpeg?.Dispose();
+            gst?.Dispose();
+            ffmpeg = null;
+            gst = null;
+            if (fifoPath is not null)
+            {
+                try { File.Delete(fifoPath); } catch (Exception) { /* never created */ }
+                fifoPath = null;
+            }
+        }
     }
 
     /// <summary>
@@ -540,34 +647,11 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
         stopped = true;
         try
         {
-            // Closing ffmpeg's stdin makes it finalise and flush the elementary stream, exactly as
-            // the Windows encoder's teardown does. The gst side dies with the pipe.
-            if (ffmpeg is { HasExited: false } process)
-            {
-                try { process.StandardInput.Close(); } catch (Exception) { /* already gone */ }
-                if (!process.WaitForExit(3000))
-                    try { process.Kill(entireProcessTree: true); } catch (Exception) { /* already gone */ }
-            }
-            if (gst is { HasExited: false } g)
-            {
-                try
-                {
-                    g.Kill(entireProcessTree: true);
-                    g.WaitForExit(3000); // reap: a killed-but-unwaited child stays a zombie
-                }
-                catch (Exception) { /* already gone */ }
-            }
+            KillChildren();
         }
         finally
         {
-            ffmpeg?.Dispose();
-            gst?.Dispose();
             ffmpegDebugLog?.Dispose();
-            if (fifoPath is not null)
-            {
-                try { File.Delete(fifoPath); } catch (Exception) { /* never created */ }
-                fifoPath = null;
-            }
         }
     }
 }
