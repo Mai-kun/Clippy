@@ -16,6 +16,21 @@ var platformResult = platform.RunPlatformCommand(args, out var platformHandled);
 if (platformHandled)
     return platformResult;
 
+// One recorder at a time. The client flags above were answered by the RUNNING recorder and
+// already returned, so the only launches left here are recorder runs -- and a second one must
+// not kill the first one's IPC socket or wipe its disk spool below. The lock lives on Linux
+// (flock on /tmp/clippy-instance.lock); on Windows the single-instance story is the existing
+// shortcut/installer behaviour and stays as it is.
+#if LINUX
+if (!LinuxSingleInstance.TryAcquire())
+{
+    Console.WriteLine("Clippy is already running");
+    LinuxNotifications.ShowStatus(ClippyConfig.Load(), "Clippy",
+        "Clippy is already running in the system tray.", forceVisual: true);
+    return 0;
+}
+#endif
+
 // Installed before anything else can fail. In tray mode there is no console at all, so a crash
 // leaves the user with a vanished tray icon and no explanation on screen -- and no way to report
 // it. This writes the reason to a file next to the exe where it can actually be found, and puts
