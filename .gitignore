@@ -510,3 +510,6 @@ src/native/clippy_nvenc.dll
 src/native/clippy_nvenc.exp
 src/native/clippy_nvenc.lib
 tools/
+
+# The local Linux release output (dotnet publish lands here, see src/Clippy.csproj PublishDir)
+dist/

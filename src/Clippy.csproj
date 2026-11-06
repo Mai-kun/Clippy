@@ -28,6 +28,10 @@
     <!-- Reflection-based JSON and any other trimmed-away metadata should fail the build loudly in
          CI rather than throwing at runtime on a user's machine. -->
     <TrimMode>partial</TrimMode>
+    <!-- The Linux release lands in dist/ at the repository root: one known place for the built
+         binary, next to the install scripts that want it. The Windows CI keeps its default
+         publish/ staging, and the workflow's explicit -o paths override this anyway. -->
+    <PublishDir Condition="'$(IsWindowsTarget)' != 'true'">$(MSBuildThisFileDirectory)..\dist\</PublishDir>
     <DefineConstants Condition="'$(IsWindowsTarget)' == 'true'">$(DefineConstants);WINDOWS</DefineConstants>
     <DefineConstants Condition="'$(IsWindowsTarget)' != 'true'">$(DefineConstants);LINUX</DefineConstants>
   </PropertyGroup>
