@@ -326,6 +326,11 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             return;
         }
 
+        // The evdev cursor tracker starts once, alongside the overlay: on Wayland XQueryPointer
+        // goes stale over native Wayland surfaces, and the tracker is what keeps the card on the
+        // monitor the cursor is REALLY on. It stands down quietly when /dev/input is unreadable.
+        LinuxMouseTracker.Start();
+
         // Fonts and colours first: a card without text is worse than no card, so an Xft failure
         // here degrades the whole overlay and lets the caller fall back to the desktop toast.
         titleFont = XftFontOpenName(display, screen, $"Sans-{TitleFontPx}:bold");
@@ -755,15 +760,25 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     /// <summary>
     /// Where the card's top-right corner hangs: in the top-right of the monitor the CURSOR is
     /// currently on -- the screen the player is looking at -- not of the union root, which on a
-    /// dual-head setup would always pick the rightmost screen. No cursor answer falls back to the
-    /// first monitor.
+    /// dual-head setup would always pick the rightmost screen. The position comes from the evdev
+    /// tracker first (on Wayland XQueryPointer only updates over X11/XWayland windows and goes
+    /// stale over native Wayland surfaces); XQueryPointer is the fallback for a session where the
+    /// tracker could not start, and no answer at all falls back to the first monitor.
     /// </summary>
     private (int X, int Y) ComputeOrigin(int width)
     {
         var monitors = QueryMonitors();
         var chosen = monitors[0];
-        if (XQueryPointer(display, XDefaultRootWindow(display),
-                out _, out _, out var cursorX, out var cursorY, out _, out _, out _) != 0)
+        var cursorX = -1;
+        var cursorY = -1;
+        if (LinuxMouseTracker.TryGetCursor(out cursorX, out cursorY))
+        {
+            chosen = monitors.FirstOrDefault(m =>
+                cursorX >= m.X && cursorX < m.X + m.Width &&
+                cursorY >= m.Y && cursorY < m.Y + m.Height) ?? chosen;
+        }
+        else if (XQueryPointer(display, XDefaultRootWindow(display),
+                     out _, out _, out cursorX, out cursorY, out _, out _, out _) != 0)
         {
             chosen = monitors.FirstOrDefault(m =>
                 cursorX >= m.X && cursorX < m.X + m.Width &&
