@@ -200,13 +200,23 @@ jobs:
       # The Windows job does NOT create the GitHub Release. The release step lives in the separate
       # "release" job below, which needs both build jobs to succeed -- a half-shipped release that
       # appeared before the Linux build failed is exactly what this shape exists to prevent.
+      - name: Stage the release files
+        shell: pwsh
+        run: |
+          # upload-artifact roots the archive at the least common ancestor of the search paths, so
+          # uploading artifacts\Clippy-Setup.exe and Clippy-win-x64.zip as two paths would land in
+          # the download as artifacts\Clippy-Setup.exe and break the release job's flat layout.
+          # Copying both into one folder makes the upload a plain single-path case.
+          New-Item -ItemType Directory -Force -Path dist-win | Out-Null
+          Copy-Item artifacts/Clippy-Setup.exe dist-win/
+          Copy-Item Clippy-win-x64.zip dist-win/
+          Get-ChildItem dist-win
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: |
-            artifacts/Clippy-Setup.exe
-            Clippy-win-x64.zip
+          path: dist-win
           if-no-files-found: error
 
   build-linux:
