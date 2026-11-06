@@ -1063,29 +1063,65 @@ internal sealed class LinuxTrayIcon : IDisposable
         }
     }
 
+    /// <summary>
+    /// The tree as it was last broadcast, by id -- the diff base that turns a settings click into
+    /// a property-only update instead of a layout rebuild. The entries are immutable after
+    /// BuildMenu returns, so keeping the references is safe.
+    /// </summary>
+    private Dictionary<int, MenuEntry> broadcastSnapshot = new();
+
+    /// <summary>
+    /// Pushes a settings change to a menu that may be open RIGHT NOW, without closing it.
+    ///
+    /// The old way -- LayoutUpdated(revision, 0) on the root after every click -- made the tray
+    /// host throw its cached tree away and close the menu: on Plasma every radio click slammed
+    /// the menu shut (live-tested). So toggles and labels go out as ItemsPropertiesUpdated with
+    /// ONLY the entries whose label or toggle state changed, and LayoutUpdated is reserved for
+    /// real structure changes (an audio device hotplug adding a row), which are rare. The
+    /// menuRevision still moves, so a client comparing revisions sees the newest state.
+    /// </summary>
     private void BumpMenu()
     {
         if (!registered || bus is null)
             return;
         menuRevision++;
 
-        bus.SendSignal(MenuPath, MenuInterface, "LayoutUpdated", "ui", w =>
+        var propertyUpdates = new List<MenuEntry>();
+        var structureChanged = false;
+        var snapshot = new Dictionary<int, MenuEntry>();
+        foreach (var entry in FlattenMenu(BuildMenu()))
         {
-            w.UInt32(menuRevision);
-            w.Int32(0);
-        });
+            snapshot[entry.Id] = entry;
+            if (!broadcastSnapshot.TryGetValue(entry.Id, out var previous))
+            {
+                propertyUpdates.Add(entry); // never broadcast: send the full properties once
+                continue;
+            }
+            if (previous.Label != entry.Label || previous.ToggleType != entry.ToggleType ||
+                previous.ToggleState != entry.ToggleState)
+                propertyUpdates.Add(entry);
+            if (!previous.Children.Select(c => c.Id).SequenceEqual(entry.Children.Select(c => c.Id)))
+                structureChanged = true;
+        }
+        broadcastSnapshot = snapshot;
 
-        // LayoutUpdated alone is not enough for the radio marks: Plasma keeps rendering the
-        // toggle-state it cached at the first fetch. ItemsPropertiesUpdated carries the fresh
-        // properties to a menu that is open RIGHT NOW (e.g. the Notifications submenu right
-        // after a click); the refetch that AboutToShow=true triggers covers the next open.
+        if (structureChanged)
+        {
+            bus.SendSignal(MenuPath, MenuInterface, "LayoutUpdated", "ui", w =>
+            {
+                w.UInt32(menuRevision);
+                w.Int32(0);
+            });
+        }
+
+        if (propertyUpdates.Count == 0)
+            return;
+
         bus.SendSignal(MenuPath, MenuInterface, "ItemsPropertiesUpdated", "a(ia{sv})a(ias)", w =>
         {
             var (updatedLength, updatedStart) = w.BeginArray(8);
-            foreach (var entry in FlattenMenu(BuildMenu()))
+            foreach (var entry in propertyUpdates)
             {
-                if (entry.Separator)
-                    continue;
                 w.Align(8);
                 w.Int32(entry.Id);
                 var (propsLength, propsStart) = w.BeginArray(8);
