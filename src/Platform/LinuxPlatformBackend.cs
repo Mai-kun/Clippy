@@ -553,7 +553,10 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         if (config.PlaySoundNotification)
             LinuxNotifications.PlayExportSaved(config.CustomSoundPath, Path.GetTempPath());
 
-        var totalSeconds = (int)Math.Round(clipSeconds, MidpointRounding.AwayFromZero);
+        // The keyframe snap trims the head (up to one GOP, ~1 s), so the real clip always lands
+        // just UNDER the requested length -- 29.4 s for a 30 s F8. Ceiling reports the duration
+        // that was asked for; rounding would advertise the trimming as a shorter clip.
+        var totalSeconds = (int)Math.Ceiling(clipSeconds);
         try
         {
             LinuxNotifications.ShowClipSaved(config, "Clip Saved",
