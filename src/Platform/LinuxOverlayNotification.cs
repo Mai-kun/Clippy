@@ -265,9 +265,9 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             return;
 
         var height = Scaled(BaseHeight);
-        var x = XDisplayWidth(display, screen) - width - Scaled(BaseMargin);
+        var (x, y) = ComputeOrigin(width);
         XResizeWindow(display, window, (uint)width, (uint)height);
-        XMoveWindow(display, window, x, Scaled(BaseMargin));
+        XMoveWindow(display, window, x, y);
 
         if (image != 0) { XDestroyImage(image); image = 0; frameBuffer = 0; }
         frameBuffer = Marshal.AllocHGlobal(width * height * 4);
@@ -284,6 +284,20 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
         cardWidth = width;
         XFlush(display);
+    }
+
+    /// <summary>
+    /// Per-show reposition: the cursor may have moved to the other monitor since the last card,
+    /// and a same-width card would otherwise stay on the old screen. Cheap (one pointer query),
+    /// so it rides along every show.
+    /// </summary>
+    private void MoveToActiveMonitor()
+    {
+        if (window == 0)
+            return;
+        var (x, y) = ComputeOrigin(cardWidth);
+        XMoveWindow(display, window, x, y);
+        XRaiseWindow(display, window);
     }
 
     // --- X11 setup / teardown ---
@@ -336,8 +350,10 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         };
         const nuint valueMask = CWBackPixel | CWBorderPixel | CWColormap | CWOverrideRedirect;
 
-        var x = Scaled(BaseMargin) + Scaled(BaseWidth);
-        window = XCreateWindow(display, root, XDisplayWidth(display, screen) - x, Scaled(BaseMargin),
+        // Top-right of the monitor the cursor is on -- not of the union root, which on a
+        // dual-head setup is always the rightmost screen.
+        var (originX, originY) = ComputeOrigin(Scaled(BaseWidth));
+        window = XCreateWindow(display, root, originX, originY,
             Scaled(BaseWidth), Scaled(BaseHeight), 0, 32, InputOutputClass, visual,
             valueMask, ref attributes);
         if (window == 0)
@@ -401,6 +417,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         messageColor = AllocColor(messageColorRef());
 
         XMapWindow(display, window);
+        XRaiseWindow(display, window);
         XFlush(display);
 
         IsReady = true;
@@ -452,6 +469,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         // Layout first: it measures the lines and grows the card when a status message is wider
         // than the 240 px design width -- every width below then reads the new cardWidth.
         textLayout = ComputeTextLayout(title, message);
+        MoveToActiveMonitor();
         var width = cardWidth;
         var height = Scaled(BaseHeight);
         var tailRadius = Scaled(BaseCornerRadius);
@@ -668,6 +686,9 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         // reach the compositor, which is what made the card flicker.
         XPutImage(display, window, graphicsContext, image, 0, 0, 0, 0,
             (uint)cardWidth, (uint)Scaled(BaseHeight));
+        // Re-assert the stacking on every frame: a game or an IDE raising itself mid-fade must
+        // never bury the card -- XRaiseWindow is fire-and-forget on the X stream, no round trip.
+        XRaiseWindow(display, window);
         XFlush(display);
     }
 
@@ -693,6 +714,63 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         // not worth the fragility, so this logs the event's arrival only.
         Console.WriteLine("Overlay: an X11 protocol error was ignored.");
         return 0;
+    }
+
+    // --- Multi-monitor: where the card goes when more than one screen is connected ---
+
+    private sealed record MonitorRect(int X, int Y, int Width, int Height);
+
+    /// <summary>
+    /// The connected monitors, via Xinerama (libXinerama ships with every X11 stack, XWayland
+    /// included). Re-queried per show, so a hotplugged monitor is picked up without a restart;
+    /// a missing libXinerama degrades to "the whole root is one screen".
+    /// </summary>
+    private List<MonitorRect> QueryMonitors()
+    {
+        var list = new List<MonitorRect>();
+        try
+        {
+            var infos = XineramaQueryScreens(display, out var count);
+            if (infos != 0 && count > 0)
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    var monitor = Marshal.PtrToStructure<XineramaScreenInfo>(infos + i * Marshal.SizeOf<XineramaScreenInfo>());
+                    if (monitor.width > 0 && monitor.height > 0)
+                        list.Add(new MonitorRect(monitor.x_org, monitor.y_org, monitor.width, monitor.height));
+                }
+                XFree(infos);
+            }
+        }
+        catch (DllNotFoundException)
+        {
+            Console.WriteLine("Overlay: libXinerama unavailable; the whole desktop counts as one monitor.");
+        }
+
+        if (list.Count == 0)
+            list.Add(new MonitorRect(0, 0, XDisplayWidth(display, screen), XDisplayHeight(display, screen)));
+        return list;
+    }
+
+    /// <summary>
+    /// Where the card's top-right corner hangs: in the top-right of the monitor the CURSOR is
+    /// currently on -- the screen the player is looking at -- not of the union root, which on a
+    /// dual-head setup would always pick the rightmost screen. No cursor answer falls back to the
+    /// first monitor.
+    /// </summary>
+    private (int X, int Y) ComputeOrigin(int width)
+    {
+        var monitors = QueryMonitors();
+        var chosen = monitors[0];
+        if (XQueryPointer(display, XDefaultRootWindow(display),
+                out _, out _, out var cursorX, out var cursorY, out _, out _, out _) != 0)
+        {
+            chosen = monitors.FirstOrDefault(m =>
+                cursorX >= m.X && cursorX < m.X + m.Width &&
+                cursorY >= m.Y && cursorY < m.Y + m.Height) ?? chosen;
+        }
+
+        return (chosen.X + chosen.Width - width - Scaled(BaseMargin), chosen.Y + Scaled(BaseMargin));
     }
 
     // Kept in a field: the GC must never collect the delegate while Xlib holds its pointer.
@@ -888,6 +966,31 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     [LibraryImport("libX11.so.6")]
     private static partial int XFlush(nint display);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial int XRaiseWindow(nint display, nint window);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial int XQueryPointer(nint display, nint window,
+        out nint rootReturn, out nint childReturn,
+        out int rootX, out int rootY, out int winX, out int winY, out uint mask);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial int XFree(nint data);
+
+    // Xinerama: the monitor geometry, per screen, in root coordinates.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XineramaScreenInfo
+    {
+        public int screen_number;
+        public short x_org;
+        public short y_org;
+        public short width;
+        public short height;
+    }
+
+    [LibraryImport("libXinerama.so.1")]
+    private static partial nint XineramaQueryScreens(nint display, out int number);
 
     [LibraryImport("libXext.so.6")]
     private static partial int XShapeCombineRectangles(nint display, nint window, int kind,
