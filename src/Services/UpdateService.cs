@@ -174,31 +174,29 @@ internal static class UpdateService
     }
 
     /// <summary>
-    /// Downloads the release, unpacks it, and hands the replacement to a detached script.
+    /// Downloads the release, unpacks it, and installs it in place -- via the setup installer, a
+    /// detached copy script, or (on Linux) a binary swap plus restart.
     ///
-    /// A running Windows image cannot overwrite its own exe. The copy therefore has to happen from a
-    /// process that outlives this one, which is what apply_update.cmd is for.
+    /// On Windows a running image cannot overwrite its own exe, so the copy happens from a process
+    /// that outlives this one: apply_update.cmd for the portable shape, the silent Inno Setup run
+    /// for the installed one. Linux allows swapping a running binary (rename the old file away --
+    /// the running process keeps its inode -- and move the new one in), so the tarball path does
+    /// the whole job itself and restarts.
     ///
-    /// ONLY Clippy.exe is copied. config.json holds the user's hotkeys, encoder and bitrate, and
-    /// ffmpeg.exe is 217 MB that has not changed; a blanket folder copy would silently reset both.
+    /// Only Clippy.exe / Clippy is copied. config.json holds the user's hotkeys, encoder and
+    /// bitrate, and ffmpeg is 217 MB that has not changed; a blanket folder copy would silently
+    /// reset both.
     /// </summary>
     public static async Task ApplyUpdateAsync(string downloadUrl, Action<string, string>? notify)
     {
         try
         {
-            // Both apply paths below are Windows machinery: an Inno Setup exe or a zip copied over
-            // with apply_update.cmd. Reaching here on Linux means a tarball URL, and unpacking it
-            // over the running binary is install.sh's job, not ours -- so the update stops short of
-            // launching anything and points at the manual step instead.
+            Log($"Starting update installation from: {downloadUrl}");
             if (!OperatingSystem.IsWindows())
             {
-                Log($"Auto-update is Windows-only; download {downloadUrl} and run install.sh from the archive.");
-                notify?.Invoke("Clippy Update", "Download the release and run install.sh from the archive.");
-                return;
+                await ApplyViaTarballAsync(downloadUrl, notify).ConfigureAwait(false);
             }
-
-            Log($"Starting update installation from: {downloadUrl}");
-            if (IsInstalled)
+            else if (IsInstalled)
             {
                 await ApplyViaSetupAsync(downloadUrl, notify).ConfigureAwait(false);
             }
@@ -213,6 +211,101 @@ internal static class UpdateService
         {
             Log($"Update installation failed ({ex.GetType().Name}: {ex.Message}):{Environment.NewLine}{ex}");
             notify?.Invoke("Clippy Update", "Update failed. The current version still works.");
+        }
+    }
+
+    /// <summary>
+    /// The Linux apply path: download the tarball, unpack it into a temp directory, and replace
+    /// ONLY the Clippy binary in place -- config.json and the user's sounds belong to the user,
+    /// exactly the rule the Windows zip path follows. The running image is renamed to .old (the
+    /// process keeps executing its inode), the new binary moves in, and this process restarts into
+    /// it with the same arguments before exiting. A failed copy is rolled back to the backup
+    /// rather than left as a half-replaced install.
+    /// </summary>
+    private static async Task ApplyViaTarballAsync(string downloadUrl, Action<string, string>? notify)
+    {
+        var temp = Path.GetTempPath();
+        var tarPath = Path.Combine(temp, $"clippy_update_{Guid.NewGuid():N}.tar.gz");
+        var extractDir = Path.Combine(temp, "clippy_extracted_linux");
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("Clippy-App");
+            notify?.Invoke("Clippy Update", "Downloading...");
+            Log($"Downloading tarball update to: {tarPath}");
+
+            using var response = await client
+                .GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead)
+                .ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            await using (var target = File.Create(tarPath))
+            {
+                await response.Content.CopyToAsync(target).ConfigureAwait(false);
+            }
+            Log($"Downloaded tarball successfully ({new FileInfo(tarPath).Length} bytes).");
+            notify?.Invoke("Clippy Update", "Installing...");
+
+            if (Directory.Exists(extractDir))
+                Directory.Delete(extractDir, true);
+            Directory.CreateDirectory(extractDir);
+            // System.Formats.Tar's strict parser chokes on the GNU-flavoured headers the release
+            // CI writes ("Unable to parse number"), so extraction goes through the same tar binary
+            // that produced the archive -- and that install.sh requires anyway.
+            var tarStart = new ProcessStartInfo("tar") { RedirectStandardError = true };
+            foreach (var argument in new[] { "-xzf", tarPath, "-C", extractDir })
+                tarStart.ArgumentList.Add(argument);
+            using var tar = Process.Start(tarStart);
+            if (tar is null)
+                throw new InvalidOperationException("tar could not be started; the archive cannot be unpacked");
+            var tarErrors = tar.StandardError.ReadToEndAsync();
+            if (!tar.WaitForExit(120_000) || tar.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"tar extraction failed (exit {tar.ExitCode}): {tarErrors.Result.Trim()}");
+
+            var newBinary = Directory
+                .EnumerateFiles(extractDir, "Clippy", SearchOption.AllDirectories)
+                .FirstOrDefault();
+            if (newBinary is null)
+                throw new InvalidOperationException("no Clippy binary inside the downloaded archive");
+
+            var currentBinary = Environment.ProcessPath;
+            if (string.IsNullOrEmpty(currentBinary) || !File.Exists(currentBinary))
+                throw new InvalidOperationException("the running binary's path is unknown; it cannot be replaced");
+
+            var backup = currentBinary + ".old";
+            File.Move(currentBinary, backup, overwrite: true);
+            try
+            {
+                File.Copy(newBinary, currentBinary, overwrite: true);
+                // The tar extraction preserves the exec bit, but File.Copy's mode handling is not
+                // part of any contract: pin the binary to 755 explicitly.
+                if (OperatingSystem.IsLinux())
+                    File.SetUnixFileMode(currentBinary,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                        UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                        UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            }
+            catch (Exception)
+            {
+                // Restore the old image: a failed update must not leave a broken install.
+                File.Move(backup, currentBinary, overwrite: true);
+                throw;
+            }
+            File.Delete(backup);
+
+            notify?.Invoke("Clippy Update", "Restarting...");
+            Log($"Update installed; restarting into {currentBinary}.");
+            var startInfo = new ProcessStartInfo(currentBinary) { UseShellExecute = false };
+            foreach (var argument in Environment.GetCommandLineArgs().Skip(1))
+                startInfo.ArgumentList.Add(argument);
+            Process.Start(startInfo);
+        }
+        catch (Exception)
+        {
+            RemoveIfPresent(tarPath);
+            throw;
         }
     }
 

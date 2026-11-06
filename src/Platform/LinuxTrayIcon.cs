@@ -878,18 +878,25 @@ internal sealed class LinuxTrayIcon : IDisposable
 
     private void CheckForUpdates()
     {
-        // Fire and forget: the check is a network call, and the tray must not stall on it.
+        // Fire and forget: the check is a network call, and the tray must not stall on it. An
+        // available update is applied right away -- the tarball path swaps the binary and restarts
+        // this process, exactly what the Windows tray's Check for Updates does.
         _ = Task.Run(async () =>
         {
             try
             {
                 var found = await UpdateService.CheckForUpdateAsync();
-                if (found.Available)
-                    LinuxNotifications.ShowClipSaved(host.Config, "Clippy Update",
-                        $"{found.Tag} is available. Restart installs it.");
-                else
+                if (!found.Available)
+                {
                     LinuxNotifications.ShowClipSaved(host.Config, "Clippy Update",
                         $"{UpdateService.Version} is current; nothing to install.");
+                    return;
+                }
+
+                LinuxNotifications.ShowClipSaved(host.Config, "Clippy Update",
+                    $"{found.Tag} is available. Updating...");
+                await UpdateService.ApplyUpdateAsync(found.DownloadUrl,
+                    (title, body) => LinuxNotifications.ShowClipSaved(host.Config, title, body));
             }
             catch (Exception ex)
             {
