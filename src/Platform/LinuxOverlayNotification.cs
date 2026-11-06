@@ -12,7 +12,9 @@ namespace Clippy;
 /// It is a raw X11 window for the same reason the Windows card is raw Win32
 /// (UI/OverlayNotification.cs, the design reference): dragging a UI toolkit into a NativeAOT
 /// recorder is not an option, and a 240x58 ARGB window is a few dozen lines of interop. The card
-/// shape -- rounded rectangle, hairline border, green check circle -- is rendered in software into
+/// shape -- a semicircular left cap fully filled by the green check badge (the card's contour
+/// follows the badge exactly), a rectangular body with a hairline border and 12 px rounded right
+/// corners -- is rendered in software into
 /// a premultiplied BGRA buffer; the text is drawn on top through Xft (the same library Plasma
 /// itself links), which gives anti-aliased text over the ARGB window for free. The fade is the
 /// Windows trick transplanted: every pixel of the buffer is scaled by the current alpha each
@@ -30,19 +32,19 @@ namespace Clippy;
 internal sealed partial class LinuxOverlayNotification : IDisposable
 {
     // Design units, mirroring the user-facing spec of the Windows card: 240x58, 20 px from the
-    // top-right corner, 12 px corner radius, a 1 px #3D3D3D hairline around a #1E1E1E card, the
-    // green check circle on the left and two text lines on the right. Every use goes through
-    // Scaled, so a per-display scale factor is a one-field change.
+    // top-right corner, 12 px corner radius on the right, a 1 px #3D3D3D hairline around a
+    // #1E1E1E card, and two text lines on the right of the accent badge. The LEFT end is a full
+    // semicircular cap (radius = half the height) and the green check circle fills it exactly,
+    // so the card's contour follows the badge with no dark corners poking out around it. Every
+    // use goes through Scaled, so a per-display scale factor is a one-field change.
     private const int BaseWidth = 240;
     private const int BaseHeight = 58;
     private const int BaseCornerRadius = 12;
     private const int BaseBorder = 1;
     private const int BaseMargin = 20;
 
-    // The accent circle, centred in the card's left band; the text starts after it.
-    private const int BaseIconCenterX = 28;
-    private const int BaseIconRadius = 13;
-    private const int BaseTextX = 52;
+    // The text starts after the cap (its right edge sits at half the height) plus a small gap.
+    private const int BaseTextX = 66;
     private const int BaseTextRightInset = 12;
     private const int BaseLineGap = 3;
 
@@ -398,31 +400,48 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     // --- Rendering: the card shape in software, the text through Xft ---
 
     /// <summary>
-    /// Renders the card at full opacity into <see cref="cardBase"/>: premultiplied BGRA, rounded
-    /// rectangle with the hairline border and the green check circle (anti-aliased by signed
-    /// distance coverage) with the two text lines baked in through Xft. The text is composited on
-    /// the scratch pixmap -- XPutImage of the shape, XRender of the text, XGetImage of the result
-    /// -- so the animation frames afterwards are a single atomic XPutImage each and the card can
-    /// never appear on screen without its text.
+    /// Renders the card at full opacity into <see cref="cardBase"/>: premultiplied BGRA, the
+    /// stadium-left shape (semicircular cap = the green badge, rectangular body, 12 px rounded
+    /// right corners) with the hairline border, all anti-aliased by signed distance coverage, and
+    /// the two text lines baked in through Xft. The text is composited on the scratch pixmap --
+    /// XPutImage of the shape, XRender of the text, XGetImage of the result -- so the animation
+    /// frames afterwards are a single atomic XPutImage each and the card can never appear on
+    /// screen without its text.
     /// </summary>
     private void RenderCardBase(string title, string message)
     {
         var width = Scaled(BaseWidth);
         var height = Scaled(BaseHeight);
-        var radius = Scaled(BaseCornerRadius);
+        var tailRadius = Scaled(BaseCornerRadius);
         var border = Scaled(BaseBorder);
+        // The left cap: a semicircle on the card's vertical midline, and the badge inside it.
+        var capRadius = height / 2f;
+        var capCenterX = capRadius;
+        var capCenterY = height / 2f;
         var buffer = new byte[width * height * 4];
 
         for (var y = 0; y < height; y++)
         {
             for (var x = 0; x < width; x++)
             {
-                var outside = SdRoundedRect(x + 0.5f, y + 0.5f, width, height, radius);
-                var inside = SdRoundedRect(x + 0.5f, y + 0.5f, width - 2 * border, height - 2 * border,
-                    Math.Max(1, radius - border));
-                // Coverage of the whole card and of its interior; the ring between them is the border.
-                var coverage = Math.Clamp(0.5f - outside, 0, 1);
-                var interior = Math.Clamp(0.5f - inside, 0, 1);
+                var px = x + 0.5f;
+                var py = y + 0.5f;
+
+                // The card is the union of three primitives: the left cap, the straight body,
+                // and the rounded right tail. Union = the nearest boundary = min of the SDFs.
+                var body = SdBox(px, py, capRadius, 0, width - tailRadius, height);
+                var cap = SdCircle(px, py, capCenterX, capCenterY, capRadius);
+                var tail = SdCircle(px, py, width - tailRadius, capCenterY, tailRadius);
+                var coverage = Math.Clamp(0.5f - MathF.Min(body, MathF.Min(cap, tail)), 0, 1);
+
+                // The interior is the same union eroded by the border; the cap/body junction is
+                // tangent-smooth, so union-of-erosions is exact there and the 1 px hairline keeps
+                // its thickness all the way around.
+                var bodyIn = SdBox(px, py, capRadius, border, width - tailRadius, height - border);
+                var capIn = SdCircle(px, py, capCenterX, capCenterY, capRadius - border);
+                var tailIn = SdCircle(px, py, width - tailRadius, capCenterY, tailRadius - border);
+                var interior = Math.Clamp(0.5f - MathF.Min(bodyIn, MathF.Min(capIn, tailIn)), 0, 1);
+
                 var ring = coverage - interior;
                 if (coverage <= 0)
                     continue;
@@ -431,20 +450,20 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
                 var g = BorderG * ring + BgG * interior;
                 var b = BorderB * ring + BgB * interior;
 
-                // The accent circle with the check, blended over the card in straight colour;
-                // everything is premultiplied once at the end.
-                var iconCenterX = Scaled(BaseIconCenterX);
-                var iconCenterY = height / 2f;
-                var iconRadius = Scaled(BaseIconRadius);
-                var circleCov = Math.Clamp(iconRadius + 0.5f - SdCircle(x + 0.5f, y + 0.5f, iconCenterX, iconCenterY, iconRadius), 0, 1);
-                if (circleCov > 0)
+                // The accent badge fills the cap exactly -- its contour IS the card's contour on
+                // the left -- and carries the check, blended over the card in straight colour;
+                // everything is premultiplied once at the end. The coverage is the usual
+                // half-pixel form: 0.5 - (distance - radius); an extra radius term here would
+                // double the badge and spill green into the card body.
+                var badgeCov = Math.Clamp(0.5f - SdCircle(px, py, capCenterX, capCenterY, capRadius), 0, 1);
+                if (badgeCov > 0)
                 {
-                    r = r * (1 - circleCov) + AccentR * circleCov;
-                    g = g * (1 - circleCov) + AccentG * circleCov;
-                    b = b * (1 - circleCov) + AccentB * circleCov;
+                    r = r * (1 - badgeCov) + AccentR * badgeCov;
+                    g = g * (1 - badgeCov) + AccentG * badgeCov;
+                    b = b * (1 - badgeCov) + AccentB * badgeCov;
                 }
 
-                var checkCov = CheckCoverage(x + 0.5f, y + 0.5f, iconCenterX, iconCenterY, iconRadius);
+                var checkCov = CheckCoverage(px, py, capCenterX, capCenterY, capRadius);
                 if (checkCov > 0)
                 {
                     r = r * (1 - checkCov) + 255 * checkCov;
@@ -493,16 +512,14 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         }
     }
 
-    /// <summary>Signed distance to the rounded rectangle's boundary; negative inside.</summary>
-    private static float SdRoundedRect(float px, float py, float width, float height, float radius)
+    /// <summary>Signed distance to an axis-aligned box's boundary; negative inside.</summary>
+    private static float SdBox(float px, float py, float x0, float y0, float x1, float y1)
     {
-        var halfW = width / 2;
-        var halfH = height / 2;
-        var qx = MathF.Abs(px - halfW) - (halfW - radius);
-        var qy = MathF.Abs(py - halfH) - (halfH - radius);
+        var qx = MathF.Abs(px - (x0 + x1) / 2) - (x1 - x0) / 2;
+        var qy = MathF.Abs(py - (y0 + y1) / 2) - (y1 - y0) / 2;
         var ax = MathF.Max(qx, 0);
         var ay = MathF.Max(qy, 0);
-        return MathF.Sqrt(ax * ax + ay * ay) + MathF.Min(MathF.Max(qx, qy), 0) - radius;
+        return MathF.Sqrt(ax * ax + ay * ay) + MathF.Min(MathF.Max(qx, qy), 0);
     }
 
     private static float SdCircle(float px, float py, float cx, float cy, float radius) =>
@@ -514,7 +531,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     /// </summary>
     private float CheckCoverage(float px, float py, float cx, float cy, float radius)
     {
-        var half = Scaled(BaseIconRadius) * 0.32f; // stroke half-width
+        var half = radius * 0.32f; // stroke half-width, proportional to the badge
         var a = (cx - radius * 0.42f, cy + radius * 0.05f);
         var b = (cx - radius * 0.10f, cy + radius * 0.38f);
         var c = (cx + radius * 0.48f, cy - radius * 0.34f);
