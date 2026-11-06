@@ -303,7 +303,14 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     {
         audio = new LinuxAudioPipeline(stopwatch);
         var monitor = LinuxAudioPipeline.ResolveMonitorSource(config.AudioDevice);
-        if (!audio.Start(monitor, logsDirectory, options.AudioCaptureOnly ? new RingBuffer(1, isVideo: false) : audioRing!))
+        // The microphone rides on the same track only when the config asks for it, and the
+        // pipeline itself rolls back to system-sound-only when the mic will not open.
+        var mic = config.RecordMicrophone
+            ? LinuxAudioPipeline.ResolveMicSource(config.MicrophoneDevice)
+            : null;
+        if (config.RecordMicrophone && mic is null)
+            Console.WriteLine("Audio: RecordMicrophone is on, but no usable microphone was found; recording the system sound only.");
+        if (!audio.Start(monitor, mic, logsDirectory, options.AudioCaptureOnly ? new RingBuffer(1, isVideo: false) : audioRing!))
         {
             audio.Dispose();
             audio = null;
@@ -688,6 +695,7 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         }
     }
 
+    /// <summary>The audio restart gate, shared by the device switch and the microphone toggle.</summary>
     private readonly object audioRestartGate = new();
 
     /// <summary>
@@ -768,6 +776,73 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     }
 
     void LinuxTrayIcon.IHost.RequestExit() => Stop("the tray asked for it");
+
+    /// <summary>
+    /// The tray's "Select Screen / Monitor...": drop the saved portal restore token and rebuild
+    /// the video pipeline, so the portal's monitor picker appears again and the new choice is
+    /// remembered. Runs on its own thread -- the Start handshake can sit on the picker for up to
+    /// a minute, and the tray's dispatch thread must keep serving the menu meanwhile.
+    /// </summary>
+    void LinuxTrayIcon.IHost.SelectScreen()
+    {
+        var tokenPath = System.IO.Path.Combine(AppContext.BaseDirectory, "portal_token.txt");
+        try
+        {
+            if (File.Exists(tokenPath))
+                File.Delete(tokenPath);
+            Console.WriteLine("Video: the saved monitor selection was cleared; the portal will ask again.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine($"Video: could not clear the portal token ({ex.Message}); the picker may not appear.");
+        }
+
+        lock (videoRestartGate)
+        {
+            video?.Dispose();
+            video = null;
+            portal?.Dispose();
+            portal = null;
+            sessionFd = null;
+            StartVideo();
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds the audio pipeline in place against the CURRENT config (RecordMicrophone,
+    /// MicrophoneDevice, AudioDevice): the ring and the shared clock survive the swap, so a clip
+    /// cut across the switch stays in sync -- the same hot-swap the audio device menu uses.
+    /// </summary>
+    void LinuxTrayIcon.IHost.RestartAudio()
+    {
+        lock (audioRestartGate)
+        {
+            audio?.Dispose();
+            audio = null;
+            StartAudio();
+        }
+    }
+
+    // The microphone list feeds every menu rebuild next to the sink cache: same 15 s TTL, so
+    // Plasma's menu polling does not spawn a pactl per poll.
+    private List<(string Name, string Description)>? micCache;
+    private DateTime micCacheTime = DateTime.MinValue;
+
+    IReadOnlyList<(string Name, string Description)> LinuxTrayIcon.IHost.ListMicrophones() =>
+        ListMicrophonesCached();
+
+    private IReadOnlyList<(string Name, string Description)> ListMicrophonesCached()
+    {
+        if (micCache is not null && DateTime.UtcNow - micCacheTime < SinkCacheTtl)
+            return micCache;
+
+        var mics = LinuxAudioPipeline.ListSources();
+        if (mics.Count == 0)
+            return mics; // a failed probe is not cached: the next menu open retries
+        micCache = mics;
+        micCacheTime = DateTime.UtcNow;
+        return mics;
+    }
 
     /// <summary>
     /// Points the recorder at the folder the user just picked. Exports write to it from the next

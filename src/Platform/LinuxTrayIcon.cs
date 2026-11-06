@@ -38,6 +38,15 @@ internal sealed class LinuxTrayIcon : IDisposable
 
         /// <summary>Points the recorder at a new clips folder (the config is saved by the tray).</summary>
         void SetClipsFolder(string folder);
+        /// <summary>
+        /// Clears the saved portal monitor choice and restarts the video pipeline, so the
+        /// portal's screen picker appears again. Can block for up to a minute on the picker.
+        /// </summary>
+        void SelectScreen();
+        /// <summary>Rebuilds the audio pipeline against the current config (microphone settings).</summary>
+        void RestartAudio();
+        /// <summary>The real input devices for the Microphone menu: no *.monitor loopbacks.</summary>
+        IReadOnlyList<(string Name, string Description)> ListMicrophones();
         /// <summary>Rebinds both clip hotkeys live, without a restart.</summary>
         void RebindHotkeys(string shortKey, string longKey);
         /// <summary>Starts a fresh copy of this executable with the same arguments, then stops this one.</summary>
@@ -65,6 +74,7 @@ internal sealed class LinuxTrayIcon : IDisposable
     private const uint IdCheckUpdates = 1005;       // Check for Updates
     private const uint IdRestart = 1006;            // Restart
     private const uint IdOpenLastClip = 1007;       // Open Last Clip
+    private const uint IdSelectScreen = 1008;       // Select Screen / Monitor...
 
     private const uint IdShort15 = 1101;
     private const uint IdShort30 = 1102;
@@ -98,12 +108,16 @@ internal sealed class LinuxTrayIcon : IDisposable
     private const uint IdQuota20 = 1612;
     private const uint IdQuota30 = 1613;
     private const uint IdQuota50 = 1614;
+    private const uint IdMicEnabled = 1701;         // "Record Microphone" checkmark (Linux-only)
+    private const uint IdMicDefault = 1702;         // Microphone -> Default (System)
 
     private const uint IdHotkeyShortBase = 3000;    // + index into HotkeyChoices
     private const uint IdHotkeyLongBase = 4000;
     private const uint IdAudioDefault = 5000;
     private const uint AudioDeviceIdBase = 5001;
     private const int MaxAudioDevices = 99;
+    private const uint MicDeviceIdBase = 5101;      // + index into the microphone list
+    private const int MaxMicDevices = 99;
 
     // Submenu parents and Linux-only entries: ranges the Windows menu never uses.
     private const uint IdStartWithSystem = 1600;
@@ -117,6 +131,7 @@ internal sealed class LinuxTrayIcon : IDisposable
     private const uint IdSubLongHotkey = 6008;
     private const uint IdSubQuota = 6009;
     private const uint IdSubAudio = 6010;
+    private const uint IdSubMic = 6011;             // Microphone submenu (Linux-only)
     private const uint IdSepBase = 7000;            // separators take sequential ids from here
 
     /// <summary>The keys both hotkey menus offer, in menu order: F1-F12, then the numeric keypad.</summary>
@@ -419,6 +434,7 @@ internal sealed class LinuxTrayIcon : IDisposable
         root.Children.Add(new MenuEntry { Id = (int)IdOpenFolder, Label = "Open Clips Folder" });
         root.Children.Add(new MenuEntry { Id = (int)IdOpenLastClip, Label = "Open Last Clip" });
         root.Children.Add(new MenuEntry { Id = (int)IdPickFolder, Label = "Select Clips Folder..." });
+        root.Children.Add(new MenuEntry { Id = (int)IdSelectScreen, Label = "Select Screen / Monitor..." });
         root.Children.Add(new MenuEntry { Id = (int)IdOpenConfig, Label = "Open Config" });
         Sep();
 
@@ -454,6 +470,7 @@ internal sealed class LinuxTrayIcon : IDisposable
             RadioInt(IdQuota30, "30 GB", config.MaxClipsFolderSizeGB, 30),
             RadioInt(IdQuota50, "50 GB", config.MaxClipsFolderSizeGB, 50)));
         root.Children.Add(AudioSubmenu(IdSubAudio));
+        root.Children.Add(MicSubmenu(IdSubMic));
 
         Sep();
         root.Children.Add(new MenuEntry
@@ -538,6 +555,47 @@ internal sealed class LinuxTrayIcon : IDisposable
                     Label = string.IsNullOrEmpty(description) ? sinkName : description,
                     ToggleType = "radio",
                     ToggleState = string.Equals(current, sinkName, StringComparison.OrdinalIgnoreCase) ? 1 : 0,
+                });
+            }
+            return entry;
+        }
+
+        MenuEntry MicSubmenu(uint id)
+        {
+            // Mirrors the Audio Device submenu, for inputs: the on/off checkmark first, then
+            // Default (System) and the real microphones -- *.monitor loopbacks never appear.
+            // Rebuilt on every open, so a headset plugged in since the last open shows up.
+            var entry = new MenuEntry { Id = (int)id, Label = "Microphone", Children = [] };
+            entry.Children.Add(new MenuEntry
+            {
+                Id = (int)IdMicEnabled,
+                Label = "Record Microphone",
+                ToggleType = "checkmark",
+                ToggleState = config.RecordMicrophone ? 1 : 0,
+            });
+            entry.Children.Add(new MenuEntry { Id = (int)(IdSepBase + 300), Separator = true });
+            var current = config.MicrophoneDevice;
+            var isDefault = string.IsNullOrWhiteSpace(current)
+                || string.Equals(current, "default", StringComparison.OrdinalIgnoreCase);
+            entry.Children.Add(new MenuEntry
+            {
+                Id = (int)IdMicDefault,
+                Label = "Default (System)",
+                ToggleType = "radio",
+                ToggleState = isDefault ? 1 : 0,
+            });
+            var mics = host.ListMicrophones();
+            if (mics.Count > 0)
+                entry.Children.Add(new MenuEntry { Id = (int)(IdSepBase + 301), Separator = true });
+            for (var i = 0; i < Math.Min(mics.Count, MaxMicDevices); i++)
+            {
+                var (micName, description) = mics[i];
+                entry.Children.Add(new MenuEntry
+                {
+                    Id = (int)(MicDeviceIdBase + (uint)i),
+                    Label = string.IsNullOrEmpty(description) ? micName : description,
+                    ToggleType = "radio",
+                    ToggleState = string.Equals(current, micName, StringComparison.OrdinalIgnoreCase) ? 1 : 0,
                 });
             }
             return entry;
@@ -735,6 +793,11 @@ internal sealed class LinuxTrayIcon : IDisposable
             case IdPickFolder:
                 PickClipsFolder();
                 break;
+            case IdSelectScreen:
+                // The portal picker can sit for up to a minute; the tray's dispatch thread must
+                // keep serving the menu meanwhile, so the restart runs on its own thread.
+                _ = Task.Run(host.SelectScreen);
+                break;
             case IdOpenConfig:
                 OpenPath(host.ConfigPath);
                 break;
@@ -807,6 +870,19 @@ internal sealed class LinuxTrayIcon : IDisposable
                 host.SetAudioDevice("default");
                 BumpMenu();
                 break;
+            case IdMicEnabled:
+                config.RecordMicrophone = !config.RecordMicrophone;
+                SaveConfig($"Microphone recording {(config.RecordMicrophone ? "on" : "off")}");
+                // The audio pipeline rebuilds against the new config; the ring and the shared
+                // clock survive the swap, so clips cut across the toggle stay in sync.
+                host.RestartAudio();
+                break;
+            case IdMicDefault:
+                config.MicrophoneDevice = "default";
+                SaveConfig("Microphone: Default (System)");
+                host.RestartAudio();
+                BumpMenu();
+                break;
             case IdStartWithSystem:
             {
                 // Autostart lives outside config.json: nothing to save, just flip the boot hook
@@ -836,6 +912,21 @@ internal sealed class LinuxTrayIcon : IDisposable
                     if (audioIndex < sinks.Count)
                     {
                         host.SetAudioDevice(sinks[audioIndex].Name);
+                        BumpMenu();
+                    }
+                    break;
+                }
+
+                // The Microphone menu's radios: same shape, one save + audio restart per pick.
+                var micIndex = (int)(id - MicDeviceIdBase);
+                if (micIndex >= 0 && micIndex < MaxMicDevices)
+                {
+                    var mics = host.ListMicrophones();
+                    if (micIndex < mics.Count)
+                    {
+                        config.MicrophoneDevice = mics[micIndex].Name;
+                        SaveConfig($"Microphone: {mics[micIndex].Description}");
+                        host.RestartAudio();
                         BumpMenu();
                     }
                 }

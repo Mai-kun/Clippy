@@ -172,6 +172,22 @@ public sealed class ClippyConfig
     public string AudioDevice { get; set; } = "default";
 
     /// <summary>
+    /// Mix the microphone over the system sound into the same audio track. Off by default: a
+    /// commentary track is a deliberate choice, not something a screen recorder should assume.
+    /// On Linux this switches the audio ffmpeg to a two-input amix (see LinuxAudioPipeline); a
+    /// microphone that fails to open rolls back to system-sound-only for that run.
+    /// </summary>
+    public bool RecordMicrophone { get; set; } = false;
+
+    /// <summary>
+    /// Which microphone records when <see cref="RecordMicrophone"/> is on. "default" (the default)
+    /// follows the system's default input; any other value is the source's technical name, as
+    /// offered by the tray's Microphone menu (real inputs only -- *.monitor loopbacks are never
+    /// listed). An unknown value degrades to no-mic rather than killing the audio track.
+    /// </summary>
+    public string MicrophoneDevice { get; set; } = "default";
+
+    /// <summary>
     /// Ask GitHub on startup whether a newer release exists. On by default: the check is one small
     /// request that fails silently, and a recorder that only tells you about updates when you go
     /// looking for them is a recorder most people never update at all.
@@ -234,6 +250,8 @@ public sealed class ClippyConfig
                 config.OutputFolder = "clips";
             if (string.IsNullOrWhiteSpace(config.LogsFolder))
                 config.LogsFolder = "logs";
+            if (string.IsNullOrWhiteSpace(config.MicrophoneDevice))
+                config.MicrophoneDevice = "default";
             if (
                 config.VideoBitrateMbps < MinVideoBitrateMbps
                 || config.VideoBitrateMbps > MaxVideoBitrateMbps
