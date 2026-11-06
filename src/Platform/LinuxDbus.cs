@@ -890,9 +890,17 @@ internal sealed class DbusWriter
     /// An a{sv} dict of portal options: string keys, variants of the given signatures. The byte
     /// count patched into the length excludes the padding between it and the first entry.
     /// </summary>
+    /// <remarks>
+    /// The length field sits on a 4-byte boundary -- an ARRAY's alignment is 4 per the D-Bus
+    /// marshalling rules, whatever its element's alignment is. dbus-broker reads it exactly there
+    /// (its c-dvar reader then aligns to the element for the entries): aligning the length to 8
+    /// instead made every dict whose stream position was 1..4 (mod 8) parse as an empty dict on
+    /// the broker, leaving the real entries as trailing bytes -- "invalid body", connection cut.
+    /// The ScreenCast calls only ever worked because their positions happened to be 5..7 (mod 8).
+    /// </remarks>
     public void WriteOptionsDict(IReadOnlyDictionary<string, (string Signature, Action<DbusWriter> Write)> options)
     {
-        Align(8);
+        Align(4);
         var lengthPosition = ReserveLength();
         Align(8); // dict entries are structs; this padding sits outside the counted length
         var contentStart = buffer.Count;
@@ -1094,8 +1102,27 @@ internal sealed class DbusReader : IDisposable
             // The portal's stream properties carry sizes as (ii) pairs, e.g. "size".
             "(ii)" => new DbusValue { String = $"{ReadInt32()}x{ReadInt32()}" },
             "a(ua{sv})" => new DbusValue { Streams = ReadStreams() },
+            // The GlobalShortcuts portal's BindShortcuts/shortcuts results: ids plus their props.
+            "a(sa{sv})" => new DbusValue { Shortcuts = ReadShortcutList() },
             _ => throw new IOException($"D-Bus: unsupported variant signature '{signature}'."),
         };
+    }
+
+    private List<(string Id, Dictionary<string, DbusValue> Props)> ReadShortcutList()
+    {
+        Align(4);
+        var length = (int)ReadUInt32();
+        Align(8);
+        var end = position + length;
+        var shortcuts = new List<(string, Dictionary<string, DbusValue>)>();
+        while (position < end)
+        {
+            Align(8);
+            var id = ReadString();
+            var props = ReadStringVariantDict();
+            shortcuts.Add((id, props));
+        }
+        return shortcuts;
     }
 
     private List<(uint Node, Dictionary<string, DbusValue> Props)> ReadStreams()
@@ -1165,5 +1192,6 @@ internal sealed class DbusValue
     public ulong UInt64 { get; init; }
     public bool Bool { get; init; }
     public List<(uint Node, Dictionary<string, DbusValue> Props)> Streams { get; init; } = [];
+    public List<(string Id, Dictionary<string, DbusValue> Props)> Shortcuts { get; init; } = [];
 }
 #endif
