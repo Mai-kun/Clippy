@@ -70,6 +70,56 @@ internal sealed class LinuxAudioPipeline : IDisposable
         return $"{defaultSink}.monitor";
     }
 
+    /// <summary>
+    /// The sinks with their real names, for the tray's Audio Device menu: `pactl list sinks`
+    /// parsed into (technical Name, human Description) pairs. The short table (`pactl list short
+    /// sinks`) is NOT used here on purpose: its third column is the sound server ("PipeWire") for
+    /// every sink, which is exactly the "three devices called PipeWire" menu bug. `LC_ALL=C` (and
+    /// LANG) pin the "Name:"/"Description:" keys against the user's locale translating them.
+    /// The Name is the sink id the audio pipeline feeds to `-f pulse -i &lt;name&gt;.monitor`;
+    /// the Description is what the menu shows.
+    /// </summary>
+    public static List<(string Name, string Description)> ListSinks()
+    {
+        var output = RunPactlLocalized("list", "sinks");
+        var sinks = new List<(string, string)>();
+        string? name = null;
+        string? description = null;
+
+        void FlushCurrent()
+        {
+            if (!string.IsNullOrEmpty(name))
+                sinks.Add((name, description ?? ""));
+            name = null;
+            description = null;
+        }
+
+        foreach (var rawLine in output.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            // Each block opens with "Sink #<index>"; a block's Name: always precedes its
+            // Description:, and property keys inside the block use "key = value" spacing, so a
+            // plain prefix match cannot cross into them.
+            if (line.StartsWith("Sink #", StringComparison.Ordinal))
+            {
+                FlushCurrent();
+            }
+            else if (name is null && line.StartsWith("Name:", StringComparison.Ordinal))
+            {
+                name = line["Name:".Length..].Trim();
+            }
+            else if (description is null && line.StartsWith("Description:", StringComparison.Ordinal))
+            {
+                description = line["Description:".Length..].Trim();
+            }
+        }
+        FlushCurrent();
+
+        if (sinks.Count == 0)
+            Console.WriteLine("Audio: pactl listed no sinks; the Audio Device menu will only offer Default (System).");
+        return sinks;
+    }
+
     private static string? RunPactl(params string[] arguments)
     {
         try
@@ -87,6 +137,29 @@ internal sealed class LinuxAudioPipeline : IDisposable
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
             return null;
+        }
+    }
+
+    /// <summary>RunPactl, with the locale pinned to C so the output's keys never translate.</summary>
+    private static string RunPactlLocalized(params string[] arguments)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo { FileName = "pactl", RedirectStandardOutput = true };
+            startInfo.Environment["LC_ALL"] = "C";
+            startInfo.Environment["LANG"] = "C";
+            foreach (var argument in arguments)
+                startInfo.ArgumentList.Add(argument);
+            using var process = Process.Start(startInfo);
+            if (process is null)
+                return "";
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(5000);
+            return output;
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            return "";
         }
     }
 
