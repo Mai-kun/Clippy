@@ -54,7 +54,10 @@ if [ "$SYSTEMD_STATE" = "running" ] || [ "$SYSTEMD_STATE" = "degraded" ]; then
     cat > "$HOME/.config/systemd/user/clippy.service" <<SERVICE
 [Unit]
 Description=Clippy Instant Replay Recorder
-After=graphical-session.target pipewire.service pipewire-pulse.service
+# Ordering AFTER the portal pair: xdg-desktop-portal elects its backends once at
+# startup, and a recorder starting too early would pull it up half-assembled --
+# without the ScreenCast interface -- and keep it that way for the whole session.
+After=graphical-session.target pipewire.service pipewire-pulse.service xdg-desktop-portal.service plasma-xdg-desktop-portal-kde.service
 PartOf=graphical-session.target
 
 [Service]

@@ -240,7 +240,11 @@ internal static class LinuxDesktopIntegration
         return $@"
 [Unit]
 Description=Clippy Instant Replay Recorder
-After=graphical-session.target pipewire.service pipewire-pulse.service
+# xdg-desktop-portal elects its backends ONCE at startup: a recorder that pulls the
+# portal up from a dead state before the compositor backend joins leaves ScreenCast
+# missing for the whole session. Ordering Clippy AFTER the portal pair is what keeps
+# the autostarted recorder from racing -- and locking in -- a half-assembled portal.
+After=graphical-session.target pipewire.service pipewire-pulse.service xdg-desktop-portal.service plasma-xdg-desktop-portal-kde.service
 PartOf=graphical-session.target
 
 [Service]
