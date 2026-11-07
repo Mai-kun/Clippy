@@ -56,6 +56,17 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
     private volatile bool stopped;
     private int accessUnits;
 
+    /// <summary>
+    /// Direct X11 capture mode: the portal could not be reached at all, so the pipeline reads the
+    /// X display instead of a PipeWire node. On an X11 session this is the full screen; on a
+    /// Wayland session it is the XWayland root -- X11 applications and the desktop wherever the
+    /// compositor mirrors it, but not Wayland-native surfaces. A degraded picture the recorder
+    /// survives beats no recording at all.
+    /// </summary>
+    private bool directCapture;
+    private static string DirectDisplay =>
+        string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")) ? ":0" : Environment.GetEnvironmentVariable("DISPLAY")!;
+
     // The arguments Start() was given, kept so the pipeline can rebuild itself after the child
     // processes die on their own (suspend/resume, a PipeWire restart, a monitor mode change).
     private int startFd;
@@ -156,6 +167,70 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
     }
 
     /// <summary>
+    /// Starts the pipeline in DIRECT mode: no portal session exists (the ScreenCast interface is
+    /// gone even after the backend re-election), so the X display is captured straight away. The
+    /// screen size comes from xrandr/xdpyinfo, the framerate cap and both encoder paths are the
+    /// portal ones with the source element swapped -- pipewiresrc out, ximagesrc in.
+    /// </summary>
+    public bool StartDirect(ClippyConfig config, string? logDirectory, RingBuffer ring)
+    {
+        var (width, height) = ProbeScreenSize();
+        Width = width;
+        Height = height;
+        Framerate = 60;
+        IsHevc = config.UseHevc;
+        directCapture = true;
+        startConfig = config;
+        startLogDirectory = logDirectory;
+        startRing = ring;
+        Console.WriteLine($"Video: the portal is unavailable -- capturing display {DirectDisplay} directly at " +
+            $"{width}x{height}. On a Wayland session this shows X11 surfaces only; the portal capture " +
+            "resumes automatically once it is back.");
+        return StartPipeline();
+    }
+
+    /// <summary>
+    /// The X screen's size, from xrandr's "current W x H" summary line and xdpyinfo's
+    /// "dimensions:" as the second opinion. 1920x1080 is the last resort a dead probe leaves;
+    /// a wrong guess shows up as a stretched or cropped clip, not as a failure.
+    /// </summary>
+    private static (int Width, int Height) ProbeScreenSize()
+    {
+        foreach (var (fileName, arguments, pattern) in new[]
+                 {
+                     ("xrandr", "--current", @"current\s+(\d+)\s+x\s+(\d+)"),
+                     ("xdpyinfo", "", @"dimensions:\s+(\d+)x(\d+)"),
+                 })
+        {
+            try
+            {
+                var probe = Process.Start(new ProcessStartInfo(fileName, arguments)
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                });
+                if (probe is null)
+                    continue;
+                var output = probe.StandardOutput.ReadToEnd();
+                probe.WaitForExit(5000);
+                var match = Regex.Match(output, pattern);
+                if (match.Success &&
+                    int.TryParse(match.Groups[1].Value, out var width) &&
+                    int.TryParse(match.Groups[2].Value, out var height) &&
+                    width > 0 && height > 0)
+                    return (width, height);
+            }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+            {
+                // No such tool on PATH: the next probe decides.
+            }
+        }
+        Console.WriteLine("Video: could not probe the screen size (xrandr/xdpyinfo); assuming 1920x1080.");
+        return (1920, 1080);
+    }
+
+    /// <summary>
     /// Builds the two-path pipeline against the remembered start arguments. Runs on the caller
     /// thread for the initial start and on the (ended) drain thread for every automatic restart,
     /// which is why it must never touch the ring's construction state -- the ring is reused as-is.
@@ -170,7 +245,9 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
         var nvencElement = DesiredNvencElement(config);
         if (nvencElement is not null && GstHasElement(nvencElement))
         {
-            gst = StartGstEncoder(pipeWireFd, startNode, nvencElement, config);
+            gst = directCapture
+                ? StartGstDirectEncoder(nvencElement, config)
+                : StartGstEncoder(pipeWireFd, startNode, nvencElement, config);
             if (gst is not null)
             {
                 StartDrain(gst.StandardOutput.BaseStream, startRing);
@@ -199,11 +276,17 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
         // Path 2: capture and encode in two processes, pixels through a FIFO.
         MakeVideoFifo();
         var fifo = fifoPath!;
-        gst = StartGstCapture(pipeWireFd, startNode, fifo);
+        gst = directCapture
+            ? StartGstDirectCapture(fifo)
+            : StartGstCapture(pipeWireFd, startNode, fifo);
         if (gst is null || gst.HasExited)
         {
             Console.WriteLine("Video: gst-launch could not be started -- is gst-launch-1.0 installed?");
-            return false;
+            gst?.Dispose();
+            gst = null;
+            // Path 3, direct mode only: no gst at all, ffmpeg reads the X display itself and
+            // emits the elementary stream on stdout. Same drain, same ring.
+            return directCapture && StartFfmpegX11Grab(config);
         }
 
         // A failing pipewiresrc (dead stream, refused fd) exits within a couple of seconds; a
@@ -353,6 +436,161 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
             Console.WriteLine($"Video: could not start gst-launch-1.0 ({ex.GetType().Name}: {ex.Message}).");
             return null;
         }
+    }
+
+    /// <summary>
+    /// Direct mode, path 1: the whole capture+encode in ONE gst process, with ximagesrc reading
+    /// the X display instead of a PipeWire node. use-damage=0 is what makes a static screen keep
+    /// flowing -- X damage events dry up when nothing moves, and a recorder living off a ring
+    /// buffer starves without a steady frame supply.
+    /// </summary>
+    private Process? StartGstDirectEncoder(string encoderElement, ClippyConfig config)
+    {
+        var parse = IsHevc ? "h265parse" : "h264parse";
+        var byteStreamCaps = IsHevc
+            ? "video/x-h265,stream-format=byte-stream,alignment=au"
+            : "video/x-h264,stream-format=byte-stream,alignment=au";
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "gst-launch-1.0",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var argument in new[]
+        {
+            "ximagesrc", $"display-name={DirectDisplay}", "use-damage=0", "show-pointer=true", "!",
+            "video/x-raw", "!", "videorate", "!", "video/x-raw,framerate=60/1", "!",
+            "cudaupload", "!", "video/x-raw(memory:CUDAMemory),format=BGRx", "!", encoderElement,
+            "bitrate=" + config.VideoBitrateMbps * 1000, "gop-size=60", "bframes=0",
+            "rc-mode=vbr", "zerolatency=true", "repeat-sequence-header=true", "!",
+            parse, "config-interval=-1", "!", byteStreamCaps, "!", "fdsink", "fd=1",
+        })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            return Process.Start(startInfo);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            Console.WriteLine($"Video: could not start gst-launch-1.0 ({ex.GetType().Name}: {ex.Message}).");
+            return null;
+        }
+    }
+
+    /// <summary>Direct mode, path 2: ximagesrc to raw BGRx through the FIFO, ffmpeg encoding.</summary>
+    private Process? StartGstDirectCapture(string fifo)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "gst-launch-1.0",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var argument in new[]
+        {
+            "ximagesrc", $"display-name={DirectDisplay}", "use-damage=0", "show-pointer=true", "!",
+            "video/x-raw", "!", "videoconvert", "!",
+            // BGRx maps byte-for-byte onto ffmpeg's bgra rawvideo input.
+            "video/x-raw,format=BGRx", "!", "filesink", $"location={fifo}",
+        })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            return Process.Start(startInfo);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            Console.WriteLine($"Video: could not start gst-launch-1.0 ({ex.GetType().Name}: {ex.Message}).");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Direct mode, path 3: even gst-launch is unusable, so ffmpeg grabs the X display itself
+    /// (x11grab) and emits the elementary stream on stdout. The drain, the ring and the parameter
+    /// sets are exactly the two-process path's -- only the capture moved inside ffmpeg.
+    /// </summary>
+    private bool StartFfmpegX11Grab(ClippyConfig config)
+    {
+        var encoderName = DesiredFfmpegEncoder(config);
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = FfmpegLocator.Executable,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+        };
+        foreach (var argument in new[]
+        {
+            "-hide_banner", "-loglevel", "debug", "-y",
+            "-f", "x11grab", "-framerate", "60", "-i", DirectDisplay,
+            "-an", "-fps_mode", "passthrough",
+        }
+        .Concat(CodecArguments(encoderName, config.VideoBitrateMbps))
+        .Concat(new[]
+        {
+            "-force_key_frames", "expr:gte(t,n_forced*1)",
+            "-pix_fmt", "yuv420p",
+            "-f", IsHevc ? "hevc" : "h264", "pipe:1",
+        }))
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            ffmpeg = Process.Start(startInfo);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            Console.WriteLine($"Video: could not start ffmpeg ({ex.GetType().Name}: {ex.Message}).");
+            return false;
+        }
+        if (ffmpeg is null)
+            return false;
+
+        ffmpegDebugLog = LogPaths.CreateCapped(
+            LogPaths.Resolve(startLogDirectory, $"clippy-video-{encoderName}", ".ffmpeg-debug.log"));
+        ffmpeg.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is null || ffmpegDebugLog is null)
+                return;
+            lock (ffmpegDebugLog)
+                ffmpegDebugLog.WriteLine(e.Data);
+        };
+        ffmpeg.BeginErrorReadLine();
+
+        // Same probe idea as everywhere else: a rejected encoder exits within milliseconds.
+        if (!encoderName.StartsWith("libx", StringComparison.OrdinalIgnoreCase))
+        {
+            Thread.Sleep(700);
+            if (ffmpeg.HasExited)
+            {
+                var failed = encoderName;
+                encoderName = SoftwareEncoder(IsHevc);
+                Console.WriteLine($"Video: {failed} is not available on this machine (ffmpeg exited with " +
+                    $"{ffmpeg.ExitCode}). Falling back to {encoderName}.");
+                ffmpeg.Dispose();
+                ffmpeg = null;
+                ffmpegDebugLog?.Dispose();
+                ffmpegDebugLog = null;
+                return StartFfmpegX11Grab(config);
+            }
+        }
+
+        Console.WriteLine($"Video: encoding {Width}x{Height} [{encoderName}] via x11grab at " +
+            $"{config.VideoBitrateMbps} Mbit/s, GOP 1 s, no B-frames, codec {(IsHevc ? "HEVC" : "H.264")}.");
+        StartDrain(ffmpeg.StandardOutput.BaseStream, startRing);
+        return true;
     }
 
     /// <summary>

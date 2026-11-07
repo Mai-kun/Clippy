@@ -151,6 +151,7 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     private LinuxHotkeyService? hotkeys;
     private Timer? durationTimer;
     private Timer? midExportTimer;
+    private Timer? videoRetryTimer;
 
     /// <summary>Serialises exports and answers a second trigger with busy instead of a queue.</summary>
     private readonly object exportGate = new();
@@ -204,25 +205,23 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
 
         try
         {
-            if (!options.AudioCaptureOnly)
-            {
-                if (!StartVideo())
-                    return 1;
-            }
-
-            if (options.WithAudio && !StartAudio())
-                Console.WriteLine("Audio: recording continues without sound.");
-
+            // The tray FIRST: the icon is the one promise the process must always keep, portal or
+            // no portal. Exports against a not-yet-started video pipeline answer "nothing to
+            // export yet" until the capture wakes up.
             hotkeys = new LinuxHotkeyService(HandleTrigger, config);
             hotkeys.Start();
 
-            // The tray is optional in every sense: no bar, no icon, no problem. When there is one,
-            // left click saves the short clip and the menu mirrors the Windows tray.
             if (options.Tray)
             {
                 tray = new LinuxTrayIcon(this);
                 tray.Start();
             }
+
+            if (!options.AudioCaptureOnly)
+                StartVideoWithRetries();
+
+            if (options.WithAudio && !StartAudio())
+                Console.WriteLine("Audio: recording continues without sound.");
 
             if (options.Duration is { } timeout)
             {
@@ -279,8 +278,20 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         catch (Exception ex)
         {
             Console.WriteLine($"Video: the portal session failed ({ex.Message}).");
-            Console.WriteLine("Video: no screen capture is possible, so the recorder cannot run.");
-            return false;
+            var cancelled = ex.Message.Contains("cancelled by the user", StringComparison.OrdinalIgnoreCase);
+            portal?.Dispose();
+            portal = null;
+            if (cancelled)
+            {
+                // The user dismissed the monitor picker; re-popping it on a timer or silently
+                // degrading to the X11 fallback would both be wrong. Recording continues without
+                // video until "Select Screen" or a restart.
+                Console.WriteLine("Video: recording continues without video until 'Select Screen' or a restart.");
+                return false;
+            }
+            // The portal is unusable even after the self-healing retry inside StartSession, so
+            // the recorder falls back to direct X11 capture instead of going blind.
+            return StartDirectVideo();
         }
         sessionFd = session.PipeWireFd;
         sessionId = session.NodeId;
@@ -297,6 +308,62 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// The portal-free last resort: the X display captured straight into the same two-path
+    /// pipeline (ximagesrc, then ffmpeg x11grab). False only when even that refused.
+    /// </summary>
+    private bool StartDirectVideo()
+    {
+        video = new LinuxVideoPipeline(stopwatch);
+        if (!video.StartDirect(config, logsDirectory, videoRing!))
+        {
+            Console.WriteLine("Video: no screen capture is available at all; retrying the portal in the background.");
+            video.Dispose();
+            video = null;
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// The video start with the background retry. A capture that fails on the first second after
+    /// boot -- before the portal has finished waking -- is the normal case for an autostarted
+    /// recorder, not an error to die on: the process stays up with its tray, and a timer retries
+    /// the portal handshake every 3 s until it goes through. Only a USER cancellation stops the
+    /// retrying (they dismissed the monitor picker; re-popping it every 3 s would be harassment).
+    /// A machine with no ScreenCast at all ends on the direct X11 fallback inside StartVideo.
+    /// </summary>
+    private void StartVideoWithRetries()
+    {
+        if (StartVideo())
+            return;
+
+        videoRetryTimer = new Timer(_ =>
+        {
+            // Same gate as the tray's encoder switch: StartVideo and its pipeline own the same
+            // fields, and the timer thread is nobody's main thread. The try/catch keeps a timer
+            // callback racing the shutdown's Dispose from killing the process.
+            try
+            {
+                lock (videoRestartGate)
+                {
+                    if (stopped.IsSet || video is not null)
+                        return;
+                    if (StartVideo())
+                    {
+                        videoRetryTimer?.Dispose();
+                        videoRetryTimer = null;
+                        Console.WriteLine("Video: the portal woke up; screen capture is running.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Video: the capture retry failed ({ex.Message}); trying again in 3 s.");
+            }
+        }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
     }
 
     private bool StartAudio()
@@ -923,6 +990,8 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         portal = null;
         durationTimer?.Dispose();
         midExportTimer?.Dispose();
+        videoRetryTimer?.Dispose();
+        videoRetryTimer = null;
         videoSpool?.Dispose();
         videoSpool = null;
         audioSpool?.Dispose();

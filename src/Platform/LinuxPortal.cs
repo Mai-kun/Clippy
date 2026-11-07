@@ -1,4 +1,5 @@
 #if LINUX
+using System.Diagnostics;
 using System.Text;
 
 namespace Clippy;
@@ -35,7 +36,8 @@ internal sealed class LinuxPortal : IDisposable
     private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan StepTimeout = TimeSpan.FromSeconds(15);
 
-    private readonly LinuxDbus bus;
+    // Not readonly: the self-healing retry in StartSession reconnects after the portal restart.
+    private LinuxDbus bus;
     private readonly string tokenFile;
 
     private LinuxPortal(LinuxDbus bus, string tokenFile)
@@ -66,8 +68,91 @@ internal sealed class LinuxPortal : IDisposable
     /// <summary>
     /// Runs the whole handshake and returns the capture session. The restore token lives in the
     /// file the constructor was given (portal_token.txt next to config.json).
+    ///
+    /// One self-healing retry wraps the handshake: xdg-desktop-portal chooses its backends ONCE,
+    /// at its own startup, and a machine that reached the desktop before the compositor backend
+    /// did (an early autostart, a flatpak-sandboxed login) answers every CreateSession with
+    /// UnknownMethod -- "No such interface org.freedesktop.portal.ScreenCast" -- for the whole
+    /// session. That state survives forever unless something re-runs the backend election, so the
+    /// failure is recognised here, the environment is synced into systemd and the portal pair is
+    /// restarted, and the handshake runs again on a fresh connection.
     /// </summary>
-    public Session StartSession() => RunSession();
+    public Session StartSession()
+    {
+        try
+        {
+            return RunSession();
+        }
+        catch (Exception ex) when (ex is IOException or TimeoutException && IsBackendMissing(ex))
+        {
+            Console.WriteLine($"Portal: {ex.Message}");
+            HealPortalBackend();
+
+            // The old connection may hold a half-created session against a portal that is now
+            // restarting; a clean reconnect is what the retried handshake wants anyway.
+            bus.Dispose();
+            var fresh = LinuxDbus.Connect();
+            bus = fresh;
+            return RunSession();
+        }
+    }
+
+    /// <summary>
+    /// The signature failure of a portal that started without its compositor backend: the method
+    /// call is answered with UnknownMethod naming the ScreenCast interface itself. Matched on the
+    /// message text because LinuxDbus folds every error reply into one IOException.
+    /// </summary>
+    private static bool IsBackendMissing(Exception ex) =>
+        ex.Message.Contains("UnknownMethod", StringComparison.OrdinalIgnoreCase) ||
+        (ex.Message.Contains("No such interface", StringComparison.OrdinalIgnoreCase) &&
+         ex.Message.Contains("ScreenCast", StringComparison.Ordinal));
+
+    /// <summary>
+    /// Re-runs the portal's backend election: the compositor's environment variables are pushed
+    /// into the systemd --user activation environment (a portal started by an early or
+    /// environment-less activation reads them from there), then the backend and the portal itself
+    /// are restarted in one unit transaction. Best effort by design -- a machine without systemd
+    /// user services loses only the healing, not the error it already had.
+    /// </summary>
+    private static void HealPortalBackend()
+    {
+        var desktop = Environment.GetEnvironmentVariable("XDG_CURRENT_DESKTOP") ?? "";
+        // The backend unit that serves THIS compositor; xdg-desktop-portal-gtk as the neutral
+        // remainder. The unit may not be installed -- the restart call then simply fails.
+        var backendUnit = desktop.Contains("KDE", StringComparison.OrdinalIgnoreCase)
+            ? "plasma-xdg-desktop-portal-kde.service"
+            : desktop.Contains("GNOME", StringComparison.OrdinalIgnoreCase)
+                ? "xdg-desktop-portal-gnome.service"
+                : desktop.Contains("wlroots", StringComparison.OrdinalIgnoreCase) ||
+                  desktop.Contains("Niri", StringComparison.OrdinalIgnoreCase)
+                    ? "xdg-desktop-portal-wlr.service"
+                    : "xdg-desktop-portal-gtk.service";
+
+        Console.WriteLine($"Portal: the ScreenCast interface is missing -- re-electing the portal backend ({backendUnit}).");
+        RunHealStep("dbus-update-activation-environment",
+            ["--systemd", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE"]);
+        RunHealStep("systemctl", ["--user", "restart", backendUnit, "xdg-desktop-portal.service"]);
+        Thread.Sleep(1500); // the restarted portal needs a moment before CreateSession is answerable
+    }
+
+    /// <summary>One healing command, output discarded, failures reported and swallowed.</summary>
+    private static void RunHealStep(string fileName, string[] arguments)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo(fileName) { UseShellExecute = false };
+            foreach (var argument in arguments)
+                startInfo.ArgumentList.Add(argument);
+            using var process = Process.Start(startInfo);
+            process?.WaitForExit(10_000);
+            if (process is { HasExited: true, ExitCode: not 0 })
+                Console.WriteLine($"Portal: '{fileName}' exited with {process.ExitCode}; continuing anyway.");
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            Console.WriteLine($"Portal: could not run '{fileName}' ({ex.Message}); continuing anyway.");
+        }
+    }
 
     private Session RunSession()
     {
