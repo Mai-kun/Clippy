@@ -796,6 +796,10 @@ internal sealed partial class ScreenCapture : IDisposable
             Console.WriteLine("Nothing is written until an export happens (F8 saves 30 s, F9 saves 3 min).");
         }
 
+        // Declared outside the try so the teardown in the finally can still change the answer: a
+        // shutdown that failed must not report success to whatever started this run.
+        var exitCode = 0;
+
         try
         {
         // The video encoder is built HERE, before the capture session starts, and the ordering is the
@@ -900,47 +904,63 @@ internal sealed partial class ScreenCapture : IDisposable
                 Console.WriteLine("Exiting without saving a clip. Press your hotkey to save one.");
             }
 
-            return 0;
+            exitCode = 0;
         }
         finally
         {
             Console.CancelKeyPress -= cancelHandler;
 
-            // Stop the callback first: once the session is disposed no new frame can be delivered, so
-            // taking the lock afterwards is bounded instead of racing an in-flight Write.
-            framePool.FrameArrived -= OnFrameArrived;
-
-            // Tear down INSIDE the same lock OnFrameArrived uses. Doing it outside let Dispose race a
-            // concurrent Write -- closing stdin while another thread writes to it -- which is exactly
-            // the kind of timing-dependent fault that makes a run pass or hang at random.
-            lock (sync)
+            // A shutdown must never throw. This block runs from a finally, so an exception escaping it
+            // took the whole process down with a stack trace -- ffmpeg exiting because the encoder
+            // refused the stream, the disk filling up, a driver reset, all of which end here in
+            // encoder.Dispose() -- instead of saying what went wrong.
+            try
             {
-                disposed = true;
+                // Stop the callback first: once the session is disposed no new frame can be delivered,
+                // so taking the lock afterwards is bounded instead of racing an in-flight Write.
+                framePool.FrameArrived -= OnFrameArrived;
 
-                // Audio first: it feeds the audio ffmpeg's stdin, which must close before it exits.
-                audio?.Dispose();
-                audio = null;
-                audioEncoder?.Dispose();
-                audioEncoder = null;
+                // Tear down INSIDE the same lock OnFrameArrived uses. Doing it outside let Dispose race a
+                // concurrent Write -- closing stdin while another thread writes to it -- which is exactly
+                // the kind of timing-dependent fault that makes a run pass or hang at random.
+                lock (sync)
+                {
+                    disposed = true;
 
-                // Close ffmpeg's stdin after the last frame so it finalises the mp4 container.
-                encoder?.Dispose();
-                encoder = null;
+                    // Audio first: it feeds the audio ffmpeg's stdin, which must close before it exits.
+                    audio?.Dispose();
+                    audio = null;
+                    audioEncoder?.Dispose();
+                    audioEncoder = null;
+
+                    // Close ffmpeg's stdin after the last frame so it finalises the mp4 container.
+                    encoder?.Dispose();
+                    encoder = null;
+                }
+
+                // The final export (in the try above) has already read both tiers; now the disk tail
+                // can close its files. Spoolers go last on purpose: an export still in flight on the
+                // hotkey thread must find them usable for as long as the encoders could still push.
+                videoSpool?.Dispose();
+                videoSpool = null;
+                audioSpool?.Dispose();
+                audioSpool = null;
+
+                if (withAudio && videoOnlyPath is not null && audioOnlyPath is not null)
+                    MuxVideoAndAudio(videoOnlyPath, audioOnlyPath, videoPath!);
+                else if (audioCaptureOnly)
+                    Console.WriteLine($"Bisection run: {discardedAudioBuffers} WASAPI buffers received and discarded; no mux.");
             }
-
-            // The final export (in the try above) has already read both tiers; now the disk tail
-            // can close its files. Spoolers go last on purpose: an export still in flight on the
-            // hotkey thread must find them usable for as long as the encoders could still push.
-            videoSpool?.Dispose();
-            videoSpool = null;
-            audioSpool?.Dispose();
-            audioSpool = null;
-
-            if (withAudio && videoOnlyPath is not null && audioOnlyPath is not null)
-                MuxVideoAndAudio(videoOnlyPath, audioOnlyPath, videoPath!);
-            else if (audioCaptureOnly)
-                Console.WriteLine($"Bisection run: {discardedAudioBuffers} WASAPI buffers received and discarded; no mux.");
+            catch (Exception ex)
+            {
+                exitCode = 1;
+                Console.WriteLine($"Shutdown: {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine("Shutdown: anything recorded before this point is still in the clips folder.");
+                CrashLog.Write($"SHUTDOWN: {ex}");
+            }
         }
+
+        return exitCode;
     }
 
     /// <summary>
@@ -1099,6 +1119,16 @@ internal sealed partial class ScreenCapture : IDisposable
                 if (lastEncodedFrameTime is { } last && (now - last).TotalMilliseconds < MinFrameIntervalMs)
                     return;
                 lastEncodedFrameTime = now;
+            }
+
+            // A dead encoder stops the recorder. Without this the only symptom was one
+            // "[wgc] frame callback threw" line per frame -- hundreds of them a second -- while the
+            // process kept "recording" into a pipe nobody was reading, and the real reason surfaced
+            // much later as an unhandled exception out of Dispose.
+            if (encoder is FfmpegVideoEncoder { Failed: true })
+            {
+                Stop("the video encoder stopped");
+                return;
             }
 
             // The direct NVENC session waits here until the real delivery rate is known, because a
