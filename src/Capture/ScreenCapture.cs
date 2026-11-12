@@ -672,16 +672,28 @@ internal sealed partial class ScreenCapture : IDisposable
         session = framePool.CreateCaptureSession(item);
 
         // Windows draws a yellow-green border around the captured item by default, which is exactly
-        // the thing a screen recorder must not add to the user's desktop. Setting it false is
-        // available from Windows 10 2004, so an older build throws and the border simply stays.
+        // the thing a screen recorder must not add to the user's desktop. IsBorderRequired lives on
+        // IGraphicsCaptureSession3, which only Windows 11 has: on Windows 10 the CsWinRT projection
+        // fails with InvalidCastException rather than a COMException, so that is in the filter too --
+        // without it the whole recorder dies at startup on a perfectly supported Windows 10 machine.
+        //
+        // The border on Windows 10 is the system's own capture indicator: it is drawn over the
+        // display by DWM and is NOT part of the captured frame (verified by dumping one), so
+        // recordings are clean. There is no API to disable it below Windows 11 -- the only way out
+        // is capturing through DXGI Desktop Duplication instead of WGC, which costs the composited
+        // cursor and brings its own failure modes, so it is not worth it for an on-screen hint.
         try
         {
             session.IsBorderRequired = false;
         }
-        catch (Exception ex) when (ex is COMException or InvalidOperationException or NotSupportedException)
+        catch (Exception ex) when (ex is COMException or InvalidCastException or InvalidOperationException or NotSupportedException)
         {
-            Console.WriteLine($"Capture: could not remove the capture border " +
-                $"({ex.GetType().Name}: {ex.Message}). A highlighted edge will show around the screen.");
+            if (Environment.OSVersion.Version.Build < 22000)
+                Console.WriteLine("Capture: Windows 10 keeps its yellow capture indicator around the screen. " +
+                    "It is not in the recording -- there is no API to hide it before Windows 11.");
+            else
+                Console.WriteLine($"Capture: could not remove the capture border " +
+                    $"({ex.GetType().Name}: {ex.Message}). A highlighted edge will show around the screen.");
         }
 
         // Seeded from the monitor so the very first frame is not mistaken for a resolution change
