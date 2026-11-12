@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace Clippy;
 
@@ -202,9 +203,14 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
     /// <summary>
     /// Starts ffmpeg, falling back to a software encoder if the requested one is rejected.
     ///
-    /// h264_nvenc needs an NVIDIA GPU and is rejected at ffmpeg's initialisation, before it reads a
-    /// single frame, so the process exits within milliseconds. That makes a short probe window a
-    /// reliable signal and lets Clippy work on an AMD or Intel machine instead of failing to record.
+    /// h264_nvenc needs an NVIDIA GPU. It used to be that ffmpeg rejected it at initialisation, so a
+    /// 700 ms "is it still alive" probe was a reliable signal. Measured on an Intel-only laptop, that
+    /// is not true: ffmpeg accepted the arguments, stayed alive through the probe, and only failed
+    /// when the first frame reached the encoder -- mid-recording, with the process dying on an
+    /// unhandled exception. So the question is asked twice before any frame is captured: no NVIDIA
+    /// driver at all means the answer in microseconds, and a driver that cannot actually open the
+    /// encoder means one throwaway ffmpeg frame. Either way the recorder lands on libx264 instead of
+    /// vanishing, which is the difference between "records at 30 fps in software" and "crashes".
     /// </summary>
     public static FfmpegVideoEncoder StartWithFallback(
         string outputPath,
@@ -221,6 +227,27 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
         // Already a software encoder: there is nothing to fall back to.
         if (encoder.StartsWith("libx", StringComparison.OrdinalIgnoreCase))
             return Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode, logDirectory);
+
+        // Ask the driver, not ffmpeg, for the cheap half of the question. ffmpeg needs ~9 seconds to
+        // admit there is no NVIDIA driver at all (it retries every CUDA DLL), which is too long to
+        // spend on the frame thread; LoadLibrary answers the same thing in microseconds.
+        if (encoder.Contains("nvenc", StringComparison.OrdinalIgnoreCase) && !NvidiaDriverPresent())
+        {
+            Console.WriteLine($"Video: {encoder} needs an NVIDIA driver, which this machine does not have. " +
+                              $"Falling back to {software} -- recording works, just on the CPU.");
+            return Start(outputPath, width, height, software, bitrateMbps, stopwatch, fpsMode, logDirectory);
+        }
+
+        // Driver present is not the same as NVENC usable: an old chip, a disabled discrete GPU or a
+        // driver that refuses the session all fail here. The liveness probe below cannot see those,
+        // because ffmpeg only opens the encoder when the first frame arrives -- measured: the process
+        // stayed alive through the whole probe and then died on frame one, taking the recording with
+        // it. Now that the no-driver case is out of the way, asking ffmpeg is fast in both directions.
+        if (!encoder.StartsWith("libx", StringComparison.OrdinalIgnoreCase) && !EncoderOpens(encoder))
+        {
+            Console.WriteLine($"Video: falling back to {software} -- recording works, just on the CPU.");
+            return Start(outputPath, width, height, software, bitrateMbps, stopwatch, fpsMode, logDirectory);
+        }
 
         var attempt = Start(outputPath, width, height, encoder, bitrateMbps, stopwatch, fpsMode, logDirectory);
         if (attempt.Probe(TimeSpan.FromMilliseconds(700)))
@@ -247,6 +274,111 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
             return true;
 
         Console.WriteLine($"Video: ffmpeg exited with code {process.ExitCode} while probing the encoder.");
+        return false;
+    }
+
+    /// <summary>
+    /// True once ffmpeg has exited without being asked to: the encoder rejected the stream, the disk
+    /// filled up, the driver reset. The recorder polls this and stops, instead of writing into a dead
+    /// pipe frame after frame and only finding out during teardown.
+    /// </summary>
+    public bool Failed
+    {
+        get
+        {
+            if (disposed)
+                return false;
+            try
+            {
+                return process.HasExited;
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// True if the NVIDIA driver is importable at all.
+    ///
+    /// Asking ffmpeg itself ("can you open h264_nvenc?") is the precise answer but costs ~9 seconds on
+    /// a machine with no GPU -- measured on an Intel-only laptop, where ffmpeg retries every CUDA DLL
+    /// before giving up. That ran on the frame thread and ate an entire 6-second recording. A failed
+    /// LoadLibrary is the same answer in microseconds: no driver, no nvenc, no reason to start ffmpeg.
+    /// </summary>
+    private static bool NvidiaDriverPresent()
+    {
+        foreach (var library in new[] { "nvEncodeAPI64.dll", "nvcuda.dll" })
+        {
+            if (NativeLibrary.TryLoad(library, out var handle))
+            {
+                NativeLibrary.Free(handle);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// True if ffmpeg can actually open this encoder here, asked with one throwaway frame.
+    ///
+    /// This is the check the liveness probe cannot make. Only worth its cost once the NVIDIA driver
+    /// question is answered, because "no driver" is the answer ffmpeg takes ~9 seconds to reach.
+    /// </summary>
+    private static bool EncoderOpens(string encoder)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = FfmpegLocator.Executable,
+            UseShellExecute = false,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in new[]
+        {
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "nullsrc=s=256x144:d=0.1",
+            "-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
+        })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var probe = Process.Start(startInfo);
+        if (probe is null)
+        {
+            Console.WriteLine($"Video: {encoder} probe could not start ffmpeg ({FfmpegLocator.Executable}).");
+            return false;
+        }
+
+        // Reading starts before the wait: a probe that fills the pipe buffer would otherwise block
+        // forever against a caller that is not reading yet.
+        var stderr = probe.StandardError.ReadToEndAsync();
+        if (!probe.WaitForExit(15_000))
+        {
+            try
+            {
+                probe.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException)
+            {
+                // It exited between the timeout and the kill; the exit code below decides.
+            }
+
+            Console.WriteLine($"Video: {encoder} did not answer the probe within 15 s.");
+            return false;
+        }
+
+        if (probe.ExitCode == 0)
+            return true;
+
+        var reason = stderr.GetAwaiter().GetResult().Trim();
+        var firstLine = reason.Length == 0 ? "no reason given" : reason.Split('\n')[0].Trim();
+        Console.WriteLine($"Video: {encoder} cannot be opened on this machine ({firstLine}).");
         return false;
     }
 
