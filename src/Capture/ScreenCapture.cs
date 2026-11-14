@@ -1651,24 +1651,102 @@ internal static partial class CaptureInterop
     private static readonly Guid GraphicsCaptureItemIid = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
     private static readonly Guid Texture2DIid = new("6F15AAF2-D208-4E89-9AB4-489535D34F9C");
 
+    /// <summary>
+    /// Waits between CreateForMonitor tries, in milliseconds. One extra try follows the last delay,
+    /// so the loop runs four times over about two and a half seconds.
+    /// </summary>
+    /// <remarks>
+    /// A healthy machine pays nothing: the first try returns and no sleep ever happens. The delays
+    /// only run on a machine whose display topology is mid-churn, and a couple of seconds is what
+    /// a monitor waking up or an HDR flip needs to settle.
+    /// </remarks>
+    private static readonly int[] MonitorCreateRetryDelaysMs = [250, 750, 1500];
+
     public static GraphicsCaptureItem CreateItemForPrimaryMonitor()
     {
-        var monitor = MonitorFromPoint(new Point { X = 0, Y = 0 }, MonitorDefaultToPrimary);
-        if (monitor == 0)
-            throw new InvalidOperationException("Primary HMONITOR was not found.");
-
-        using var factory = ActivationFactory.Get("Windows.Graphics.Capture.GraphicsCaptureItem");
-        var interop = factory.AsInterface<IGraphicsCaptureItemInterop>();
-
-        ThrowIfFailed(interop.CreateForMonitor(monitor, GraphicsCaptureItemIid, out var item));
-        try
+        // WGC re-validates the HMONITOR against its own view of the display topology, and that view
+        // can disagree with user32's for a while: right after the monitor sleeps, after an HDR or
+        // resolution change, and on some Windows 11 24H2 builds where Microsoft confirmed
+        // CreateForMonitor returning E_INVALIDARG for handles EnumDisplayMonitors still reports --
+        // a Windows bug, not a caller error. The field report fixed itself by restarting the app:
+        // the fresh process re-read the topology. Retrying here is that same restart, minus asking
+        // the user to do anything -- each attempt re-fetches the handle and re-checks it against
+        // the current enumeration, so once the display settles the next try goes through.
+        var lastProblem = "the primary monitor was never fetched.";
+        for (var attempt = 0; ; attempt++)
         {
-            return MarshalInspectable<GraphicsCaptureItem>.FromAbi(item)!;
+            var monitor = MonitorFromPoint(new Point { X = 0, Y = 0 }, MonitorDefaultToPrimary);
+            if (monitor == 0)
+            {
+                lastProblem = "user32 returned no primary HMONITOR.";
+            }
+            else if (!IsMonitorEnumerated(monitor))
+            {
+                lastProblem = $"HMONITOR {monitor} is not in the live display enumeration (topology is changing).";
+            }
+            else
+            {
+                using var factory = ActivationFactory.Get("Windows.Graphics.Capture.GraphicsCaptureItem");
+                var interop = factory.AsInterface<IGraphicsCaptureItemInterop>();
+
+                var hresult = interop.CreateForMonitor(monitor, GraphicsCaptureItemIid, out var item);
+                if (hresult >= 0)
+                {
+                    try
+                    {
+                        return MarshalInspectable<GraphicsCaptureItem>.FromAbi(item)!;
+                    }
+                    finally
+                    {
+                        MarshalInspectable<GraphicsCaptureItem>.DisposeAbi(item);
+                    }
+                }
+
+                // "Value does not fall within the expected range" is the .NET rendering of
+                // E_INVALIDARG; keeping it verbatim means a clippy-error.log from a user greps
+                // against the crash reports this retry loop is for.
+                lastProblem = $"CreateForMonitor failed with 0x{hresult:X8} " +
+                              $"({Marshal.GetExceptionForHR(hresult)?.Message}).";
+            }
+
+            if (attempt >= MonitorCreateRetryDelaysMs.Length)
+                throw new InvalidOperationException(
+                    $"Windows.Graphics.Capture refused the primary monitor after " +
+                    $"{MonitorCreateRetryDelaysMs.Length + 1} tries: {lastProblem} " +
+                    "E_INVALIDARG on a valid monitor is the known Windows bug (confirmed by Microsoft on some " +
+                    "Windows 11 24H2 builds; it also happens right after the display wakes or the topology " +
+                    "changes). Updating the display driver, or replugging the display, usually clears it.");
+
+            Console.WriteLine($"Capture: monitor item attempt {attempt + 1} failed: {lastProblem} Retrying.");
+            Thread.Sleep(MonitorCreateRetryDelaysMs[attempt]);
         }
-        finally
-        {
-            MarshalInspectable<GraphicsCaptureItem>.DisposeAbi(item);
-        }
+    }
+
+    /// <summary>
+    /// Checks the handle against the enumeration user32 has right now, the way Chromium checks
+    /// before its own CreateForMonitor call: a handle user32 no longer lists would be wasted on
+    /// WGC, and the check separates "stale handle, refetch it" from "valid handle, Windows just
+    /// refuses it".
+    /// </summary>
+    private static unsafe bool IsMonitorEnumerated(nint monitor)
+    {
+        // Two slots in unmanaged memory: [0] the handle being looked for, [1] set to 1 when the
+        // callback sees it. An UnmanagedCallersOnly callback cannot reach managed state, so the
+        // outcome travels through the LPARAM.
+        var state = stackalloc nint[2];
+        state[0] = monitor;
+        state[1] = 0;
+        EnumDisplayMonitors(nint.Zero, nint.Zero, &MonitorEnumCallback, (nint)state);
+        return state[1] != 0;
+    }
+
+    [UnmanagedCallersOnly]
+    private static unsafe int MonitorEnumCallback(nint monitor, nint hdc, nint rect, nint state)
+    {
+        var slots = (nint*)state;
+        if (monitor == slots[0])
+            slots[1] = 1;
+        return 1; // keep enumerating
     }
 
     public static IDirect3DDevice CreateDirect3DDevice(ID3D11Device d3d11Device)
@@ -1700,6 +1778,11 @@ internal static partial class CaptureInterop
 
     [LibraryImport("user32.dll")]
     private static partial nint MonitorFromPoint(Point point, uint flags);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static unsafe partial bool EnumDisplayMonitors(nint hdc, nint clipRect,
+        delegate* unmanaged<nint, nint, nint, nint, int> callback, nint data);
 
     [LibraryImport("d3d11.dll", EntryPoint = "CreateDirect3D11DeviceFromDXGIDevice")]
     private static partial int CreateDirect3D11DeviceFromDXGIDevice(nint dxgiDevice, out nint direct3DDevice);

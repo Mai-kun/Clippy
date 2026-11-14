@@ -38,8 +38,12 @@ if (!LinuxSingleInstance.TryAcquire())
 AppDomain.CurrentDomain.UnhandledException += (_, e) =>
 {
     var ex = e.ExceptionObject as Exception;
+    // The OS build number matters more here than for most apps: several of this app's crashes
+    // were Windows-version-specific (the capture border on Windows 10, CreateForMonitor
+    // E_INVALIDARG on some 24H2 builds), and without the build a user report cannot be told
+    // apart from an ordinary bug.
     CrashLog.Write(
-        $"UNHANDLED: {ex?.GetType().FullName}: {ex?.Message}\n{ex?.StackTrace}");
+        $"UNHANDLED on {Environment.OSVersion.VersionString}: {ex?.GetType().FullName}: {ex?.Message}\n{ex?.StackTrace}");
 };
 TaskScheduler.UnobservedTaskException += (_, e) =>
 {
