@@ -440,7 +440,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
             parser.Append(bytes, 0, Emit);
     }
 
-    private void Emit(byte[] data, int length, bool isIdr, double _)
+    private void Emit(ReadOnlySpan<byte> data, bool isIdr, double _)
     {
         // nal_unit_type is the low 5 bits of the first payload byte. SPS (7) and PPS (8) are kept
         // because the muxer needs them to describe the track; AUD (9) and SEI (6) are dropped, because
@@ -448,8 +448,8 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         var type = data[0] & 0x1F;
         switch (type)
         {
-            case 7: sps = data; return;
-            case 8: pps = data; return;
+            case 7: sps = data.ToArray(); return;
+            case 8: pps = data.ToArray(); return;
             case 9:
             case 6: return;
         }
@@ -466,11 +466,7 @@ internal sealed class MfVideoEncoder : IVideoEncoder
         if (currentAccessUnitTime < 0)
             return;
 
-        // Copied, not handed over: the parser array is reused on the next append, and the ring holds
-        // packets for minutes.
-        var packet = new byte[Math.Max(length, 16)];
-        Buffer.BlockCopy(data, 0, packet, 0, length);
-        ring.Push(packet, length, currentAccessUnitTime, isIdr);
+        ring.Push(data, currentAccessUnitTime, isIdr);
 
         if (isIdr)
         {

@@ -56,6 +56,11 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
     private volatile bool stopped;
     private int accessUnits;
 
+    private IntPtr nativeStream = IntPtr.Zero;
+    private LinuxNativeBridge.VideoPacketCallback? nativeVideoCallback;
+    private AnnexBParser? nativeParser;
+    private double nativeLastStamp = -1;
+
     /// <summary>
     /// Direct X11 capture mode: the portal could not be reached at all, so the pipeline reads the
     /// X display instead of a PipeWire node. On an X11 session this is the full screen; on a
@@ -231,18 +236,25 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
     }
 
     /// <summary>
-    /// Builds the two-path pipeline against the remembered start arguments. Runs on the caller
-    /// thread for the initial start and on the (ended) drain thread for every automatic restart,
-    /// which is why it must never touch the ring's construction state -- the ring is reused as-is.
+    /// Builds the pipeline against the remembered start arguments.
+    /// Tries the in-process native bridge (PipeWire + CUDA NVENC) first; falls back to gst-launch
+    /// single-process hardware encoding, then to the two-process FIFO + ffmpeg pipeline.
     /// </summary>
     private bool StartPipeline()
     {
         var pipeWireFd = startFd;
         var config = startConfig;
 
-        // Path 1: single-process hardware encoding. A config that explicitly asks for a software
-        // encoder ("libx...") skips straight to the ffmpeg fallback.
+        // Path 0: native in-process capture + CUDA NVENC encoding via libclippy_linux.so.
         var nvencElement = DesiredNvencElement(config);
+        if (!directCapture && nvencElement is not null && LinuxNativeBridge.IsAvailable)
+        {
+            if (StartNativePipeline(pipeWireFd, config))
+                return true;
+        }
+
+        // Path 1: single-process hardware encoding via GStreamer. A config that explicitly asks for a software
+        // encoder ("libx...") skips straight to the ffmpeg fallback.
         if (nvencElement is not null && GstHasElement(nvencElement))
         {
             gst = directCapture
@@ -332,6 +344,102 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
         return true;
     }
 
+    private bool StartNativePipeline(int pipeWireFd, ClippyConfig config)
+    {
+        try
+        {
+            nativeLastStamp = -1;
+            nativeParser = new AnnexBParser(IsHevc);
+            nativeVideoCallback = OnNativeVideoPacket;
+            var isHevc = config.UseHevc ? 1 : 0;
+            var bitrateBps = config.VideoBitrateMbps * 1_000_000;
+
+            var res = LinuxNativeBridge.VideoStart(
+                pipeWireFd,
+                startNode,
+                Width,
+                Height,
+                (int)Framerate,
+                bitrateBps,
+                isHevc,
+                nativeVideoCallback,
+                IntPtr.Zero,
+                out nativeStream);
+
+            if (res != 0 || nativeStream == IntPtr.Zero)
+            {
+                Console.WriteLine($"Video: native NVENC failed to start (code {res}). Falling back to gst-launch/ffmpeg pipeline.");
+                if (nativeStream != IntPtr.Zero)
+                {
+                    LinuxNativeBridge.VideoStop(nativeStream);
+                    nativeStream = IntPtr.Zero;
+                }
+                return false;
+            }
+
+            // Retrieve initial sequence params
+            if (LinuxNativeBridge.VideoGetSequenceParams(nativeStream, out var seqPtr, out var seqSize) == 0 && seqSize > 0)
+            {
+                unsafe
+                {
+                    var seqSpan = new ReadOnlySpan<byte>((void*)seqPtr, (int)seqSize);
+                    nativeParser.Append(seqSpan, 0, (nal, isIdr, time) =>
+                    {
+                        if (IsParameterSet(nal, IsHevc))
+                            StoreParameterSet(nal);
+                    });
+                }
+            }
+
+            Console.WriteLine($"Video: encoding {Width}x{Height} [native NVENC] at " +
+                $"{config.VideoBitrateMbps} Mbit/s in-process, GOP 1 s, no B-frames, " +
+                $"codec {(IsHevc ? "HEVC" : "H.264")}.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Video: native NVENC initialization threw {ex.GetType().Name}: {ex.Message}. Falling back to gst-launch/ffmpeg pipeline.");
+            if (nativeStream != IntPtr.Zero)
+            {
+                try { LinuxNativeBridge.VideoStop(nativeStream); } catch { }
+                nativeStream = IntPtr.Zero;
+            }
+            return false;
+        }
+    }
+
+    private void OnNativeVideoPacket(IntPtr userData, IntPtr data, uint len, int isKeyframe, double clockSec)
+    {
+        if (data == IntPtr.Zero || len == 0)
+        {
+            if (!stopped)
+                HandlePipelineEnd("native video stream disconnected");
+            return;
+        }
+
+        Interlocked.Exchange(ref restartAttempts, 0);
+        var arrival = stopwatch.Elapsed.TotalSeconds;
+
+        unsafe
+        {
+            var span = new ReadOnlySpan<byte>((void*)data, (int)len);
+            nativeParser?.Append(span, arrival, (nal, isIdr, captureSeconds) =>
+            {
+                if (IsParameterSet(nal, IsHevc))
+                {
+                    StoreParameterSet(nal);
+                    return;
+                }
+
+                var time = Math.Max(captureSeconds, nativeLastStamp + 0.001);
+                nativeLastStamp = time;
+
+                startRing.Push(nal, time, isIdr);
+                Interlocked.Increment(ref accessUnits);
+            });
+        }
+    }
+
     /// <summary>
     /// The raw BGRx pixels travel gst -> ffmpeg through a named pipe, never through this process:
     /// 1920x1080 at 60 fps is ~500 MB/s, and a managed relay would burn the CPU the encoder is
@@ -376,6 +484,7 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
             // stamps buffers on arrival.
             "pipewiresrc", $"fd={pipeWireFd}", $"path={nodeId}", "keepalive-time=1000", "always-copy=false", "do-timestamp=true", "!",
             "video/x-raw", "!", "videorate", "!", "video/x-raw,framerate=60/1", "!",
+            "queue", "max-size-buffers=2", "max-size-time=0", "max-size-bytes=0", "leaky=downstream", "!",
             // ALL-CUDA PATH: cudaupload DMAs the BGRx frame into VRAM and NVENC eats BGRx
             // directly (its CUDAMemory sink template lists BGRx/BGRA/RGBA) -- the colour
             // conversion to NV12 happens inside the encoder hardware, so videoconvert and its
@@ -461,6 +570,7 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
         {
             "ximagesrc", $"display-name={DirectDisplay}", "use-damage=0", "show-pointer=true", "!",
             "video/x-raw", "!", "videorate", "!", "video/x-raw,framerate=60/1", "!",
+            "queue", "max-size-buffers=2", "max-size-time=0", "max-size-bytes=0", "leaky=downstream", "!",
             "cudaupload", "!", "video/x-raw(memory:CUDAMemory),format=BGRx", "!", encoderElement,
             "bitrate=" + config.VideoBitrateMbps * 1000, "gop-size=60", "bframes=0",
             "rc-mode=vbr", "zerolatency=true", "repeat-sequence-header=true", "!",
@@ -729,21 +839,18 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
                     // Data flows again: whatever killed the previous pipeline, this one lives.
                     Interlocked.Exchange(ref restartAttempts, 0);
                     var arrival = stopwatch.Elapsed.TotalSeconds;
-                    parser.Append(buffer.AsSpan(0, read), arrival, (nal, length, isIdr, captureSeconds) =>
+                    parser.Append(buffer.AsSpan(0, read), arrival, (nal, isIdr, captureSeconds) =>
                     {
-                        var span = nal.AsSpan(0, length);
-                        if (IsParameterSet(span, IsHevc))
+                        if (IsParameterSet(nal, IsHevc))
                         {
-                            StoreParameterSet(span);
+                            StoreParameterSet(nal);
                             return;
                         }
 
                         var time = Math.Max(captureSeconds, lastStamp + 0.001);
                         lastStamp = time;
 
-                        var rented = ArrayPool<byte>.Shared.Rent(length);
-                        span.CopyTo(rented);
-                        target.Push(rented, length, time, isIdr);
+                        target.Push(nal, time, isIdr);
                         Interlocked.Increment(ref accessUnits);
                     });
                 }
@@ -795,6 +902,18 @@ internal sealed partial class LinuxVideoPipeline : IDisposable
     /// <summary>The child processes and the FIFO, without the stopped flag or the debug log -- shared by Dispose and the restart.</summary>
     private void KillChildren()
     {
+        if (nativeStream != IntPtr.Zero)
+        {
+            try
+            {
+                LinuxNativeBridge.VideoStop(nativeStream);
+            }
+            catch (Exception) { /* already gone */ }
+            nativeStream = IntPtr.Zero;
+        }
+        nativeVideoCallback = null;
+        nativeParser = null;
+
         try
         {
             // Closing ffmpeg's stdin makes it finalise and flush the elementary stream, exactly as

@@ -61,6 +61,14 @@ internal sealed class RingBuffer
     /// </summary>
     private readonly object gate = new();
 
+    /// <summary>Copies data directly from a span into a pooled packet buffer.</summary>
+    public void Push(ReadOnlySpan<byte> data, double captureClockSeconds, bool isKeyframe)
+    {
+        var rented = PacketBufferPool.Rent(data.Length);
+        data.CopyTo(rented);
+        Push(rented, data.Length, captureClockSeconds, isKeyframe);
+    }
+
     /// <summary>Takes ownership of a rented buffer.</summary>
     public void Push(byte[] rented, int length, double captureClockSeconds, bool isKeyframe)
     {

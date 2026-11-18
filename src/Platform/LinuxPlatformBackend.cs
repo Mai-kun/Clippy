@@ -152,6 +152,7 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     private Timer? durationTimer;
     private Timer? midExportTimer;
     private Timer? videoRetryTimer;
+    private Timer? memoryTrimTimer;
 
     /// <summary>Serialises exports and answers a second trigger with busy instead of a queue.</summary>
     private readonly object exportGate = new();
@@ -235,6 +236,9 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
                 midExportTimer = new Timer(_ => GuardedExport(options.ExportDuration ?? 10),
                     null, TimeSpan.FromSeconds(at), Timeout.InfiniteTimeSpan);
             }
+
+            memoryTrimTimer = new Timer(_ => BackgroundMemoryTrim(),
+                null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
 
             stopped.Wait();
             Console.WriteLine("Recording stopped.");
@@ -706,9 +710,31 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     /// </summary>
     private static void ReleaseExportMemory()
     {
+        PacketBufferPool.Trim();
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         GC.WaitForPendingFinalizers();
         malloc_trim(0);
+    }
+
+    private void BackgroundMemoryTrim()
+    {
+        if (!Monitor.TryEnter(exportGate))
+            return;
+        try
+        {
+            if (exporting)
+                return;
+            PacketBufferPool.Trim();
+            GC.Collect(1, GCCollectionMode.Optimized, blocking: false);
+            malloc_trim(0);
+        }
+        catch
+        {
+        }
+        finally
+        {
+            Monitor.Exit(exportGate);
+        }
     }
 
     [LibraryImport("libc", SetLastError = true)]
@@ -775,8 +801,9 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     /// </summary>
     void LinuxTrayIcon.IHost.SetVideoEncoding(int bitrateMbps, string codec, string encoder)
     {
+        var newHevc = string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase);
         if (bitrateMbps == config.VideoBitrateMbps &&
-            string.Equals(codec, config.VideoCodec, StringComparison.OrdinalIgnoreCase) &&
+            newHevc == config.UseHevc &&
             string.Equals(encoder, config.VideoEncoder, StringComparison.OrdinalIgnoreCase) &&
             video is not null)
             return; // nothing changed
@@ -990,6 +1017,8 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         portal = null;
         durationTimer?.Dispose();
         midExportTimer?.Dispose();
+        memoryTrimTimer?.Dispose();
+        memoryTrimTimer = null;
         videoRetryTimer?.Dispose();
         videoRetryTimer = null;
         videoSpool?.Dispose();

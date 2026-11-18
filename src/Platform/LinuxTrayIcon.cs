@@ -824,14 +824,12 @@ internal sealed class LinuxTrayIcon : IDisposable
                 host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec, config.VideoEncoder);
                 break;
             case IdCodecHevc:
-                config.VideoCodec = "hevc";
                 SaveConfig("Video codec HEVC");
-                host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec, config.VideoEncoder);
+                host.SetVideoEncoding(config.VideoBitrateMbps, "hevc", config.VideoEncoder);
                 break;
             case IdCodecH264:
-                config.VideoCodec = "h264";
                 SaveConfig("Video codec H.264");
-                host.SetVideoEncoding(config.VideoBitrateMbps, config.VideoCodec, config.VideoEncoder);
+                host.SetVideoEncoding(config.VideoBitrateMbps, "h264", config.VideoEncoder);
                 break;
             case IdNotifyOverlay:
                 config.NotificationType = "overlay";

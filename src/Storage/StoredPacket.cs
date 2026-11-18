@@ -4,7 +4,7 @@ namespace Clippy;
 
 /// <summary>
 /// One elementary-stream packet held in the ring buffer.
-/// Data is rented from <see cref="ArrayPool{T}"/> and is longer than <see cref="Length"/>, so the
+/// Data is rented from <see cref="PacketBufferPool"/> and is longer than <see cref="Length"/>, so the
 /// real span is always taken from 0..Length, never from the array's full length.
 /// </summary>
 internal sealed class StoredPacket
@@ -32,5 +32,5 @@ internal sealed class StoredPacket
         return copy;
     }
 
-    public void Release() => ArrayPool<byte>.Shared.Return(Data);
+    public void Release() => PacketBufferPool.Return(Data);
 }

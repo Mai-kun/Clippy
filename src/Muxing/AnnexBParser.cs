@@ -1,5 +1,8 @@
 namespace Clippy;
 
+/// <summary>Handler for NAL units emitted as ReadOnlySpan without allocating a temporary byte array.</summary>
+internal delegate void NalSpanHandler(ReadOnlySpan<byte> nal, bool isKeyframe, double captureSeconds);
+
 /// <summary>
 /// Splits a raw Annex B byte stream into individual NAL units.
 ///
@@ -35,11 +38,11 @@ internal sealed class AnnexBParser
     private int? pendingNalStart;
 
     /// <summary>
-    /// Feeds a chunk of stdout bytes and emits every NAL that became complete.
+    /// Feeds a chunk of stdout bytes and emits every NAL that became complete directly as a ReadOnlySpan.
     /// The capture clock is stamped on arrival at this parser, never read back from the stream, so no
     /// ffmpeg-internal decision (encoder delay, bitrate guess, container rewrite) can influence it.
     /// </summary>
-    public void Append(ReadOnlySpan<byte> data, double captureSeconds, Action<byte[], int, bool, double> emit)
+    public void Append(ReadOnlySpan<byte> data, double captureSeconds, NalSpanHandler emit)
     {
         EnsureCapacity(pendingLength + data.Length);
         data.CopyTo(pending.AsSpan(pendingLength));
@@ -47,7 +50,10 @@ internal sealed class AnnexBParser
         Drain(emit, captureSeconds);
     }
 
-    public void Flush(double captureSeconds, Action<byte[], int, bool, double> emit)
+    public void Append(ReadOnlySpan<byte> data, double captureSeconds, Action<byte[], int, bool, double> emit)
+        => Append(data, captureSeconds, (nal, isIdr, t) => emit(nal.ToArray(), nal.Length, isIdr, t));
+
+    public void Flush(double captureSeconds, NalSpanHandler emit)
     {
         if (pendingLength == 0)
             return;
@@ -77,7 +83,10 @@ internal sealed class AnnexBParser
         pendingNalStart = null;
     }
 
-    private void Drain(Action<byte[], int, bool, double> emit, double captureSeconds)
+    public void Flush(double captureSeconds, Action<byte[], int, bool, double> emit)
+        => Flush(captureSeconds, (nal, isIdr, t) => emit(nal.ToArray(), nal.Length, isIdr, t));
+
+    private void Drain(NalSpanHandler emit, double captureSeconds)
     {
         while (true)
         {
@@ -120,7 +129,7 @@ internal sealed class AnnexBParser
     /// Emits the NAL whose payload is [payloadStart, payloadStart+length), dropping the
     /// trailing_zero_8bits Annex B appends before the next start code.
     /// </summary>
-    private void EmitNal(int payloadStart, int length, Action<byte[], int, bool, double> emit, double captureSeconds)
+    private void EmitNal(int payloadStart, int length, NalSpanHandler emit, double captureSeconds)
     {
         while (length > 0 && pending[payloadStart + length - 1] == 0)
             length--;
@@ -142,9 +151,7 @@ internal sealed class AnnexBParser
             isIdr = (pending[payloadStart] & 0x1F) == 5;
         }
 
-        var copy = new byte[length];
-        Buffer.BlockCopy(pending, payloadStart, copy, 0, length);
-        emit(copy, length, isIdr, captureSeconds);
+        emit(pending.AsSpan(payloadStart, length), isIdr, captureSeconds);
     }
 
     /// <summary>

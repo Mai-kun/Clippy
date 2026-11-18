@@ -513,3 +513,10 @@ tools/
 
 # The local Linux release output (dotnet publish lands here, see src/Clippy.csproj PublishDir)
 dist/
+publish/
+publish-*/
+
+# Rust native-linux target and build artifacts
+src/native-linux/target/
+src/native-linux/libclippy_linux.so
+

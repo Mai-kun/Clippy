@@ -10,7 +10,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 rm -f "$HOME/.config/autostart/clippy.desktop"
 rm -f "$HOME/.local/share/applications/clippy.desktop"
 rm -f "$HOME/.local/bin/clippy"
-rm -f "$APP_DIR/Clippy" "$APP_DIR/uninstall.sh" "$APP_DIR/config.example.json"
+rm -f "$APP_DIR/Clippy" "$APP_DIR/libclippy_linux.so" "$APP_DIR/uninstall.sh" "$APP_DIR/config.example.json"
 rmdir "$APP_DIR" 2>/dev/null || true
 
 echo "Clippy uninstalled (binaries, autostart, shortcuts removed)."

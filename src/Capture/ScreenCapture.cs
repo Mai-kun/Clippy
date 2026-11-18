@@ -66,6 +66,7 @@ internal sealed partial class ScreenCapture : IDisposable
     private bool audioCaptureOnly;
     private int discardedAudioBuffers;
     private double videoStartSeconds;
+    private readonly object exportGate = new();
 
     /// <summary>
     /// Retargets the live loopback to another render endpoint, from the tray's Audio Device menu.
@@ -80,11 +81,13 @@ internal sealed partial class ScreenCapture : IDisposable
     /// </summary>
     public string? ExportClip(double durationSeconds)
     {
-        if (videoRing is null || audioRing is null || encoder?.Sps is null || encoder.Pps is null)
+        lock (exportGate)
         {
-            Console.WriteLine("Export: nothing to export yet (recorder not started or no SPS/PPS seen).");
-            return null;
-        }
+            if (videoRing is null || audioRing is null || encoder?.Sps is null || encoder.Pps is null)
+            {
+                Console.WriteLine("Export: nothing to export yet (recorder not started or no SPS/PPS seen).");
+                return null;
+            }
 
         // Snapshot the clock first, then both slices. Slice copies, so the packets stay valid even
         // though the drain threads keep pushing while this runs.
@@ -371,6 +374,7 @@ internal sealed partial class ScreenCapture : IDisposable
 
         return path;
     }
+}
 
     /// <summary>
     /// clip_yyyy-MM-dd_HH-mm-ss.mp4: an ISO-shaped stamp instead of the old HHmmssfff. The point is
@@ -547,9 +551,28 @@ internal sealed partial class ScreenCapture : IDisposable
     /// </summary>
     private static void ReleaseExportMemory()
     {
+        PacketBufferPool.Trim();
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         GC.WaitForPendingFinalizers();
         TrimWorkingSet();
+    }
+
+    private void BackgroundMemoryTrim()
+    {
+        if (!Monitor.TryEnter(exportGate))
+            return;
+        try
+        {
+            PacketBufferPool.Trim();
+            GC.Collect(1, GCCollectionMode.Optimized, blocking: false);
+        }
+        catch
+        {
+        }
+        finally
+        {
+            Monitor.Exit(exportGate);
+        }
     }
 
     private static double FirstOrNaN(IReadOnlyList<double> values) => values.Count > 0 ? values[0] : double.NaN;
@@ -862,6 +885,7 @@ internal sealed partial class ScreenCapture : IDisposable
             using var midExport = exportAtSeconds is { } at
                 ? new Timer(_ => GuardedExport(exportDurationSeconds ?? 10), null, TimeSpan.FromSeconds(at), Timeout.InfiniteTimeSpan)
                 : null;
+            using var memoryTrimTimer = new Timer(_ => BackgroundMemoryTrim(), null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
 
             // Phase 6: the low-level keyboard hook only records the key and signals an event; a
             // dedicated worker thread performs the export. Not a pool thread -- an export takes

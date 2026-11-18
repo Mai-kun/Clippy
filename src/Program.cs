@@ -16,6 +16,21 @@ var platformResult = platform.RunPlatformCommand(args, out var platformHandled);
 if (platformHandled)
     return platformResult;
 
+if (args.Contains("--test-parsers"))
+    return Clippy.ParserSelfTest.Run();
+
+if (args.Contains("--test-ring"))
+    return Clippy.RingBufferSelfTest.Run();
+
+if (args.Contains("--test-mp4"))
+    return Clippy.Mp4WriterSelfTest.Run();
+
+if (args.FirstOrDefault() == "--test-audio-timeline")
+    return Clippy.FfmpegAudioEncoder.SelfTest() ? 0 : 1;
+
+if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
+    return PrintUsage();
+
 // One recorder at a time. The client flags above were answered by the RUNNING recorder and
 // already returned, so the only launches left here are recorder runs -- and a second one must
 // not kill the first one's IPC socket or wipe its disk spool below. The lock lives on Linux

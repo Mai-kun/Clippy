@@ -22,8 +22,10 @@ internal static class RingBufferSelfTest
         failures += Check("audio: trim leaves no time gap", AudioTrimHasNoGaps);
         failures += Check("slice: honours the requested range", SliceRespectsRange);
         failures += Check("buffer: padding past Length never leaks", PaddingDoesNotLeak);
-    failures += Check("buffer: concurrent Push while slicing", ConcurrentPushAndSlice);
-    failures += Check("spool: evicted packets survive on disk and rejoin the head", SpoolRoundTripsEvictedPackets);
+        failures += Check("buffer: concurrent Push while slicing", ConcurrentPushAndSlice);
+        failures += Check("pool: fine-grained buckets minimize slack and reuse buffers", PacketBufferPoolReuseAndSlack);
+        failures += Check("pool: trim drops cached buffers", PacketBufferPoolTrim);
+        failures += Check("spool: evicted packets survive on disk and rejoin the head", SpoolRoundTripsEvictedPackets);
     failures += Check("spool: segments older than the history limit are deleted", SpoolPrunesOldSegments);
     failures += Check("spool: hybrid slice under eviction has no duplicate or gap", SpoolHybridSliceUnderEviction);
 
@@ -52,7 +54,7 @@ internal static class RingBufferSelfTest
         }
     }
 
-    private static byte[] Rented(int size = 64) => System.Buffers.ArrayPool<byte>.Shared.Rent(size);
+    private static byte[] Rented(int size = 64) => PacketBufferPool.Rent(size);
 
     /// <summary>
     /// One thread pushes continuously while another slices, which is what the live recorder does.
@@ -150,6 +152,35 @@ internal static class RingBufferSelfTest
         }
 
         return error;
+    }
+
+    private static string? PacketBufferPoolReuseAndSlack()
+    {
+        var size = 135 * 1024;
+        var buf1 = PacketBufferPool.Rent(size);
+        if (buf1.Length < size)
+            return $"rented buffer length {buf1.Length} is smaller than requested {size}";
+        if (buf1.Length > size + 16384)
+            return $"slack is too high: rented {buf1.Length} for requested {size} (slack {buf1.Length - size})";
+
+        PacketBufferPool.Return(buf1);
+        var buf2 = PacketBufferPool.Rent(size);
+        if (!ReferenceEquals(buf1, buf2))
+            return "pool did not reuse returned buffer of matching bucket";
+        PacketBufferPool.Return(buf2);
+        return null;
+    }
+
+    private static string? PacketBufferPoolTrim()
+    {
+        var buf = PacketBufferPool.Rent(1024);
+        PacketBufferPool.Return(buf);
+        PacketBufferPool.Trim();
+        var buf2 = PacketBufferPool.Rent(1024);
+        if (ReferenceEquals(buf, buf2))
+            return "buffer was returned from pool after Trim()";
+        PacketBufferPool.Return(buf2);
+        return null;
     }
 
     /// <summary>Pushes `seconds` of 30 fps video, an I-frame every second, tracking the widest span.</summary>

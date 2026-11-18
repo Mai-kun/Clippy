@@ -24,7 +24,8 @@ internal sealed class FfmpegAudioEncoder : IAudioEncoder
     private readonly StreamWriter debugLog;
     private readonly string debugLogPath;
     private readonly FfmpegStartupGate gate;
-    private readonly ConcurrentQueue<byte[]> queue = new();
+    private readonly ConcurrentQueue<(byte[] Data, int Length)> queue = new();
+    private readonly ConcurrentStack<byte[]> bufferPool = new();
     private readonly AutoResetEvent signal = new(false);
     private readonly int queueLimit;
     private Thread? pump;
@@ -196,11 +197,9 @@ internal sealed class FfmpegAudioEncoder : IAudioEncoder
                 {
                     // The timestamp argument is ignored: the frame's real time comes from its ordinal
                     // on the audio timeline, never from when the bytes happened to be read.
-                    parser.Append(buffer.AsSpan(0, read), 0, (data, length, t) =>
+                    parser.Append(buffer.AsSpan(0, read), 0, (frame, t) =>
                     {
-                        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
-                        data.CopyTo(rented, 0);
-                        ring!.Push(rented, length, NextFrameTime(), isKeyframe: true);
+                        ring!.Push(frame, NextFrameTime(), isKeyframe: true);
                     });
                 }
             }
@@ -258,7 +257,7 @@ internal sealed class FfmpegAudioEncoder : IAudioEncoder
     public bool WaitForReady(TimeSpan timeout) => gate.WaitForReady(timeout);
 
     /// <summary>Queues one buffer. Never blocks: a dedicated thread owns ffmpeg's stdin.</summary>
-    public void Write(byte[] samples, long qpcPosition)
+    public void Write(ReadOnlySpan<byte> samples, long qpcPosition)
     {
         if (disposed)
             return;
@@ -286,8 +285,12 @@ internal sealed class FfmpegAudioEncoder : IAudioEncoder
 
         Interlocked.Add(ref queuedSamples, samples.Length / bytesPerSampleFrame);
 
+        if (!bufferPool.TryPop(out var buf) || buf.Length < samples.Length)
+            buf = new byte[Math.Max(samples.Length, 16384)];
+
+        samples.CopyTo(buf);
         var now = stopwatch.Elapsed.TotalMilliseconds;
-        queue.Enqueue(samples);
+        queue.Enqueue((buf, samples.Length));
         signal.Set();
 
         lock (timingLog)
@@ -298,25 +301,32 @@ internal sealed class FfmpegAudioEncoder : IAudioEncoder
         }
     }
 
+    public void Write(byte[] samples, long qpcPosition) => Write(samples.AsSpan(), qpcPosition);
+
     private void Drain()
     {
         while (pumpRunning || !queue.IsEmpty)
         {
             signal.WaitOne(200);
-            while (queue.TryDequeue(out var buffer))
+            while (queue.TryDequeue(out var item))
             {
-                Interlocked.Add(ref writtenSamples, buffer.Length / bytesPerSampleFrame);
+                Interlocked.Add(ref writtenSamples, item.Length / bytesPerSampleFrame);
                 try
                 {
                     // No Flush: ~100 tiny pipe writes per second was measurably worse for ffmpeg
                     // than letting the pipe coalesce them. The stream is byte-oriented, so both the
                     // content and the order are unchanged.
-                    stdin.Write(buffer, 0, buffer.Length);
+                    stdin.Write(item.Data, 0, item.Length);
                 }
                 catch (IOException)
                 {
                     // ffmpeg closed stdin; stop rather than spin on a broken pipe.
                     return;
+                }
+                finally
+                {
+                    if (bufferPool.Count < 32)
+                        bufferPool.Push(item.Data);
                 }
             }
         }

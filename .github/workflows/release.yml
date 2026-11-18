@@ -246,8 +246,15 @@ jobs:
       - name: Enable AOT prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang zlib1g-dev
+          sudo apt-get install -y clang zlib1g-dev libpipewire-0.3-dev libfdk-aac-dev
           ffmpeg -version | head -1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the native Linux bridge
+        run: |
+          cargo build --release --manifest-path src/native-linux/Cargo.toml
 
       - name: Publish (Native AOT)
         run: >
@@ -283,11 +290,12 @@ jobs:
           rm -f Clippy-linux-x64.tar.gz
           mkdir -p pkg
           cp publish-linux/Clippy pkg/Clippy
+          cp src/native-linux/target/release/libclippy_linux.so pkg/libclippy_linux.so
           cp config.example.json pkg/config.example.json
           cp installer/linux/install.sh pkg/install.sh
           cp installer/linux/uninstall.sh pkg/uninstall.sh
-          chmod +x pkg/Clippy pkg/install.sh pkg/uninstall.sh
-          # Only the four files ship: the test fixtures and the .dbg symbols stay out.
+          chmod +x pkg/Clippy pkg/install.sh pkg/uninstall.sh pkg/libclippy_linux.so
+          # The binary, native bridge, install scripts and sample config ship: fixtures and .dbg stay out.
           tar -czf Clippy-linux-x64.tar.gz -C pkg .
           tar -tzf Clippy-linux-x64.tar.gz
           # This is a bash step, not PowerShell: a bare "archive: ..." expression line would be

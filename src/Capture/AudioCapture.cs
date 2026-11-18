@@ -34,16 +34,21 @@ internal sealed class AudioCapture : IDisposable
     // stream to its own zero and the real A/V offset is lost. Measured per run, never hardcoded.
     private readonly double videoStartSeconds;
 
+    public delegate void AudioDataHandler(ReadOnlySpan<byte> buffer, long qpcPosition);
+
     /// <summary>
     /// Set after construction, read on the WASAPI callback thread. volatile because the assignment
     /// happens on the recording thread while the callback may already be running.
     /// </summary>
-    private Action<byte[], long>? sink;
-    public Action<byte[], long>? Sink
+    private AudioDataHandler? sink;
+    public AudioDataHandler? Sink
     {
         get => sink;
         set => sink = value;
     }
+
+    private byte[] processBuffer = new byte[65536];
+    private static readonly byte[] SilenceBuffer = new byte[48000 * 8];
 
     private readonly CaptureDataAvailableHandler handler;
 
@@ -411,11 +416,11 @@ internal sealed class AudioCapture : IDisposable
     /// because the slider can move during a recording. Integer mix formats are left alone: shared-mode
     /// loopback is float32 on every endpoint seen so far.
     /// </summary>
-    private void UndoSoftwareVolume(byte[] samples)
+    private void UndoSoftwareVolume(Span<byte> samples)
     {
         if (!captureIsFloat)
             return;
-        var floats = MemoryMarshal.Cast<byte, float>(samples.AsSpan());
+        var floats = MemoryMarshal.Cast<byte, float>(samples);
         var peak = 0f;
         foreach (var f in floats)
             peak = Math.Max(peak, Math.Abs(f));
@@ -470,10 +475,13 @@ internal sealed class AudioCapture : IDisposable
 
     private void OnDataAvailable(ReadOnlySpan<byte> buffer, long qpcPosition)
     {
-        var copy = buffer.ToArray();
-        UndoSoftwareVolume(copy);
+        if (processBuffer.Length < buffer.Length)
+            Array.Resize(ref processBuffer, Math.Max(processBuffer.Length * 2, buffer.Length));
+        buffer.CopyTo(processBuffer);
+        var span = processBuffer.AsSpan(0, buffer.Length);
+        UndoSoftwareVolume(span);
         Interlocked.Increment(ref bufferCount);
-        Interlocked.Add(ref totalBytes, copy.Length);
+        Interlocked.Add(ref totalBytes, span.Length);
         if (firstBufferHundredNanos == 0)
             Interlocked.CompareExchange(ref firstBufferHundredNanos, qpcPosition, 0);
 
@@ -526,16 +534,20 @@ internal sealed class AudioCapture : IDisposable
             {
                 Console.WriteLine($"[gap] {fillSeconds * 1000:F0} ms of silence inserted at " +
                     $"{stopwatch.Elapsed.TotalSeconds:F3}s (packet was {gap * 1000:F0} ms late)");
-                sink?.Invoke(new byte[fillSamples * BytesPerFrame], qpcPosition);
+                var fillBytes = fillSamples * BytesPerFrame;
+                var silenceSpan = fillBytes <= SilenceBuffer.Length
+                    ? SilenceBuffer.AsSpan(0, fillBytes)
+                    : new byte[fillBytes];
+                sink?.Invoke(silenceSpan, qpcPosition);
                 samplesSoFar += fillSamples;
             }
         }
 
-        samplesSoFar += copy.Length / BytesPerFrame;
+        samplesSoFar += span.Length / BytesPerFrame;
 
         // The QPC position is the packet's true capture time on the same system clock that
         // -use_wallclock_as_timestamps reads, which is what keeps audio on the video timeline.
-        sink?.Invoke(copy, qpcPosition);
+        sink?.Invoke(span, qpcPosition);
     }
 
     /// <summary>Feeds leading silence so the stream starts `seconds` earlier than the first real packet.</summary>

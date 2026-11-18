@@ -56,6 +56,10 @@
     <ApplicationIcon>assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="9" />
+  </ItemGroup>
+
   <ItemGroup Condition="'$(TargetFramework)' != 'net10.0'">
     <PackageReference Include="NAudio.Wasapi" Version="3.1.0" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
@@ -89,6 +93,7 @@
 
   <ItemGroup Condition="'$(TargetFramework)' != 'net10.0'">
     <Compile Remove="Platform\LinuxPlatformBackend.cs" />
+    <Compile Remove="Platform\LinuxNativeBridge.cs" />
     <Compile Remove="Platform\LinuxDbus.cs" />
     <Compile Remove="Platform\LinuxPortal.cs" />
     <Compile Remove="Platform\LinuxVideoPipeline.cs" />
@@ -151,6 +156,15 @@
     <Copy SourceFiles="$(MSBuildProjectDirectory)\native\clippy_nvenc.dll"
           DestinationFolder="$(PublishDir)"
           Condition="Exists('$(MSBuildProjectDirectory)\native\clippy_nvenc.dll') AND '$(PublishDir)' != ''" />
+  </Target>
+  <Target Name="CopyLinuxBridge" AfterTargets="Build;Publish"
+          Condition="'$(IsWindowsTarget)' != 'true'">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\native-linux\target\release\libclippy_linux.so"
+          DestinationFolder="$(OutDir)"
+          Condition="Exists('$(MSBuildProjectDirectory)\native-linux\target\release\libclippy_linux.so') AND '$(OutDir)' != ''" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\native-linux\target\release\libclippy_linux.so"
+          DestinationFolder="$(PublishDir)"
+          Condition="Exists('$(MSBuildProjectDirectory)\native-linux\target\release\libclippy_linux.so') AND '$(PublishDir)' != ''" />
   </Target>
   <!-- Peel-off debug copy from StripSymbols (see the property group above): released, never
        shipped. Deleting it here means every publish lands clean, not only the CI one. -->

@@ -38,6 +38,9 @@ internal sealed class LinuxAudioPipeline : IDisposable
     private double anchorSeconds;
     private int anchorSet;
 
+    private IntPtr nativeAudio = IntPtr.Zero;
+    private LinuxNativeBridge.AudioAdtsCallback? nativeAudioCallback;
+
     // The arguments Start() was given, kept so the pipeline can rebuild itself when ffmpeg dies
     // on its own (suspend/resume, a PipeWire restart).
     private string startMonitorSource = "";
@@ -254,10 +257,8 @@ internal sealed class LinuxAudioPipeline : IDisposable
     }
 
     /// <summary>
-    /// Starts ffmpeg: the sink's monitor (and, when <paramref name="micSource"/> is set, the
-    /// microphone mixed over it) in, AAC ADTS out. Returns false when ffmpeg could not be started
-    /// at all. A microphone that dies at negotiation is rolled back to system-sound-only -- a clip
-    /// without the mic is a pity; a clip without any sound is a loss.
+    /// Starts the audio capture: tries the native in-process PipeWire + FDK-AAC pipeline first,
+    /// falling back to ffmpeg if the native library or FDK-AAC is unavailable.
     /// </summary>
     public bool Start(string monitorSource, string? micSource, string? logDirectory, RingBuffer ring)
     {
@@ -265,7 +266,84 @@ internal sealed class LinuxAudioPipeline : IDisposable
         startMicSource = micSource;
         startLogDirectory = logDirectory;
         startRing = ring;
-        return StartFfmpegPipeline(withMic: micSource is not null);
+        return StartPipeline();
+    }
+
+    private bool StartPipeline()
+    {
+        if (LinuxNativeBridge.IsAvailable)
+        {
+            if (StartNativeAudio(startMonitorSource, startMicSource))
+                return true;
+        }
+
+        return StartFfmpegPipeline(withMic: startMicSource is not null);
+    }
+
+    private bool StartNativeAudio(string monitorSource, string? micSource)
+    {
+        try
+        {
+            nativeAudioCallback = OnNativeAudioPacket;
+            var recordMic = micSource is not null ? 1 : 0;
+            var res = LinuxNativeBridge.AudioStart(
+                string.IsNullOrEmpty(monitorSource) ? null : monitorSource,
+                recordMic,
+                micSource,
+                nativeAudioCallback,
+                IntPtr.Zero,
+                out nativeAudio);
+
+            if (res != 0 || nativeAudio == IntPtr.Zero)
+            {
+                Console.WriteLine($"Audio: native audio failed to start (code {res}). Falling back to ffmpeg.");
+                if (nativeAudio != IntPtr.Zero)
+                {
+                    LinuxNativeBridge.AudioStop(nativeAudio);
+                    nativeAudio = IntPtr.Zero;
+                }
+                return false;
+            }
+
+            Console.WriteLine(micSource is not null
+                ? $"Audio: capturing the system sound + microphone '{micSource}' as AAC [native FDK-AAC]."
+                : "Audio: capturing the system sound as AAC [native FDK-AAC].");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Audio: native audio initialization threw {ex.GetType().Name}: {ex.Message}. Falling back to ffmpeg.");
+            if (nativeAudio != IntPtr.Zero)
+            {
+                try { LinuxNativeBridge.AudioStop(nativeAudio); } catch { }
+                nativeAudio = IntPtr.Zero;
+            }
+            return false;
+        }
+    }
+
+    private void OnNativeAudioPacket(IntPtr userData, IntPtr adtsData, uint len, long timestampNs)
+    {
+        if (adtsData == IntPtr.Zero || len == 0)
+        {
+            if (!stopped)
+                HandlePipelineEnd("native audio stream disconnected");
+            return;
+        }
+
+        Interlocked.Exchange(ref restartAttempts, 0);
+
+        unsafe
+        {
+            var span = new ReadOnlySpan<byte>((void*)adtsData, (int)len);
+            if (Interlocked.CompareExchange(ref anchorSet, 1, 0) == 0)
+                anchorSeconds = stopwatch.Elapsed.TotalSeconds;
+
+            var k = Interlocked.Increment(ref framesIn) - 1;
+            var time = anchorSeconds + k * SamplesPerFrame / (double)SampleRate;
+
+            startRing.Push(span, time, isKeyframe: true);
+        }
     }
 
     /// <summary>Builds the ffmpeg process (and its drain) against the remembered start arguments.</summary>
@@ -370,6 +448,17 @@ internal sealed class LinuxAudioPipeline : IDisposable
 
     private void KillFfmpeg()
     {
+        if (nativeAudio != IntPtr.Zero)
+        {
+            try
+            {
+                LinuxNativeBridge.AudioStop(nativeAudio);
+            }
+            catch (Exception) { /* already gone */ }
+            nativeAudio = IntPtr.Zero;
+        }
+        nativeAudioCallback = null;
+
         if (ffmpeg is { HasExited: false } process)
         {
             try { process.Kill(entireProcessTree: true); process.WaitForExit(3000); }
@@ -380,8 +469,8 @@ internal sealed class LinuxAudioPipeline : IDisposable
     }
 
     /// <summary>
-    /// The ffmpeg process died on its own -- suspend/resume, a PipeWire restart. Wait out the
-    /// backoff and rebuild on the ended drain thread; repeated failures back off 2 s, 4 s, 8 s
+    /// The audio pipeline ended on its own -- suspend/resume, a PipeWire restart. Wait out the
+    /// backoff and rebuild; repeated failures back off 2 s, 4 s, 8 s
     /// and hold at 10 s until the sound server is really back.
     /// </summary>
     private void HandlePipelineEnd(string reason)
@@ -398,7 +487,7 @@ internal sealed class LinuxAudioPipeline : IDisposable
             return;
 
         KillFfmpeg();
-        if (StartFfmpegPipeline(withMic: startMicSource is not null))
+        if (StartPipeline())
             Console.WriteLine("Audio: the capture pipeline is back.");
         else
             Console.WriteLine("Audio: the restart failed; the next drain end retries with a longer backoff.");
@@ -420,7 +509,7 @@ internal sealed class LinuxAudioPipeline : IDisposable
                     // Data flows again: this pipeline lives, reset the restart backoff.
                     Interlocked.Exchange(ref restartAttempts, 0);
                     var arrival = stopwatch.Elapsed.TotalSeconds;
-                    parser.Append(buffer.AsSpan(0, read), arrival, (frame, length, captureSeconds) =>
+                    parser.Append(buffer.AsSpan(0, read), arrival, (frame, captureSeconds) =>
                     {
                         // The timeline anchor is the first frame's arrival; every later frame is
                         // placed by its ordinal, never by its arrival time.
@@ -430,10 +519,8 @@ internal sealed class LinuxAudioPipeline : IDisposable
                         var k = Interlocked.Increment(ref framesIn) - 1;
                         var time = anchorSeconds + k * SamplesPerFrame / (double)SampleRate;
 
-                        var rented = ArrayPool<byte>.Shared.Rent(length);
-                        frame.AsSpan(0, length).CopyTo(rented);
                         // ADTS frames are self-contained: every packet is a keyframe.
-                        target.Push(rented, length, time, isKeyframe: true);
+                        target.Push(frame, time, isKeyframe: true);
                     });
                 }
                 if (read == 0)

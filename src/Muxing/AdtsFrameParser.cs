@@ -1,5 +1,8 @@
 namespace Clippy;
 
+/// <summary>Handler for ADTS audio frames emitted as ReadOnlySpan without allocating a temporary byte array.</summary>
+internal delegate void AdtsSpanHandler(ReadOnlySpan<byte> frame, double captureSeconds);
+
 /// <summary>Splits a raw ADTS (raw AAC) byte stream into individual frames.</summary>
 internal sealed class AdtsFrameParser
 {
@@ -8,10 +11,10 @@ internal sealed class AdtsFrameParser
     private int searchFrom;
 
     /// <summary>
-    /// Feeds a chunk of stdout bytes and emits every frame that became complete. The capture clock is
-    /// stamped on arrival here, so it is independent of anything ffmpeg did to the stream.
+    /// Feeds a chunk of stdout bytes and emits every frame that became complete directly as a ReadOnlySpan.
+    /// The capture clock is stamped on arrival here, so it is independent of anything ffmpeg did to the stream.
     /// </summary>
-    public void Append(ReadOnlySpan<byte> data, double captureSeconds, Action<byte[], int, double> emit)
+    public void Append(ReadOnlySpan<byte> data, double captureSeconds, AdtsSpanHandler emit)
     {
         EnsureCapacity(pendingLength + data.Length);
         data.CopyTo(pending.AsSpan(pendingLength));
@@ -50,9 +53,7 @@ internal sealed class AdtsFrameParser
                 return;
             }
 
-            var copy = new byte[length];
-            Buffer.BlockCopy(pending, sync, copy, 0, length);
-            emit(copy, length, captureSeconds);
+            emit(pending.AsSpan(sync, length), captureSeconds);
 
             var remaining = pendingLength - (sync + length);
             Buffer.BlockCopy(pending, sync + length, pending, 0, remaining);
@@ -60,6 +61,9 @@ internal sealed class AdtsFrameParser
             searchFrom = 0;
         }
     }
+
+    public void Append(ReadOnlySpan<byte> data, double captureSeconds, Action<byte[], int, double> emit)
+        => Append(data, captureSeconds, (frame, t) => emit(frame.ToArray(), frame.Length, t));
 
     private int FindSyncWord(int from)
     {

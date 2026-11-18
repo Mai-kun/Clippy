@@ -21,6 +21,7 @@ mkdir -p "$APP_DIR" "$BIN_DIR"
 # The binary and the shipped files. User data (config.json, portal_token.txt,
 # clips/, logs/) is never touched: an update is a copy over it.
 install -m 755 "$SRC_DIR/Clippy" "$APP_DIR/Clippy"
+[ -f "$SRC_DIR/libclippy_linux.so" ] && install -m 755 "$SRC_DIR/libclippy_linux.so" "$APP_DIR/libclippy_linux.so" || true
 [ -f "$SRC_DIR/config.example.json" ] && install -m 644 "$SRC_DIR/config.example.json" "$APP_DIR/config.example.json" || true
 [ -f "$SRC_DIR/uninstall.sh" ] && install -m 755 "$SRC_DIR/uninstall.sh" "$APP_DIR/uninstall.sh" || true
 

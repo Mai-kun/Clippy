@@ -1,0 +1,13 @@
+[package]
+name = "clippy_linux"
+version = "1.7.0"
+edition = "2021"
+
+[lib]
+name = "clippy_linux"
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.1"

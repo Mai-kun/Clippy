@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -93,8 +94,9 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     // device delivers.
     private readonly long frameDuration100ns;
 
-    private readonly BlockingCollection<(byte[] Pcm, long Qpc)> queue =
-        new(new ConcurrentQueue<(byte[], long)>());
+    private readonly BlockingCollection<(byte[] Pcm, int Length, long Qpc)> queue =
+        new(new ConcurrentQueue<(byte[], int, long)>());
+    private readonly ConcurrentStack<byte[]> bufferPool = new();
     private readonly object gate = new();
     private Thread? worker;
     private volatile bool running;
@@ -156,7 +158,7 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     public bool WaitForReady(TimeSpan timeout) => true;
 
     /// <summary>Queues one buffer. Never blocks: the WASAPI callback must not stall on a codec.</summary>
-    public void Write(byte[] samples, long qpcPosition)
+    public void Write(ReadOnlySpan<byte> samples, long qpcPosition)
     {
         if (disposed)
             return;
@@ -179,14 +181,24 @@ internal sealed class MfAudioEncoder : IAudioEncoder
         }
 
         queuedSamples += samples.Length / (sourceChannels * SourceBytesPerSample);
-        if (!queue.TryAdd((samples, qpcPosition)))
+
+        if (!bufferPool.TryPop(out var buf) || buf.Length < samples.Length)
+            buf = new byte[Math.Max(samples.Length, 16384)];
+
+        samples.CopyTo(buf);
+
+        if (!queue.TryAdd((buf, samples.Length, qpcPosition)))
         {
             droppedSamples += samples.Length / (sourceChannels * SourceBytesPerSample);
+            if (bufferPool.Count < 32)
+                bufferPool.Push(buf);
             return;
         }
 
         buffersWritten++;
     }
+
+    public void Write(byte[] samples, long qpcPosition) => Write(samples.AsSpan(), qpcPosition);
 
     /// <summary>
     /// Finds, configures and returns a ready encoder. Throws with a specific reason when this machine
@@ -326,17 +338,20 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     {
         var carry = new byte[FrameBytes];
         var carryLength = 0;
+        var conversionBuffer = new byte[65536];
 
         while (running || !queue.IsCompleted)
         {
             if (!queue.TryTake(out var item, running ? 200 : 0))
                 continue;
 
-            var pcm = ToInt16(item.Pcm, carry, ref carryLength, out var frames);
+            var pcm = ToInt16(item.Pcm.AsSpan(0, item.Length), carry, ref carryLength, ref conversionBuffer, out var frames);
+            if (bufferPool.Count < 32)
+                bufferPool.Push(item.Pcm);
 
             for (var f = 0; f < frames; f++)
             {
-                if (!Feed(pcm.AsSpan(f * FrameBytes, FrameBytes)))
+                if (!Feed(pcm.Slice(f * FrameBytes, FrameBytes)))
                 {
                     Console.WriteLine("[mft] encoder stopped accepting input; abandoning the rest of the queue");
                     running = false;
@@ -351,8 +366,11 @@ internal sealed class MfAudioEncoder : IAudioEncoder
         // stopping early here would silently cut the tail of every recording.
         while (queue.TryTake(out var item))
         {
-            var pcm = ToInt16(item.Pcm, carry, ref carryLength, out var frames);
-            for (var f = 0; f < frames && Feed(pcm.AsSpan(f * FrameBytes, FrameBytes)); f++)
+            var pcm = ToInt16(item.Pcm.AsSpan(0, item.Length), carry, ref carryLength, ref conversionBuffer, out var frames);
+            if (bufferPool.Count < 32)
+                bufferPool.Push(item.Pcm);
+
+            for (var f = 0; f < frames && Feed(pcm.Slice(f * FrameBytes, FrameBytes)); f++)
                 DrainOutput();
         }
 
@@ -378,13 +396,16 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     /// packet at 48 kHz, so 2.13 packets per frame). Feeding only whole frames is what keeps the
     /// ordinal arithmetic exact -- and therefore the A/V alignment exact.
     /// </summary>
-    private byte[] ToInt16(byte[] source, byte[] carry, ref int carryLength, out int frames)
+    private ReadOnlySpan<byte> ToInt16(ReadOnlySpan<byte> source, byte[] carry, ref int carryLength, ref byte[] targetBuffer, out int frames)
     {
         // float32 is 4 bytes per sample, 16-bit integer is 2, packed 24-bit is 3 and 24-in-32 is 4.
         var bytesPerSample = SourceBytesPerSample;
         var inputFrames = source.Length / (bytesPerSample * sourceChannels);
-        var target = new byte[carryLength + inputFrames * OutputBytesPerFrame];
-        Buffer.BlockCopy(carry, 0, target, 0, carryLength);
+        var needed = carryLength + inputFrames * OutputBytesPerFrame;
+        if (targetBuffer.Length < needed)
+            Array.Resize(ref targetBuffer, Math.Max(targetBuffer.Length * 2, needed));
+
+        Buffer.BlockCopy(carry, 0, targetBuffer, 0, carryLength);
 
         if (!sourceIsFloat && sourceChannels == Channels)
         {
@@ -392,7 +413,7 @@ internal sealed class MfAudioEncoder : IAudioEncoder
             {
                 // Stereo 16-bit integer already IS the target format; copying it bit-exact beats a
                 // round-trip through float, which would shave an LSB off positive full-scale samples.
-                Buffer.BlockCopy(source, 0, target, carryLength, inputFrames * OutputBytesPerFrame);
+                source.Slice(0, inputFrames * OutputBytesPerFrame).CopyTo(targetBuffer.AsSpan(carryLength));
             }
             else
             {
@@ -401,8 +422,8 @@ internal sealed class MfAudioEncoder : IAudioEncoder
                 {
                     var src = f * bytesPerSample * sourceChannels;
                     var dst = carryLength + f * OutputBytesPerFrame;
-                    WriteS16(target, dst, ReadTop16(source, src));
-                    WriteS16(target, dst + 2, ReadTop16(source, src + bytesPerSample));
+                    WriteS16(targetBuffer, dst, ReadTop16(source, src));
+                    WriteS16(targetBuffer, dst + 2, ReadTop16(source, src + bytesPerSample));
                 }
             }
         }
@@ -413,18 +434,18 @@ internal sealed class MfAudioEncoder : IAudioEncoder
                 MixFrameToStereo(source, f * bytesPerSample * sourceChannels, bytesPerSample,
                     out var left, out var right);
                 var offset = carryLength + f * OutputBytesPerFrame;
-                WriteS16(target, offset, left);
-                WriteS16(target, offset + 2, right);
+                WriteS16(targetBuffer, offset, left);
+                WriteS16(targetBuffer, offset + 2, right);
             }
         }
 
         // The tail that does not make a whole frame stays for the next call.
-        frames = target.Length / FrameBytes;
-        carryLength = target.Length - (frames * FrameBytes);
+        frames = needed / FrameBytes;
+        carryLength = needed - (frames * FrameBytes);
         if (carryLength > 0)
-            Buffer.BlockCopy(target, frames * FrameBytes, carry, 0, carryLength);
+            Buffer.BlockCopy(targetBuffer, frames * FrameBytes, carry, 0, carryLength);
 
-        return target;
+        return targetBuffer.AsSpan(0, needed);
     }
 
     /// <summary>
@@ -434,7 +455,7 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     /// ITU/SMPTE downmix attenuation so full-scale summing cannot clip the pair. Mono is duplicated
     /// rather than attenuated: a single channel is meant to be heard on both sides at its own level.
     /// </summary>
-    private void MixFrameToStereo(byte[] source, int offset, int bytesPerSample,
+    private void MixFrameToStereo(ReadOnlySpan<byte> source, int offset, int bytesPerSample,
         out float left, out float right)
     {
         if (sourceChannels == 1)
@@ -479,22 +500,22 @@ internal sealed class MfAudioEncoder : IAudioEncoder
     /// bytes 1 (low) and 2 (high, holding the sign bit); 24 valid bits in a 32-bit container live in
     /// bytes 2 and 3, because WAVEFORMATEXTENSIBLE aligns the valid bits to the most significant end.
     /// </summary>
-    private short ReadTop16(byte[] source, int offset)
+    private short ReadTop16(ReadOnlySpan<byte> source, int offset)
     {
         if (sourceValidBits == 16)
-            return BitConverter.ToInt16(source, offset);
+            return BinaryPrimitives.ReadInt16LittleEndian(source.Slice(offset));
         if (sourceBytesPerSample == 3)
             return (short)(source[offset + 1] | (source[offset + 2] << 8));
         return (short)(source[offset + 2] | (source[offset + 3] << 8));
     }
 
     /// <summary>One source sample as [-1, 1), for the downmix sum.</summary>
-    private float ReadNormalized(byte[] source, int offset)
+    private float ReadNormalized(ReadOnlySpan<byte> source, int offset)
     {
         if (sourceIsFloat)
-            return BitConverter.ToSingle(source, offset);
+            return BinaryPrimitives.ReadSingleLittleEndian(source.Slice(offset));
         if (sourceValidBits == 16)
-            return BitConverter.ToInt16(source, offset) / 32768f;
+            return BinaryPrimitives.ReadInt16LittleEndian(source.Slice(offset)) / 32768f;
 
         int value;
         if (sourceBytesPerSample == 3)
@@ -543,7 +564,10 @@ internal sealed class MfAudioEncoder : IAudioEncoder
         using var sample = MediaFactory.MFCreateSample();
         using var buffer = MediaFactory.MFCreateMemoryBuffer(pcm.Length);
         buffer.Lock(out var dst, out _, out _);
-        Marshal.Copy(pcm.ToArray(), 0, dst, pcm.Length);
+        unsafe
+        {
+            pcm.CopyTo(new Span<byte>((void*)dst, pcm.Length));
+        }
         buffer.Unlock();
         buffer.CurrentLength = pcm.Length;
         sample.AddBuffer(buffer);
@@ -590,16 +614,21 @@ internal sealed class MfAudioEncoder : IAudioEncoder
 
         using var contiguous = sample.ConvertToContiguousBuffer();
         contiguous.Lock(out var src, out _, out var length);
-        var adts = new byte[length];
-        Marshal.Copy(src, adts, 0, length);
-        contiguous.Unlock();
-
-        var target = ring;
-        if (target is not null)
+        try
         {
-            var rented = ArrayPool<byte>.Shared.Rent(length);
-            adts.CopyTo(rented, 0);
-            target.Push(rented, length, NextFrameTime(), isKeyframe: true);
+            var target = ring;
+            if (target is not null)
+            {
+                unsafe
+                {
+                    var adtsSpan = new ReadOnlySpan<byte>((void*)src, length);
+                    target.Push(adtsSpan, NextFrameTime(), isKeyframe: true);
+                }
+            }
+        }
+        finally
+        {
+            contiguous.Unlock();
         }
 
         return true;

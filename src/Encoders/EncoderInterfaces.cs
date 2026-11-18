@@ -71,6 +71,8 @@ internal interface IVideoEncoder : IDisposable
 internal interface IAudioEncoder : IDisposable
 {
     /// <summary>PCM samples for the moment identified by <paramref name="qpcPosition"/>.</summary>
+    void Write(ReadOnlySpan<byte> samples, long qpcPosition);
+
     void Write(byte[] samples, long qpcPosition);
 
     void StartDrain(RingBuffer target);

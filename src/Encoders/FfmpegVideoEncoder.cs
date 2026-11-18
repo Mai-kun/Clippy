@@ -452,23 +452,23 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
         Console.WriteLine($"[sync] video drain thread start at {clock.Elapsed.TotalSeconds:F3}s");
     }
 
-    private void Push(byte[] data, int length, bool isIdr, double readClockSeconds)
+    private void Push(ReadOnlySpan<byte> data, bool isIdr, double readClockSeconds)
     {
         var type = data[0] & 0x1F;
         if (type == 7)
         {
             if (sps is null)
             {
-                sps = data;
-                Console.WriteLine($"[params] first SPS seen at {readClockSeconds:R} ({length} bytes)");
+                sps = data.ToArray();
+                Console.WriteLine($"[params] first SPS seen at {readClockSeconds:R} ({data.Length} bytes)");
             }
         }
         else if (type == 8)
         {
             if (pps is null)
             {
-                pps = data;
-                Console.WriteLine($"[params] first PPS seen at {readClockSeconds:R} ({length} bytes)");
+                pps = data.ToArray();
+                Console.WriteLine($"[params] first PPS seen at {readClockSeconds:R} ({data.Length} bytes)");
             }
         }
 
@@ -496,9 +496,7 @@ internal sealed class FfmpegVideoEncoder : IVideoEncoder
             }
         }
 
-        var rented = ArrayPool<byte>.Shared.Rent(length);
-        data.CopyTo(rented, 0);
-        ring!.Push(rented, length, captureSeconds, isIdr);
+        ring!.Push(data, captureSeconds, isIdr);
     }
 
     /// <summary>Parameter sets captured from the live stream, needed for the muxer avcC box.</summary>

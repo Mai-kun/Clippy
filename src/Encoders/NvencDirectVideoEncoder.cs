@@ -22,9 +22,6 @@ namespace Clippy;
 /// </remarks>
 internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
 {
-    /// <summary>One encoded frame, in the worst case, for 4K at a high bitrate.</summary>
-    private const int MaxFrameBytes = 16 * 1024 * 1024;
-
     private void* context;
     private readonly bool hevc;
     private readonly AnnexBParser parser;
@@ -41,14 +38,15 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
     private int accessUnitCount;
     private bool disposed;
 
-    // Reused across frames so that a GC pause never lands inside the encode the timing is measured
-    // on, and so that a 4K frame does not allocate 16 MB sixty times a second.
-    private readonly byte[] frameBytes = new byte[MaxFrameBytes];
+    // Dynamically sized according to frame resolution, avoiding a static 16 MB allocation.
+    // Reused across frames to eliminate per-frame GC pauses.
+    private byte[] frameBytes;
 
-    private NvencDirectVideoEncoder(void* ctx, bool hevc)
+    private NvencDirectVideoEncoder(void* ctx, bool hevc, int width, int height)
     {
         context = ctx;
         this.hevc = hevc;
+        frameBytes = new byte[Math.Clamp(width * height, 2 * 1024 * 1024, 16 * 1024 * 1024)];
         // The parser needs the codec up front: H.264 and HEVC frame the stream identically and
         // differ only in the NAL header, so one flag here decides how every later byte is read.
         parser = new AnnexBParser(hevc);
@@ -101,7 +99,7 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
             return null;
         }
 
-        var encoder = new NvencDirectVideoEncoder(ctx, hevc);
+        var encoder = new NvencDirectVideoEncoder(ctx, hevc, width, height);
         encoder.ReadParameterSets();
         Console.WriteLine($"[nvenc-direct] NVENC session open at {width}x{height} @ {fps}fps, " +
                           $"{bitrateBps / 1_000_000} Mbit/s, codec {(hevc ? "HEVC (H.265)" : "H.264")}. " +
@@ -147,25 +145,25 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
     /// 7 and 8; HEVC uses 32, 33 and 34, and all three are needed -- a container missing the VPS is
     /// one players reject.
     /// </summary>
-    private void CaptureParameterSet(byte[] nal, int length, bool _, double __)
+    private void CaptureParameterSet(ReadOnlySpan<byte> nal, bool _, double __)
     {
         var type = NalType(nal);
         if (hevc)
         {
             if (type == HevcNal.Vps && vps is null)
-                vps = nal;
+                vps = nal.ToArray();
             else if (type == HevcNal.Sps && sps is null)
-                sps = nal;
+                sps = nal.ToArray();
             else if (type == HevcNal.Pps && pps is null)
-                pps = nal;
+                pps = nal.ToArray();
         }
         else if (type == 7 && sps is null)
         {
-            sps = nal;
+            sps = nal.ToArray();
         }
         else if (type == 8 && pps is null)
         {
-            pps = nal;
+            pps = nal.ToArray();
         }
     }
 
@@ -211,11 +209,23 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
 
         int isKey = 0;
         int written;
-        fixed (byte* dst = frameBytes)
+        while (true)
         {
-            long ts = (long)(captureSeconds * 10_000_000.0);
-            written = NvencNative.Encode(context, (void*)texture.NativePointer, ts,
-                                         dst, frameBytes.Length, &isKey);
+            fixed (byte* dst = frameBytes)
+            {
+                long ts = (long)(captureSeconds * 10_000_000.0);
+                written = NvencNative.Encode(context, (void*)texture.NativePointer, ts,
+                                             dst, frameBytes.Length, &isKey);
+            }
+
+            if (written == 0 && NvencNative.ErrorText.Contains("does not fit") && frameBytes.Length < 16 * 1024 * 1024)
+            {
+                var newSize = Math.Min(frameBytes.Length * 2, 16 * 1024 * 1024);
+                Console.WriteLine($"[nvenc-direct] reallocating frameBytes from {frameBytes.Length} to {newSize} bytes");
+                frameBytes = new byte[newSize];
+                continue;
+            }
+            break;
         }
 
         if (written < 0)
@@ -245,10 +255,10 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
     }
 
     /// <summary>One NAL unit leaving the parser.</summary>
-    private void Push(byte[] data, int length, bool isIdr, double parserTime)
+    private void Push(ReadOnlySpan<byte> data, bool isIdr, double parserTime)
     {
         var type = NalType(data);
-        CaptureParameterSet(data, length, isIdr, parserTime);
+        CaptureParameterSet(data, isIdr, parserTime);
 
         // Only a picture NAL is a picture, so only a picture NAL consumes a capture time. Parameter
         // sets and SEI travel with whatever picture follows them and must not shift the timeline --
@@ -271,9 +281,7 @@ internal sealed unsafe class NvencDirectVideoEncoder : IVideoEncoder
             }
         }
 
-        var rented = ArrayPool<byte>.Shared.Rent(length);
-        data.CopyTo(rented, 0);
-        ring!.Push(rented, length, captureSeconds, isIdr);
+        ring!.Push(data, captureSeconds, isIdr);
     }
 
     public void EnqueueCaptureTime(double captureClockSeconds)
