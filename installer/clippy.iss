@@ -39,6 +39,12 @@ WizardStyle=modern
 ; and a UAC prompt is the fastest way to make a user distrust an unsigned installer.
 PrivilegesRequired=lowest
 
+; Task selections (autostart, desktopicon) are re-read from the previous install on every
+; update, INCLUDING the silent /VERYSILENT ones the updater runs -- this is Inno's default, kept
+; here as a promise: a user who unticked autostart must not have it silently re-created by an
+; update, and one who ticked the desktop icon must not have it silently deleted.
+UsePreviousTasks=yes
+
 ; The whole point of the silent-update path: a running Clippy.exe is locked, so the installer has to
 ; be able to ask Windows to close it. Restart Manager does this for us.
 CloseApplications=yes
@@ -60,11 +66,14 @@ Name: "autostart"; Description: "Запускать {#AppName} при старт
 Name: "desktopicon"; Description: "Создать значок на рабочем столе"; GroupDescription: "Дополнительно:"; Flags: unchecked
 
 [InstallDelete]
-; Clean up legacy/test files from previous versions during upgrade:
+; Clean up legacy/test files from previous versions during upgrade. ffmpeg.exe is deliberately
+; NOT on this list: releases stopped shipping it, but an installed copy from a release that did
+; ship it still runs its ffmpeg-encoder options (h264_nvenc via ffmpeg, CPU libx264) through the
+; bundled exe -- deleting it on update silently broke those options for every updating user
+; (FfmpegLocator then falls back to a bare "ffmpeg" that may not exist on PATH).
 Type: files; Name: "{app}\mp4-selftest-*"
 Type: filesandordirs; Name: "{app}\Tests"
 Type: files; Name: "{app}\clippy-error.log"
-Type: files; Name: "{app}\ffmpeg.exe"
 
 [Files]
 ; One entry with a wildcard, not a hand-kept list: the publish folder is the definition of what ships,

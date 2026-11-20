@@ -40,16 +40,32 @@ internal static class LinuxDesktopIntegration
             var exePath = Environment.ProcessPath ?? AppContext.BaseDirectory;
 
             // Re-write when the Exec line no longer points at this binary: the exe moved, or an
-            // older install left a stale path behind.
+            // older install left a stale path behind. A copy launched from an arbitrary folder
+            // (an unpacked tarball, a build tree) must NOT steal the entry, though: Exec would
+            // start pointing at the stray location, and the portal identity and the tray icon
+            // would follow it. So the Exec line follows only the canonical install location --
+            // where install.sh puts it, and what the systemd unit and ~/.local/bin/clippy point
+            // at -- or a target that no longer exists (a stale entry nothing else can fix).
+            var canonicalDir = Path.Combine(home, ".local", "share", "Clippy");
+            var mayClaimEntry = exePath.StartsWith(canonicalDir + Path.DirectorySeparatorChar, StringComparison.Ordinal);
             var needsWrite = true;
             if (File.Exists(desktopPath))
             {
                 foreach (var line in File.ReadAllLines(desktopPath))
                 {
-                    if (line.StartsWith("Exec=", StringComparison.Ordinal) &&
-                        line[5..].Trim().Trim('"') == exePath)
+                    if (line.StartsWith("Exec=", StringComparison.Ordinal))
                     {
-                        needsWrite = false;
+                        var current = line[5..].Trim().Trim('"');
+                        if (current == exePath)
+                        {
+                            needsWrite = false;
+                        }
+                        else if (File.Exists(current) && !mayClaimEntry)
+                        {
+                            // The entry works, the running copy is not the canonical install:
+                            // leave it alone.
+                            needsWrite = false;
+                        }
                         break;
                     }
                 }
@@ -250,7 +266,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory={appDir}
-ExecStart={exePath}
+ExecStart=""{exePath}""
 Restart=on-failure
 RestartSec=3
 
@@ -264,7 +280,7 @@ WantedBy=graphical-session.target default.target
 [Desktop Entry]
 Type=Application
 Name=Clippy
-Exec={exePath}
+Exec=""{exePath}""
 Icon=clippy
 Terminal=false
 X-GNOME-Autostart-enabled=true

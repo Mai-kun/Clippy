@@ -43,6 +43,42 @@ internal static partial class LinuxSingleInstance
         return true;
     }
 
+    /// <summary>
+    /// Gives the lock up early. The restart and update flows start their replacement while this
+    /// process is still alive, and the replacement must not read "already running" from its own
+    /// predecessor: the fd is closed, so the kernel drops the flock immediately, while this
+    /// process keeps running (and recording) for the seconds its shutdown still takes. Releasing
+    /// a lock this process never held is a no-op, which is what the fail-open case lands at.
+    /// </summary>
+    public static void Release()
+    {
+        var fd = Interlocked.Exchange(ref lockFd, -1);
+        if (fd >= 0)
+            close(fd);
+    }
+
+    /// <summary>
+    /// TryAcquire with patience, for handoffs. A restart or an update hands recording from one
+    /// process to the next: the replacement is started while the old one still holds the lock
+    /// and is walking its own shutdown. Waiting up to <paramref name="timeout"/> here turns that
+    /// handover from a mutual kill (the replacement exits "already running", the old process
+    /// exits, nothing is left) into a pause. A genuine second launch simply waits the same short
+    /// window and then reports the running recorder exactly as before; TimeSpan.Zero is a single
+    /// non-blocking attempt.
+    /// </summary>
+    public static bool TryAcquireWithTimeout(TimeSpan timeout)
+    {
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        while (true)
+        {
+            if (TryAcquire())
+                return true;
+            if (Environment.TickCount64 >= deadline)
+                return false;
+            Thread.Sleep(100);
+        }
+    }
+
     [LibraryImport("libc", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     private static partial int open(string path, int flags, uint mode);
 

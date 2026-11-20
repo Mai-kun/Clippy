@@ -35,12 +35,15 @@ esac
 # Menu entry (the app itself generates the icon into the hicolor theme on
 # its first run and rewrites this file with the exact binary path).
 mkdir -p "$HOME/.local/share/applications"
+# Exec is quoted per the desktop-entry spec: a $HOME with spaces must not break
+# the entry the way an unquoted path would. The app's own EnsureDesktopFile
+# trims the quotes when comparing, so both writers agree on the same file.
 cat > "$HOME/.local/share/applications/clippy.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Clippy
 Comment=Instant replay recorder
-Exec=$APP_DIR/Clippy
+Exec="$APP_DIR/Clippy"
 Icon=clippy
 Terminal=false
 Categories=Utility;AudioVideo;Recorder;
@@ -64,7 +67,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=$APP_DIR
-ExecStart=$APP_DIR/Clippy
+ExecStart="$APP_DIR/Clippy"
 Restart=on-failure
 RestartSec=3
 
@@ -87,7 +90,7 @@ else
 [Desktop Entry]
 Type=Application
 Name=Clippy
-Exec=$APP_DIR/Clippy
+Exec="$APP_DIR/Clippy"
 Icon=clippy
 Terminal=false
 X-GNOME-Autostart-enabled=true
@@ -96,8 +99,10 @@ AUTOSTART
 fi
 
 # Global hotkeys through evdev need the input group; without it the recorder
-# still works, just without direct F8/F9 capture.
-if ! id -nG "$USER" | grep -qw input; then
+# still works, just without direct F8/F9 capture. No argument to id: the calling
+# user is the default, and $USER is not guaranteed to exist (set -u makes a bare
+# reference an error -- seen as "USER: unbound variable" in a clean env).
+if ! id -nG | grep -qw input; then
     cat <<HINT
 
 NOTE: for the global F8/F9 hotkeys through evdev, add yourself to the input group:

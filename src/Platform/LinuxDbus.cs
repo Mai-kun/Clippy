@@ -590,6 +590,19 @@ internal sealed partial class LinuxDbus : IDisposable
         Func<DbusReader, byte[]> handler, string? replySignature = null) =>
         handlers[(path, interfaceName, member)] = (handler, replySignature);
 
+    private readonly Dictionary<(string Interface, string Member), Action<DbusReader>> signalHandlers = [];
+
+    /// <summary>
+    /// Registers a signal handler, routed by INTERFACE and MEMBER -- the path takes no part
+    /// (signals carry one, but the ones this program waits on sit at fixed well-known paths) and
+    /// the sender does not either. The handler runs on the dispatch thread, which is exactly what
+    /// makes a synchronous Call inside it safe: the loop that would otherwise read the socket is
+    /// blocked in this handler for its duration, so the reply cannot be eaten by anyone else.
+    /// A handler must not throw; the dispatch loop guards anyway.
+    /// </summary>
+    public void AddSignalHandler(string interfaceName, string member, Action<DbusReader> handler) =>
+        signalHandlers[(interfaceName, member)] = handler;
+
     /// <summary>
     /// Serves incoming method calls until Dispose. Runs on its own thread: a tray handler that
     /// takes seconds (an export) must not stall anything else, and nothing else shares this
@@ -619,6 +632,27 @@ internal sealed partial class LinuxDbus : IDisposable
                         ? $"Tray: stopped serving ({ex.GetType().Name}: {ex.Message})."
                         : "Tray: shut down cleanly.");
                     return; // the session bus is gone; the tray has nowhere to live
+                }
+
+                if (message.Type == MessageTypeSignal)
+                {
+                    // Match rules the client AddMatch'ed route signals here; without a handler
+                    // they are dropped, exactly as before. Handlers run inline: a re-registration
+                    // that answers a watcher restart issues its calls from this thread.
+                    if (signalHandlers.TryGetValue((message.Interface, message.Member), out var signal))
+                    {
+                        try
+                        {
+                            signal(new DbusReader(message.Body));
+                        }
+                        catch (Exception ex)
+                        {
+                            // A dead handler must not take the dispatch thread -- and with it the
+                            // whole tray menu -- down with it.
+                            Console.WriteLine($"Tray: signal handler for {message.Interface}.{message.Member} failed ({ex.GetType().Name}: {ex.Message}).");
+                        }
+                    }
+                    continue;
                 }
 
                 if (message.Type != MessageTypeMethodCall)

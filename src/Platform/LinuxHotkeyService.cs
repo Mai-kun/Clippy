@@ -525,24 +525,49 @@ internal sealed partial class LinuxHotkeyService : IDisposable
 
     private void StartX11()
     {
-        try
+        // X11 is the capture that comes up LAST in a boot race: XWayland (or the whole X server)
+        // may not be listening yet, and DISPLAY may not have been imported into this process's
+        // environment at all. A one-shot XOpenDisplay turned that race into a session-long loss
+        // of the X11 grab path, so the connection attempt retries in the background until a
+        // display answers; the portal and evdev captures run meanwhile, exactly as before.
+        x11Thread = new Thread(X11ConnectLoop) { IsBackground = true, Name = "clippy-x11-keys" };
+        x11Thread.Start();
+    }
+
+    /// <summary>
+    /// Retries XOpenDisplay until a display answers, then runs the grab loop on this thread.
+    /// libX11 being entirely absent stays the permanent verdict it always was -- no amount of
+    /// retrying loads a library that is not installed -- while a missing display is retried
+    /// every couple of seconds for the whole run.
+    /// </summary>
+    private void X11ConnectLoop()
+    {
+        var announced = false;
+        while (!stopped)
         {
-            xDisplay = XOpenDisplay(null);
-        }
-        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
-        {
-            Console.WriteLine("Hotkeys: libX11 is not available; the X11 grab capture is off (the portal and evdev still work).");
-            xDisplay = 0;
-        }
-        if (xDisplay == 0)
-        {
-            if (x11Thread is null)
-                Console.WriteLine("Hotkeys: no X display; the X11 grab capture is off (the portal and evdev still work).");
-            return;
+            try
+            {
+                xDisplay = LinuxX11.TryOpenDisplay();
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+            {
+                Console.WriteLine("Hotkeys: libX11 is not available; the X11 grab capture is off (the portal and evdev still work).");
+                return;
+            }
+            if (xDisplay != 0)
+                break;
+
+            if (!announced)
+            {
+                announced = true;
+                Console.WriteLine("Hotkeys: no X display yet; the X11 grab capture will start when one appears (the portal and evdev still work).");
+            }
+            Thread.Sleep(2000);
         }
 
-        x11Thread = new Thread(X11Loop) { IsBackground = true, Name = "clippy-x11-keys" };
-        x11Thread.Start();
+        if (stopped)
+            return;
+        X11Loop();
     }
 
     private unsafe void X11Loop()
@@ -701,9 +726,6 @@ internal sealed partial class LinuxHotkeyService : IDisposable
         Interlocked.Increment(ref xErrorCount);
         return 0; // handled: the protocol continues, the failed grab simply is not ours
     }
-
-    [LibraryImport("libX11.so.6", StringMarshalling = StringMarshalling.Utf8, SetLastError = false)]
-    private static partial nint XOpenDisplay(string? name);
 
     [LibraryImport("libX11.so.6")]
     private static partial nint XDefaultRootWindow(nint display);
