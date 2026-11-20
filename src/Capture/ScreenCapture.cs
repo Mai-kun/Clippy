@@ -50,9 +50,6 @@ internal sealed partial class ScreenCapture : IDisposable
     // Video mode: ffmpeg is started lazily on the first frame, when the true capture size is known.
     // ffmpeg stamps frames on read, so no warm-up buffer and no frame-rate guess are needed.
     private string? videoPath;
-    /// <summary>Set by RunVideo when --tray is active, so ExportClip can raise a system notification
-    /// without ScreenCapture taking a dependency on the tray's lifetime.</summary>
-    public Action<string, string>? notify;
 
     /// <summary>The tray, when one was created, so Capture can wire up the live hotkey rebind.</summary>
     public TrayIcon? tray;
@@ -74,6 +71,13 @@ internal sealed partial class ScreenCapture : IDisposable
     /// the config the recorder reads when it opens the device; after that it switches in place.
     /// </summary>
     public void SwitchAudioDevice(string deviceIdOrName) => audio?.SwitchDevice(deviceIdOrName);
+
+    /// <summary>
+    /// The --updated announcement: the summary of what changed travels in the marker file the
+    /// apply wrote before the restart; a missing one degrades to the generic card.
+    /// </summary>
+    private static void AnnounceUpdateCompleted() =>
+        NotificationCenter.UpdateCompletedFromMarker(UpdateService.CurrentVersion);
 
     /// <summary>
     /// Writes the last <paramref name="durationSeconds"/> still held in the rings to an MP4 file.
@@ -349,23 +353,10 @@ internal sealed partial class ScreenCapture : IDisposable
 
         // The card says what the player actually wants to know -- how long the clip is and what it
         // cost in disk -- not a technical path they would have to go and read off a file manager.
-        //
-        // Rounded, not truncated: a 30 s clip that the encoder closed at 29.96 s is 30 s to the
-        // player, and "0:29" reads as a clip that came up a second short -- i.e. as a recorder bug,
-        // not as a GOP boundary. AwayFromZero so .5 always goes up, which is the direction a user
-        // complaining about a short clip would expect.
-        var totalSeconds = (int)Math.Round(clipSeconds, MidpointRounding.AwayFromZero);
-        try
-        {
-            notify?.Invoke(
-                "Clip Saved",
-                $"{ClipStamp(totalSeconds)} · {FileMegabytes(path):F1} MB");
-        }
-        catch (Exception ex)
-        {
-            // A notification is never worth failing an export that already wrote its bytes.
-            Console.WriteLine($"Export: notification failed ({ex.GetType().Name}: {ex.Message}).");
-        }
+        // The shared pipeline routes it: overlay card, toast, or nothing per the config, and the
+        // text is the same on Linux. A notification is never worth failing an export that already
+        // wrote its bytes, and ClipSaved already never throws.
+        NotificationCenter.ClipSaved(clipSeconds, FileMegabytes(path));
 
         // After the file exists, not before: a quota check that ran first could delete the clip this
         // export is about to write, if the folder were already at the limit and this clip's name
@@ -761,23 +752,15 @@ internal sealed partial class ScreenCapture : IDisposable
         using var trayIcon = tray ? new TrayIcon(capture.Config, Path.GetDirectoryName(videoPath)!, capture.RequestStop) : null;
         trayIcon?.Start();
 
-        // Route the "clip saved" visual to what the config asked for: the Medal-style overlay card
-        // (its own non-activating window), the now-silent Windows toast, or nothing at all (sound
-        // only). The overlay degrades to the toast if its layered window could not be created, so a
-        // saved clip is never announced by silence. The confirmation SOUND is separate and unchanged.
-        using var overlay = capture.Config.UseOverlayNotification ? new OverlayNotification() : null;
-        overlay?.Start();
-
-        // Wire the "clip saved" visual independent of the tray: the overlay card is its own window and
-        // works even without an icon; only the toast fallback needs the tray to exist.
-        if (overlay is not null && overlay.IsReady)
-            capture.notify = overlay.Show;
-        else if (capture.Config.UseWindowsToastNotification && trayIcon is not null)
-            capture.notify = trayIcon.ShowNotification;
-        else if (capture.Config.UseOverlayNotification && trayIcon is not null)
-            // "overlay" whose window could not be built: fall back to the (now silent) toast so a
-            // saved clip is never announced by nothing but a sound.
-            capture.notify = trayIcon.ShowNotification;
+        // The shared notification pipeline takes over the "where does a payload land" question:
+        // the presenter owns one overlay card (or falls back to the tray balloon) for everything
+        // the run announces -- saved clips, update checks, download progress -- so there is one
+        // card in one place instead of a notification stack. The confirmation SOUND stays at the
+        // export site, where the config is at hand.
+        using var presenter = new WindowsNotificationPresenter(
+            () => capture.Config,
+            (title, message) => trayIcon?.ShowNotification(title, message));
+        NotificationCenter.SetPresenter(presenter);
 
         if (trayIcon is not null)
         {
@@ -788,7 +771,7 @@ internal sealed partial class ScreenCapture : IDisposable
 
             if (updated)
             {
-                trayIcon.ShowNotification("Clippy", $"Program successfully updated to version {UpdateService.CurrentVersion}!");
+                AnnounceUpdateCompleted();
             }
 
             // Fire and forget, deliberately. This is a network call on the way to recording, and a

@@ -144,6 +144,7 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     private LinuxVideoPipeline? video;
     private LinuxAudioPipeline? audio;
     private LinuxTrayIcon? tray;
+    private LinuxNotificationPresenter? presenter;
     private DiskSpooler? videoSpool;
     private DiskSpooler? audioSpool;
     private RingBuffer? videoRing;
@@ -184,10 +185,11 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
 
         // Launched with --updated by the update flow's restart: confirm the new version visibly,
         // even for a Sound Only user -- this is the one notification the update itself owes them.
+        // The summary of what changed travels in the marker file the apply wrote before the
+        // restart; a missing one degrades to the generic card.
         if (options.Updated)
         {
-            LinuxNotifications.ShowStatus(config, "Clippy",
-                $"Updated to version {UpdateService.Version}!", forceVisual: true);
+            NotificationCenter.UpdateCompletedFromMarker(UpdateService.Version);
         }
 
         Console.WriteLine($"Recording [{config.VideoEncoder}] into a hybrid ring: " +
@@ -206,6 +208,12 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
 
         try
         {
+            // The shared notification pipeline, installed before anything can fire an export or an
+            // update flow: one presenter for the whole run, one overlay card for everything it
+            // announces. Unset (and its window torn down) in Dispose.
+            presenter = new LinuxNotificationPresenter(() => config);
+            NotificationCenter.SetPresenter(presenter);
+
             // The tray FIRST: the icon is the one promise the process must always keep, portal or
             // no portal. Exports against a not-yet-started video pipeline answer "nothing to
             // export yet" until the capture wakes up.
@@ -639,19 +647,9 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         if (config.PlaySoundNotification)
             LinuxNotifications.PlayExportSaved(config.CustomSoundPath, Path.GetTempPath());
 
-        // The keyframe snap trims the head (up to one GOP, ~1 s), so the real clip always lands
-        // just UNDER the requested length -- 29.4 s for a 30 s F8. Ceiling reports the duration
-        // that was asked for; rounding would advertise the trimming as a shorter clip.
-        var totalSeconds = (int)Math.Ceiling(clipSeconds);
-        try
-        {
-            LinuxNotifications.ShowClipSaved(config, "Clip Saved",
-                $"{ClipStamp(totalSeconds)} · {FileMegabytes(path):F1} MB");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Export: notification failed ({ex.GetType().Name}: {ex.Message}).");
-        }
+        // The card says what the player actually wants to know -- length and disk cost -- through
+        // the shared pipeline: the same words and the same card as on Windows.
+        NotificationCenter.ClipSaved(clipSeconds, FileMegabytes(path));
 
         // After the file exists, not before: a quota check that ran first could delete the clip
         // this export is about to write.
@@ -687,9 +685,6 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
 
         return Math.Max(videoEnd, audioEnd);
     }
-
-    /// <summary>m:ss for the notification, from a whole-second count rounded to the nearest second.</summary>
-    private static string ClipStamp(int totalSeconds) => $"{totalSeconds / 60}:{totalSeconds % 60:D2}";
 
     private static double FileMegabytes(string path)
     {
@@ -973,6 +968,12 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
     /// same restart the Windows tray performs: the new process launches BEFORE this one stops, so
     /// there is no window where nothing is recording, and the user's own arguments are replayed
     /// verbatim.
+    ///
+    /// The instance lock is the one thing the launch order would otherwise get backwards: the
+    /// replacement boots while this process still holds the lock, and a plain second launch reads
+    /// "already running" from its own predecessor and kills itself -- leaving nothing after this
+    /// process exits. It therefore launches with --restart-handoff (it waits for the lock), and
+    /// the lock is released here as soon as the launch has happened, so the wait is a formality.
     /// </summary>
     void LinuxTrayIcon.IHost.RestartProcess()
     {
@@ -988,7 +989,9 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
             var startInfo = new ProcessStartInfo(exe) { UseShellExecute = false };
             foreach (var argument in Environment.GetCommandLineArgs().Skip(1))
                 startInfo.ArgumentList.Add(argument);
+            startInfo.ArgumentList.Add("--restart-handoff");
             Process.Start(startInfo);
+            LinuxSingleInstance.Release();
             Console.WriteLine("Tray: a new instance was started; this one is shutting down.");
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or InvalidOperationException)
@@ -1008,6 +1011,9 @@ internal sealed partial class LinuxRecorder : IDisposable, LinuxTrayIcon.IHost
         // export still in flight finds the spoolers usable for as long as the encoders could push.
         hotkeys?.Dispose();
         tray?.Dispose();
+        presenter?.Dispose();
+        presenter = null;
+        NotificationCenter.SetPresenter(null);
         tray = null;
         audio?.Dispose();
         audio = null;

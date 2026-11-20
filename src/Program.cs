@@ -36,12 +36,23 @@ if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
 // not kill the first one's IPC socket or wipe its disk spool below. The lock lives on Linux
 // (flock on /tmp/clippy-instance.lock); on Windows the single-instance story is the existing
 // shortcut/installer behaviour and stays as it is.
+//
+// A handoff launch (--updated after an update, --restart-handoff from the tray's Restart) is a
+// different second launch: its own predecessor started it and is STILL ALIVE, holding the lock
+// on its way out. Without patience the replacement kills itself as a duplicate, the predecessor
+// exits behind it, and nothing is left running -- which is exactly the dead-recorder-after-update
+// report. A handoff therefore waits up to 5 s for the lock before believing "already running".
+var handoff = args.Contains("--updated", StringComparer.OrdinalIgnoreCase)
+    || args.Contains("--restart-handoff", StringComparer.OrdinalIgnoreCase);
 #if LINUX
-if (!LinuxSingleInstance.TryAcquire())
+if (!LinuxSingleInstance.TryAcquireWithTimeout(handoff ? TimeSpan.FromSeconds(5) : TimeSpan.Zero))
 {
     Console.WriteLine("Clippy is already running");
-    LinuxNotifications.ShowStatus(ClippyConfig.Load(), "Clippy",
-        "Clippy is already running in the system tray.", forceVisual: true);
+    // The shared pipeline routes it (a toast here -- the second process has no overlay of its
+    // own); ForceVisual so a Sound Only user still learns why nothing started.
+    NotificationCenter.SetPresenter(new LinuxNotificationPresenter(ClippyConfig.Load));
+    NotificationCenter.AlreadyRunning();
+    NotificationCenter.SetPresenter(null);
     return 0;
 }
 #endif
@@ -81,6 +92,7 @@ var isUpdated = args.Contains("--updated", StringComparer.OrdinalIgnoreCase);
 // needs comes from config.json, so the default path is the same one --record builds by hand.
 // If --updated was passed, start normally into the tray and show the update notification.
 var nonOptionArgs = args.Where(a => !a.Equals("--updated", StringComparison.OrdinalIgnoreCase) &&
+                                    !a.Equals("--restart-handoff", StringComparison.OrdinalIgnoreCase) &&
                                     !a.Equals("--console", StringComparison.OrdinalIgnoreCase) &&
                                     !a.Equals("--debug", StringComparison.OrdinalIgnoreCase)).ToArray();
 
@@ -121,13 +133,73 @@ if (args.Contains("--self-update"))
     if (!found.Available)
         return 0;
 
-    await UpdateService.ApplyUpdateAsync(found.DownloadUrl, null);
+    await UpdateService.ApplyUpdateAsync(found.Tag, found.DownloadUrl, found.ReleaseNotes);
     return 0;
 }
 
 if (args.Contains("--test-update"))
 {
     return await UpdateService.RunSelfTest();
+}
+
+// Applies the archive at <path-or-url> (a local file:// path or an HTTP URL) through the same
+// apply path a real update takes, then restarts into it -- the one branch a hand test cannot
+// reach, because CheckForUpdateAsync only ever offers the current GitHub release. The visuals run
+// through the shared pipeline exactly as a real update's would: Checking parks the card, the
+// download sweeps its bar in place, Installing completes it, and the restarted process shows the
+// completed card from the marker the apply left. With no URL the flag becomes the VERIFICATION
+// half: it is what the apply-restart replays, so the process that comes back (same PID, by exec)
+// proves the restart worked, the lock was handed over, and the completed card showed.
+if (args.Contains("--test-update-apply", StringComparer.OrdinalIgnoreCase))
+{
+    var source = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal));
+    Console.WriteLine($"[test] process {Environment.ProcessId} applying update from '{source ?? "<verify-only>"}'");
+
+    // The visuals: a presenter of the running platform, so the card behaves exactly as it would
+    // for a real update. The toast side stays silent -- this run has no tray to hang a balloon on.
+#if LINUX
+    INotificationPresenter presenter = new LinuxNotificationPresenter(ClippyConfig.Load);
+#else
+    INotificationPresenter presenter = new WindowsNotificationPresenter(ClippyConfig.Load, (_, _) => { });
+#endif
+    NotificationCenter.SetPresenter(presenter);
+    try
+    {
+        if (source is null)
+        {
+            Console.WriteLine("[test] restart verified: the replacement image is running and holds the instance lock.");
+            NotificationCenter.UpdateCompletedFromMarker(UpdateService.CurrentVersion);
+            await Task.Delay(5500); // the completed card's hold, so a human actually sees it
+            return 0;
+        }
+
+        NotificationCenter.CheckingForUpdates();
+
+        // Map the native bridge before applying: a LIVE recorder holds libclippy_linux.so mapped
+        // while an update replaces it, and the move-then-copy in the apply path must prove itself
+        // against exactly that (a mapped file refuses open-for-write; the rename sidesteps it).
+        try
+        {
+            _ = System.Runtime.InteropServices.NativeLibrary.Load(
+                Path.Combine(AppContext.BaseDirectory, "libclippy_linux.so"));
+            Console.WriteLine("[test] the native bridge is mapped for the duration of the apply.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[test] the native bridge did not load ({ex.GetType().Name}); the apply runs unmapped.");
+        }
+
+        // The version label is cosmetic here (it names the "Downloading {v}..." step); the marker
+        // the apply writes uses the same string, and a REAL update's --updated restart overwrites
+        // it with the real version and summary.
+        await UpdateService.ApplyUpdateAsync("update", source);
+        return 0;
+    }
+    finally
+    {
+        NotificationCenter.SetPresenter(null);
+        presenter.Dispose();
+    }
 }
 
 if (args.Contains("--help") || args.Contains("-h") || args.Contains("--usage"))
@@ -241,6 +313,8 @@ static int PrintUsage()
     Console.WriteLine("  --help, -h, --usage        this text");
     Console.WriteLine("  --self-update             check for and install an update, then exit");
     Console.WriteLine("  --updated                 launched after update; shows update notification");
+    Console.WriteLine("  --restart-handoff         internal: waits for the predecessor to release the");
+    Console.WriteLine("                            single-instance lock instead of exiting as a duplicate");
     Console.WriteLine("  --console, --debug        allocate a console for this run (the Windows build is windowed)");
     Console.WriteLine();
     Console.WriteLine("Modes:");
@@ -259,6 +333,10 @@ static int PrintUsage()
     Console.WriteLine("Diagnostics:");
     Console.WriteLine("  --smoke                    end-to-end smoke test (Windows only)");
     Console.WriteLine("  --audio-probe              list audio devices and capture from one (Windows only)");
+    Console.WriteLine("  --test-update              update self-test (checks, zip extraction, download)");
+    Console.WriteLine("  --test-update-apply <url>  apply a local archive (file://) or URL through the real");
+    Console.WriteLine("                             update path and restart into it; without a URL it only");
+    Console.WriteLine("                             verifies the restarted process");
     Console.WriteLine("  --test-parsers             H.264 / AAC parser self-test");
     Console.WriteLine("  --test-ring                ring buffer self-test");
     Console.WriteLine("  --test-mp4                 MP4 writer self-test");
