@@ -32,6 +32,11 @@ internal sealed partial class OverlayNotification : IDisposable
     private const int BaseBorder = 1;
     private const int BaseMargin = 16;
 
+    // The progress strip rides below the text block when a payload carries one: the card grows by
+    // BarZone design pixels and draws a 6 px pill there, track and fill from the shared palette
+    // (NotificationCenter owns the colours, so both platforms' bars are the same bar).
+    private const int BaseBarZone = NotificationCenter.BarZoneDesignPx;
+
     // Text only, no left-hand icon: the inset is the same on both sides, so the two lines read as
     // one centred block instead of a label stuck beside a picture.
     private const int BaseTextX = 14;
@@ -106,16 +111,19 @@ internal sealed partial class OverlayNotification : IDisposable
     private const uint BorderColor = 0x003D3D3D;  // #3D3D3D neutral dark grey hairline
     private const uint TitleColor = 0x00F0F0F0;   // near-white bold title
     private const uint MessageColor = 0x00AAAAAA; // grey message
+    private const uint TrackColor = 0x003D3D3D;   // #3D3D3D the progress bar's groove
+    private const uint AccentColor = 0x005EC522;  // #22C55E the moving fill (0x00BBGGRR of the shared accent)
 
-    private enum Phase { Idle, FadeIn, Hold, FadeOut }
+    private enum Phase { Idle, FadeIn, Hold, StickyHold, FadeOut }
 
     private readonly ManualResetEventSlim ready = new(false);
     private Thread? thread;
     private volatile bool disposed;
 
-    // Written on the capture thread before PostMessage, read on the overlay thread in WM_SHOW.
-    private volatile string pendingTitle = "";
-    private volatile string pendingMessage = "";
+    // Written on whatever thread calls ShowOrUpdate before PostMessage, read on the overlay thread
+    // in WM_SHOW. A reference write is atomic, and the payload record is immutable once built, so
+    // no lock is needed: the overlay thread either sees the old payload or the new one, both valid.
+    private volatile NotificationPayload pendingPayload = new() { Title = "", Subtitle = "" };
 
     // Overlay-thread state.
     private nint hwnd;
@@ -125,6 +133,8 @@ internal sealed partial class OverlayNotification : IDisposable
     private nint bitsPtr;
     private nint borderBrush;
     private nint bgBrush;
+    private nint trackBrush;
+    private nint accentBrush;
     private nint titleFont;
     private nint messageFont;
     private int posX;
@@ -132,6 +142,9 @@ internal sealed partial class OverlayNotification : IDisposable
     private Phase phase = Phase.Idle;
     private int alpha;
     private long phaseStartTicks;
+    // How long the current card holds before fading out; payload-driven, because the completed
+    // card wants to be read rather than glimpsed.
+    private int holdMs = HoldMs;
 
     // The card's real pixel metrics for the monitor it is currently aimed at, derived from the
     // Base* design units by Layout(). Not constants: the game can sit on a 100% screen one clip and
@@ -193,18 +206,23 @@ internal sealed partial class OverlayNotification : IDisposable
     public bool IsReady => hwnd != 0;
 
     /// <summary>
-    /// Queues a card to show. Thread-safe: called from the export thread, delivered on the overlay
-    /// thread. A card already on screen is smoothly re-timed rather than flickering back in.
+    /// Queues a payload to show. Thread-safe: called from any thread, delivered on the overlay
+    /// thread. A card already on screen is updated IN PLACE -- same window, new content, no fade
+    /// restart -- and the payload decides whether the close timer runs (sticky cards live until a
+    /// non-sticky payload replaces them).
     /// </summary>
-    public void Show(string title, string message)
+    public void ShowOrUpdate(NotificationPayload payload)
     {
         if (disposed || hwnd == 0)
             return;
 
-        pendingTitle = title;
-        pendingMessage = message;
+        pendingPayload = payload;
         PostMessage(hwnd, WM_SHOW, 0, 0);
     }
+
+    /// <summary>The plain two-line card: a payload without a bar, for simple callers.</summary>
+    public void Show(string title, string message) =>
+        ShowOrUpdate(new NotificationPayload { Title = title, Subtitle = message });
 
     public void Dispose()
     {
@@ -322,6 +340,8 @@ internal sealed partial class OverlayNotification : IDisposable
 
         borderBrush = CreateSolidBrush(BorderColor);
         bgBrush = CreateSolidBrush(BgColor);
+        trackBrush = CreateSolidBrush(TrackColor);
+        accentBrush = CreateSolidBrush(AccentColor);
 
         // CreateFont's height is in pixels on a screen DC and must be negative for "cell height",
         // which is what a design size means. TitleFontPx / messageFontPx already carry the monitor's
@@ -345,6 +365,8 @@ internal sealed partial class OverlayNotification : IDisposable
         if (dib != 0) { DeleteObject(dib); dib = 0; }
         if (borderBrush != 0) { DeleteObject(borderBrush); borderBrush = 0; }
         if (bgBrush != 0) { DeleteObject(bgBrush); bgBrush = 0; }
+        if (trackBrush != 0) { DeleteObject(trackBrush); trackBrush = 0; }
+        if (accentBrush != 0) { DeleteObject(accentBrush); accentBrush = 0; }
         if (titleFont != 0) { DeleteObject(titleFont); titleFont = 0; }
         if (messageFont != 0) { DeleteObject(messageFont); messageFont = 0; }
     }
@@ -500,6 +522,7 @@ internal sealed partial class OverlayNotification : IDisposable
         Layout(dpi);
         graphicsDpi = dpi;
         ResizeGraphics();
+        ApplyPayloadSize(pendingPayload, WorkAreaWidthOf(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)));
 
         // This monitor's work area, not the primary one's: the window already sits on the monitor
         // whose DPI changed, and SPI_GETWORKAREA would move the card back to the main screen.
@@ -513,41 +536,113 @@ internal sealed partial class OverlayNotification : IDisposable
         }
 
         if (phase != Phase.Idle)
-            RenderCard();
+            RenderCard(pendingPayload);
     }
 
     private void BeginShow()
     {
-        // Recomputed per clip, not once per process: the game may have been moved to the other
-        // monitor since the last one, and the card has to follow it. Also where a DPI change is
+        // Recomputed per payload, not once per process: the game may have been moved to the other
+        // monitor since the last card, and the card has to follow it. Also where a DPI change is
         // noticed -- the DIB and fonts cannot be resized after the fact, they have to be rebuilt.
-        var placement = ComputePlacement();
-        posX = placement.X;
-        posY = placement.Y;
-
-        // Repositioned unconditionally, unlike the graphics: the window can move without its DPI
-        // changing (a game dragged between two 100% monitors), and only the position encodes which
-        // monitor it is on.
-        if (placement.Dpi != graphicsDpi)
+        var payload = pendingPayload;
+        var monitor = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
+        var dpi = MonitorDpi(monitor);
+        Layout(dpi);
+        if (dpi != graphicsDpi)
         {
-            graphicsDpi = placement.Dpi;
+            graphicsDpi = dpi;
             ResizeGraphics();
         }
+
+        // The card grows before the work area is consulted, so the position below uses the final
+        // width: text wider than the design width widens the card (up to the screen), and a bar
+        // payload adds its zone to the height.
+        ApplyPayloadSize(payload, WorkAreaWidthOf(monitor));
+
+        var work = WorkAreaOf(monitor);
+        posX = work.right - Margin - Width;
+        posY = work.top + Margin;
 
         // SWP_NOZORDER keeps TOPMOST without re-asserting it, SWP_NOACTIVATE keeps the game focused:
         // this is a reposition, not an activation.
         SetWindowPos(hwnd, 0, posX, posY, Width, Height, SWP_NOZORDER | SWP_NOACTIVATE);
 
-        RenderCard();
+        RenderCard(payload);
 
-        // A card already on screen keeps its place and just gets more time ("smooth restart"); an
-        // idle window fades in from nothing.
-        phase = alpha > 0 ? Phase.Hold : Phase.FadeIn;
-        phaseStartTicks = Environment.TickCount64;
+        // The in-place contract: a card already on screen swaps its content at the current alpha
+        // and re-times itself per the payload -- a sticky one parks in hold indefinitely, a normal
+        // one restarts its hold. An idle window fades in from nothing.
+        if (alpha > 0)
+        {
+            phase = payload.Sticky ? Phase.StickyHold : Phase.Hold;
+            phaseStartTicks = Environment.TickCount64;
+            holdMs = payload.HoldMs;
+        }
+        else
+        {
+            phase = Phase.FadeIn;
+            phaseStartTicks = Environment.TickCount64;
+            holdMs = payload.HoldMs;
+        }
 
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(hwnd, TimerId, TimerIntervalMs, 0);
         Paint();
+    }
+
+    /// <summary>The work area's width, the card's growth ceiling: never wider than its screen.</summary>
+    private int WorkAreaWidthOf(nint monitor)
+    {
+        var work = WorkAreaOf(monitor);
+        return Math.Max(Scaled(BaseWidth), work.right - work.left - 2 * Margin);
+    }
+
+    private Rect WorkAreaOf(nint monitor)
+    {
+        var work = new Rect();
+        if (!GetMonitorInfo(monitor, ref work) &&
+            !SystemParametersInfo(SPI_GETWORKAREA, 0, ref work, 0))
+        {
+            work = new Rect
+            {
+                right = GetSystemMetrics(SM_CXSCREEN),
+                bottom = GetSystemMetrics(SM_CYSCREEN),
+            };
+        }
+        return work;
+    }
+
+    /// <summary>
+    /// Sizes the card for this payload. Long text GROWS the card instead of being clipped -- the
+    /// width goes to the longest measured line plus the symmetric text insets, capped by the
+    /// monitor; a payload with a progress bar adds the bar zone to the height. Everything is
+    /// scaled already, so the numbers here are physical pixels.
+    /// </summary>
+    private void ApplyPayloadSize(NotificationPayload payload, int maxWidth)
+    {
+        var hasBar = payload.Progress is not null || payload.Indeterminate;
+        var targetHeight = Scaled(hasBar ? BaseHeight + BaseBarZone : BaseHeight);
+
+        var (titleW, messageW) = MeasureText(payload.Title, payload.Subtitle);
+        var wanted = TextX * 2 + Math.Max(titleW, messageW);
+        var targetWidth = Math.Clamp(wanted, Scaled(BaseWidth), Math.Max(Scaled(BaseWidth), maxWidth));
+
+        if (targetWidth != Width || targetHeight != Height)
+        {
+            Width = targetWidth;
+            Height = targetHeight;
+            ResizeGraphics();
+        }
+    }
+
+    /// <summary>The rendered widths of the two lines, via GDI on the card's own fonts.</summary>
+    private (int Title, int Message) MeasureText(string title, string message)
+    {
+        SelectObject(memDc, titleFont);
+        GetTextExtentPoint32(memDc, title, title.Length, out var titleSize);
+        SelectObject(memDc, messageFont);
+        GetTextExtentPoint32(memDc, message, message.Length, out var messageSize);
+        return (titleSize.cx, messageSize.cx);
     }
 
     private void StepAnimation()
@@ -560,7 +655,7 @@ internal sealed partial class OverlayNotification : IDisposable
                 if (elapsed >= FadeInMs)
                 {
                     alpha = 255;
-                    phase = Phase.Hold;
+                    phase = Phase.StickyHold;
                     phaseStartTicks = Environment.TickCount64;
                 }
                 else
@@ -571,11 +666,22 @@ internal sealed partial class OverlayNotification : IDisposable
 
             case Phase.Hold:
                 alpha = 255;
-                if (elapsed >= HoldMs)
+                if (elapsed >= holdMs)
                 {
                     phase = Phase.FadeOut;
                     phaseStartTicks = Environment.TickCount64;
                 }
+                break;
+
+            case Phase.StickyHold:
+                // Full opacity, no close timer: the card lives until a non-sticky payload replaces
+                // it. The one thing that still animates here is the indeterminate sweep, which
+                // redraws the card each tick with the pill at its new position.
+                alpha = 255;
+                if (pendingPayload.Indeterminate)
+                    RenderCard(pendingPayload);
+                else
+                    return; // nothing changed this tick; do not push the same bitmap again
                 break;
 
             case Phase.FadeOut:
@@ -616,20 +722,24 @@ internal sealed partial class OverlayNotification : IDisposable
     }
 
     /// <summary>
-    /// Draws the card into the DIB. The shape (background + accent border) and the text are drawn by
-    /// GDI, which never touches the alpha byte; a final managed pass then sets alpha to 255 inside
-    /// the rounded rectangle and 0 in the corners, so the result is correct regardless of what GDI
-    /// left behind.
+    /// Draws the card into the DIB. The shape (background + border), the text and -- when the
+    /// payload carries one -- the progress bar are drawn by GDI, which never touches the alpha
+    /// byte; a final managed pass then sets alpha to 255 inside the rounded rectangle and 0 in the
+    /// corners, so the result is correct regardless of what GDI left behind.
+    ///
+    /// With a bar present the text block centres in the space ABOVE the bar zone, so the card
+    /// grows downward and the two lines keep the exact same offsets they have on a bar-less card.
     /// </summary>
-    private unsafe void RenderCard()
+    private unsafe void RenderCard(NotificationPayload payload)
     {
         if (memDc == 0 || bitsPtr == 0)
             return;
 
         new Span<byte>((void*)bitsPtr, Width * Height * 4).Clear();
 
-        var title = Fit(pendingTitle, TitleMaxChars);
-        var message = Fit(pendingMessage, MessageMaxChars);
+        var title = Fit(payload.Title, TitleMaxChars);
+        var message = Fit(payload.Subtitle, MessageMaxChars);
+        var hasBar = payload.Progress is not null || payload.Indeterminate;
 
         // GDI's round-rect region is exclusive of its right and bottom edges: CreateRoundRectRgn(0, 0,
         // W, H) covers x in [0, W-1] but y only up to H-2, so the last row and column of the card
@@ -645,13 +755,25 @@ internal sealed partial class OverlayNotification : IDisposable
 
         SetBkMode(memDc, TRANSPARENT_BK);
 
+        // The text block's vertical centre: the space above the bar zone when one rides along, the
+        // whole card otherwise -- which reproduces Layout()'s centring exactly (TitleY/MessageY are
+        // that same computation for the bar-less height).
+        var lineGap = Scaled(BaseLineGap);
+        var blockHeight = TitleFontPx + lineGap + messageFontPx;
+        var zoneHeight = hasBar ? Height - Scaled(BaseBarZone) : Height;
+        var titleY = (zoneHeight - blockHeight) / 2;
+        var messageY = titleY + TitleFontPx + lineGap;
+
         SelectObject(memDc, titleFont);
         SetTextColor(memDc, TitleColor);
-        TextOut(memDc, TextX, TitleY, title, title.Length);
+        TextOut(memDc, TextX, titleY, title, title.Length);
 
         SelectObject(memDc, messageFont);
         SetTextColor(memDc, MessageColor);
-        TextOut(memDc, TextX, MessageY, message, message.Length);
+        TextOut(memDc, TextX, messageY, message, message.Length);
+
+        if (hasBar)
+            DrawProgress(payload, messageY + messageFontPx);
 
         DeleteObject(outer);
         DeleteObject(inner);
@@ -666,6 +788,51 @@ internal sealed partial class OverlayNotification : IDisposable
                 pixels[i + 3] = InsideRoundedRect(x, y) ? (byte)255 : (byte)0;
             }
         }
+    }
+
+    /// <summary>
+    /// The progress strip: a rounded track spanning the text's width, the fill (or the sweep pill)
+    /// drawn over it. Same insets as the text above, so bar and text read as one composition.
+    /// </summary>
+    private void DrawProgress(NotificationPayload payload, int afterMessageY)
+    {
+        var barHeight = Scaled(NotificationCenter.BarHeightDesignPx);
+        var zone = Scaled(BaseBarZone);
+        var y = Height - zone + (zone - barHeight) / 2;
+        var x0 = TextX;
+        var x1 = Width - TextX;
+        if (x1 - x0 < barHeight)
+            return;
+
+        FillPill(x0, y, x1, y + barHeight, trackBrush);
+
+        if (payload.Indeterminate)
+        {
+            // A quarter-width pill gliding back and forth: honest motion for an unknown total.
+            var travel = x1 - x0;
+            var pillWidth = Math.Max(barHeight, travel / 4);
+            var period = 1600;
+            var t = (Environment.TickCount64 % period) / (double)(period / 2);
+            if (t > 1)
+                t = 2 - t; // ping-pong
+            var position = (int)((travel - pillWidth) * t);
+            FillPill(x0 + position, y, x0 + position + pillWidth, y + barHeight, accentBrush);
+        }
+        else if (payload.Progress is { } progress)
+        {
+            var fillWidth = (int)((x1 - x0) * Math.Clamp(progress, 0, 1));
+            if (fillWidth > 0)
+                FillPill(x0, y, x0 + Math.Max(fillWidth, barHeight), y + barHeight, accentBrush);
+        }
+    }
+
+    /// <summary>One rounded pill; the +1s extend the region to the final pixel, like the card's own ring.</summary>
+    private void FillPill(int x0, int y0, int x1, int y1, nint brush)
+    {
+        var radius = (y1 - y0) * 2;
+        var region = CreateRoundRectRgn(x0, y0, x1 + 1, y1 + 1, radius, radius);
+        FillRgn(memDc, region, brush);
+        DeleteObject(region);
     }
 
     /// <summary>Truncates with an ellipsis so text never runs past the card.</summary>
@@ -694,9 +861,9 @@ internal sealed partial class OverlayNotification : IDisposable
                 "No GDI device context in this session, so the card cannot be rendered off-screen.");
         }
 
-        pendingTitle = title;
-        pendingMessage = message;
-        RenderCard();
+        // A plain two-line card, exactly what a payload without a bar renders: the test asserts the
+        // design geometry, so the card is NOT widened here (only BeginShow grows it).
+        RenderCard(new NotificationPayload { Title = title, Subtitle = message });
 
         var pixels = new byte[Width * Height * 4];
         new Span<byte>((void*)bitsPtr, pixels.Length).CopyTo(pixels);
@@ -901,6 +1068,10 @@ internal sealed partial class OverlayNotification : IDisposable
 
     [LibraryImport("user32.dll", EntryPoint = "GetSystemMetrics")]
     private static partial int GetSystemMetrics(int index);
+
+    [LibraryImport("gdi32.dll", EntryPoint = "GetTextExtentPoint32W", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetTextExtentPoint32(nint hdc, string text, int length, out Size size);
 
 
     [LibraryImport("user32.dll", EntryPoint = "GetDC")]

@@ -6,19 +6,24 @@ namespace Clippy;
 
 /// <summary>
 /// The Medal / ShadowPlay-style game overlay card on Linux: a compact dark card at the top-right
-/// of the screen that fades in, holds ~2.6 s and fades out -- without ever stealing focus from the
+/// of the screen that fades in, holds and fades out -- without ever stealing focus from the
 /// running game, on KDE Plasma and on Niri alike.
 ///
 /// It is a raw X11 window for the same reason the Windows card is raw Win32
-/// (UI/OverlayNotification.cs, the design reference): dragging a UI toolkit into a NativeAOT
-/// recorder is not an option, and a 240x58 ARGB window is a few dozen lines of interop. The card
-/// shape -- a semicircular left cap fully filled by the green check badge (the card's contour
-/// follows the badge exactly), a rectangular body with a hairline border and 12 px rounded right
-/// corners -- is rendered in software into
-/// a premultiplied BGRA buffer; the text is drawn on top through Xft (the same library Plasma
-/// itself links), which gives anti-aliased text over the ARGB window for free. The fade is the
-/// Windows trick transplanted: every pixel of the buffer is scaled by the current alpha each
+/// (UI/OverlayNotification.cs, the DESIGN REFERENCE this file mirrors 1-to-1): dragging a UI
+/// toolkit into a NativeAOT recorder is not an option, and an ARGB window is a few dozen lines of
+/// interop. The card is the Windows card's geometry -- 320x65 design px, a plain rectangle with
+/// 12 px rounded corners on all four sides, a 1 px #3D3D3D hairline around a #1E1E1E body, a 16 px
+/// bold near-white title over a 14 px grey subtitle, no icon -- rendered in software into a
+/// premultiplied BGRA buffer, the text drawn through Xft (the same library Plasma itself links).
+/// The fade is the Windows trick: every pixel of the buffer is scaled by the current alpha each
 /// frame, so the rounded corners stay transparent while the whole card fades.
+///
+/// ShowOrUpdate is the in-place contract shared with the Windows card: a payload arriving while a
+/// card is already on screen swaps its content at the current alpha -- no fade restart, no
+/// flicker -- and a sticky payload (a download in flight) parks the card at full opacity until a
+/// non-sticky one replaces it. The progress bar rides in a zone below the text block: the card
+/// grows by that zone's height, and the fill (or the indeterminate sweep) moves per frame.
 ///
 /// The window is created with override_redirect = True: the window manager (KWin, or Niri's
 /// XWayland handling) never decorates, tiles or focuses it. Its event mask is zero AND its X11
@@ -27,29 +32,29 @@ namespace Clippy;
 /// never take focus, which is the one thing a notification must not do during a full-screen game.
 /// On Wayland this all runs inside XWayland, which exists in every KDE and Niri session that can
 /// run X11 apps; a session without X11 at all falls back to the desktop toast (see
-/// LinuxNotifications).
+/// LinuxNotificationPresenter).
 /// </summary>
 internal sealed partial class LinuxOverlayNotification : IDisposable
 {
-    // Design units, mirroring the user-facing spec of the Windows card: 240x58, 20 px from the
-    // top-right corner, 12 px corner radius on the right, a 1 px #3D3D3D hairline around a
-    // #1E1E1E card, and two text lines on the right of the accent badge. The LEFT end is a full
-    // semicircular cap (radius = half the height) and the green check circle fills it exactly,
-    // so the card's contour follows the badge with no dark corners poking out around it. Every
-    // use goes through Scaled, so a per-display scale factor is a one-field change.
-    private const int BaseWidth = 240;
-    private const int BaseHeight = 58;
+    // Design units, identical to the Windows card's (UI/OverlayNotification.cs) so the two cards
+    // are the same card: 320x65, 12 px radius on ALL four corners, 1 px hairline, 16 px margin,
+    // text inset 14 on both sides, 16/14 px fonts, 4 px line gap. Every use goes through Scaled.
+    private const int BaseWidth = 320;
+    private const int BaseHeight = 65;
     private const int BaseCornerRadius = 12;
     private const int BaseBorder = 1;
-    private const int BaseMargin = 20;
+    private const int BaseMargin = 16;
 
-    // The text starts after the cap (its right edge sits at half the height) plus a small gap.
-    private const int BaseTextX = 66;
-    private const int BaseTextRightInset = 12;
-    private const int BaseLineGap = 3;
+    private const int BaseTextX = 14;
+    private const int BaseTextRightInset = 14;
+    private const int BaseLineGap = 4;
 
     private const int TitleFontPx = 16;
-    private const int MessageFontPx = 13;
+    private const int MessageFontPx = 14;
+
+    // The progress strip's design metrics, shared with the Windows card through NotificationCenter.
+    private const int BarZone = NotificationCenter.BarZoneDesignPx;
+    private const int BarHeight = NotificationCenter.BarHeightDesignPx;
 
     // Animation timings, identical to the Windows overlay.
     private const int FadeInMs = 120;
@@ -57,15 +62,13 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     private const int FadeOutMs = 220;
     private const int StepMs = 15;
 
-    // #RRGGBB straight from the Windows card's palette; the title is the near-white the spec
-    // calls for, the message the same grey Tailwind names "gray-400".
-    private const byte BgR = 30, BgG = 30, BgB = 30;           // #1E1E1E
-    private const byte BorderR = 61, BorderG = 61, BorderB = 61; // #3D3D3D
-    private const byte TitleR = 244, TitleG = 244, TitleB = 246; // #F4F4F6
-    private const byte MessageR = 156, MessageG = 163, MessageB = 175; // #9CA3AF
-    private const byte AccentR = 34, AccentG = 197, AccentB = 94;      // #22C55E
+    // The Windows card's palette, byte for byte (COLORREF 0x00BBGGRR there, channels here).
+    private const byte BgR = 30, BgG = 30, BgB = 30;               // #1E1E1E
+    private const byte BorderR = 61, BorderG = 61, BorderB = 61;   // #3D3D3D
+    private const byte TitleR = 240, TitleG = 240, TitleB = 240;   // #F0F0F0
+    private const byte MessageR = 170, MessageG = 170, MessageB = 170; // #AAAAAA
 
-    private enum Phase { FadeIn, Hold, FadeOut }
+    private enum Phase { FadeIn, Hold, StickyHold, FadeOut }
 
     private readonly ManualResetEventSlim ready = new(false);
     private Thread? thread;
@@ -73,7 +76,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     private readonly AutoResetEvent kick = new(false);
     private readonly object queueGate = new();
-    private readonly Queue<(string Title, string Message)> queue = new();
+    private readonly Queue<NotificationPayload> queue = new();
 
     // X11 objects, all created and destroyed on the overlay thread.
     private nint display;
@@ -94,13 +97,22 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     private int screen;
 
     // Pre-rendered card at full opacity (premultiplied BGRA); each frame scales it by the phase
-    // alpha, so the hold frames do not re-render the shape at all.
+    // alpha, so the hold frames do not re-render the shape at all. An indeterminate sweep is
+    // composited onto the scaled copy per frame -- the base never changes per tick.
     private byte[]? cardBase;
 
-    // The card's CURRENT pixel width: 240 design px, grown per show when a status line is longer
-    // than the card (see ComputeTextLayout). The window, both XImages and the scratch pixmap are
-    // all sized to this and rebuilt by EnsureWidth whenever it changes.
+    // The card's CURRENT pixel size: 320x65 design, grown per show when a status line is longer
+    // than the card or a payload carries a progress bar (see EnsureSize). The window, both
+    // XImages and the scratch pixmap are all sized to this and rebuilt on change.
     private int cardWidth = BaseWidth;
+    private int cardHeight = BaseHeight;
+
+    // The bar's pixel geometry, recorded by the last render so the per-frame sweep knows where to
+    // draw without re-measuring.
+    private int trackX0, trackX1, barY0, barY1;
+
+    /// <summary>The per-display scale factor: 1 at 96 DPI, 2 at 192. Taken from Xft.dpi.</summary>
+    private float scale = 1f;
 
     /// <summary>True once the overlay window exists and text can be drawn. Checked after Start.</summary>
     public bool IsReady { get; private set; }
@@ -116,25 +128,31 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     }
 
     /// <summary>
-    /// Queues a card. Thread-safe, called from the export thread; a card already on screen is
-    /// re-timed by the pump loop rather than flickered. True when the card was queued for display
-    /// (the overlay is ready); false means the caller should fall back to the desktop toast.
+    /// Shows a payload, or updates a card already on screen in place. Thread-safe, called from any
+    /// thread; the overlay thread dequeues the newest payload and either fades a card in or swaps
+    /// the content of the one already showing. True when the payload was queued (the overlay is
+    /// ready); false means the caller should fall back to the desktop toast.
     /// </summary>
-    public bool Show(string title, string message)
+    public bool ShowOrUpdate(NotificationPayload payload)
     {
         if (disposed || !IsReady)
             return false;
 
         lock (queueGate)
         {
-            // Keep the newest; a burst of saves must not turn into a queue of cards.
-            if (queue.Count > 2)
+            // Keep the newest: a download ticking at 11 Hz must not pile up a render per tick, and
+            // the intermediate percentages are obsolete the moment a newer one exists.
+            if (queue.Count > 1)
                 queue.Dequeue();
-            queue.Enqueue((title, message));
+            queue.Enqueue(payload);
         }
         kick.Set();
         return true;
     }
+
+    /// <summary>The plain two-line card, for callers that have no payload to give.</summary>
+    public bool Show(string title, string message) =>
+        ShowOrUpdate(new NotificationPayload { Title = title, Subtitle = message });
 
     public void Dispose()
     {
@@ -157,11 +175,14 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             if (!IsReady)
                 return;
 
+            // One cadence drives everything: payloads are consumed and rendered in place the
+            // moment they arrive, the phase machine advances the fades, and the indeterminate
+            // sweep redraws its pill -- all at the same 15 ms tick the fade animation uses.
             while (!disposed)
             {
-                kick.WaitOne(200);
-                while (!disposed && TryDequeue(out var item))
-                    Animate(item.Title, item.Message);
+                ProcessPending();
+                Tick();
+                kick.WaitOne(StepMs);
             }
         }
         catch (Exception ex)
@@ -174,122 +195,146 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         }
     }
 
-    private bool TryDequeue(out (string Title, string Message) item)
+    private bool TryDequeueLatest(out NotificationPayload payload)
     {
         lock (queueGate)
         {
             if (queue.Count == 0)
             {
-                item = default;
+                payload = null!;
                 return false;
             }
-            item = queue.Dequeue();
+            // The last one wins: everything queued before it is a stale intermediate step of the
+            // same story (Checking → Downloading 12% → 45% → ...), and only the newest matters.
+            while (queue.Count > 1)
+                queue.Dequeue();
+            payload = queue.Dequeue();
             return true;
         }
     }
 
-    /// <summary>Fade in, hold, fade out -- one card, blocking this thread the whole way.</summary>
-    private void Animate(string title, string message)
+    /// <summary>
+    /// Consumes the newest payload. A visible card is re-rendered IN PLACE at its current alpha --
+    /// the same window, new content, no fade restart, no flicker -- and re-timed per the payload:
+    /// sticky parks in hold for as long as the operation runs, non-sticky restarts the hold that
+    /// leads to the fade-out. A hidden card starts a fresh fade-in.
+    /// </summary>
+    private void ProcessPending()
     {
-        RenderCardBase(title, message);
+        if (!TryDequeueLatest(out var payload))
+            return;
 
-        // A card already on screen keeps its alpha and just gets more time (the Windows "smooth
-        // restart"); an idle window fades in from nothing.
-        var phase = CurrentAlpha > 0 ? Phase.Hold : Phase.FadeIn;
-        var phaseStart = Environment.TickCount64;
+        RenderCardBase(payload);
 
-        while (!disposed)
+        if (CurrentAlpha > 0)
         {
-            var elapsed = Environment.TickCount64 - phaseStart;
-            switch (phase)
-            {
-                case Phase.FadeIn:
-                    if (elapsed >= FadeInMs)
-                    {
-                        CurrentAlpha = 255;
-                        phase = Phase.Hold;
-                        phaseStart = Environment.TickCount64;
-                    }
-                    else
-                        CurrentAlpha = (int)(elapsed * 255 / FadeInMs);
-                    break;
-
-                case Phase.Hold:
-                    CurrentAlpha = 255;
-                    if (elapsed >= HoldMs)
-                    {
-                        phase = Phase.FadeOut;
-                        phaseStart = Environment.TickCount64;
-                    }
-                    break;
-
-                case Phase.FadeOut:
-                    var remaining = FadeOutMs - elapsed;
-                    if (remaining <= 0)
-                    {
-                        CurrentAlpha = 0;
-                        DrawFrame(0);
-                        return;
-                    }
-                    CurrentAlpha = (int)(remaining * 255 / FadeOutMs);
-                    break;
-            }
-
-            DrawFrame(CurrentAlpha);
-            Thread.Sleep(StepMs);
-
-            // A newer card queued while this one animates takes over immediately (the window is
-            // already visible, so the new card starts at hold, like the Windows one).
-            if (phase != Phase.FadeOut && TryDequeue(out var next))
-            {
-                RenderCardBase(next.Title, next.Message);
-                phase = Phase.Hold;
-                phaseStart = Environment.TickCount64;
-            }
+            phase = payload.Sticky ? Phase.StickyHold : Phase.Hold;
+            phaseStartTicks = Environment.TickCount64;
+            holdMs = payload.HoldMs;
+        }
+        else
+        {
+            phase = Phase.FadeIn;
+            phaseStartTicks = Environment.TickCount64;
+            holdMs = payload.HoldMs;
         }
     }
+
+    /// <summary>The phase machine, one step per tick; mirrors the Windows card's StepAnimation.</summary>
+    private Phase phase = Phase.FadeIn;
+    private long phaseStartTicks;
+    private int holdMs = HoldMs;
 
     /// <summary>Alpha of the card on screen, read and written only on the overlay thread.</summary>
     private int CurrentAlpha;
 
-    /// <summary>
-    /// Resizes every size-dependent resource to <paramref name="width"/>: the override-redirect
-    /// window (its RIGHT edge stays anchored at the margin, so the card keeps hanging in the
-    /// top-right corner), the frame image the animation pushes, and the scratch pixmap/image pair
-    /// the text is baked on. Called per show before rendering, only when the width actually
-    /// changes, so the common clip card never rebuilds anything.
-    /// </summary>
-    private void EnsureWidth(int width)
+    private void Tick()
     {
-        if (width == cardWidth || window == 0)
+        var elapsed = Environment.TickCount64 - phaseStartTicks;
+        switch (phase)
+        {
+            case Phase.FadeIn:
+                if (elapsed >= FadeInMs)
+                {
+                    CurrentAlpha = 255;
+                    phase = Phase.StickyHold;
+                    phaseStartTicks = Environment.TickCount64;
+                }
+                else
+                    CurrentAlpha = (int)(elapsed * 255 / FadeInMs);
+                break;
+
+            case Phase.Hold:
+                CurrentAlpha = 255;
+                if (elapsed >= holdMs)
+                {
+                    phase = Phase.FadeOut;
+                    phaseStartTicks = Environment.TickCount64;
+                }
+                break;
+
+            case Phase.StickyHold:
+                // Full opacity, no close timer: the card lives until a non-sticky payload replaces
+                // it. The indeterminate sweep still animates, inside DrawFrame.
+                CurrentAlpha = 255;
+                break;
+
+            case Phase.FadeOut:
+                var remaining = FadeOutMs - elapsed;
+                if (remaining <= 0)
+                {
+                    CurrentAlpha = 0;
+                    DrawFrame(0);
+                    return;
+                }
+                CurrentAlpha = (int)(remaining * 255 / FadeOutMs);
+                break;
+        }
+
+        DrawFrame(CurrentAlpha);
+    }
+
+    /// <summary>
+    /// Resizes every size-dependent resource to the card's current pixel size: the
+    /// override-redirect window (its RIGHT edge stays anchored at the margin, so the card keeps
+    /// hanging in the top-right corner as it grows), the frame image the animation pushes, and the
+    /// scratch pixmap/image pair the text is baked on. Called per render, only when the size
+    /// actually changes, so the common clip card never rebuilds anything.
+    /// </summary>
+    private void EnsureSize(int width, int height)
+    {
+        if (width == cardWidth && height == cardHeight)
             return;
 
-        var height = Scaled(BaseHeight);
-        var (x, y) = ComputeOrigin(width);
-        XResizeWindow(display, window, (uint)width, (uint)height);
-        XMoveWindow(display, window, x, y);
+        if (window != 0)
+        {
+            var (x, y) = ComputeOrigin(width);
+            XResizeWindow(display, window, (uint)width, (uint)height);
+            XMoveWindow(display, window, x, y);
 
-        if (image != 0) { XDestroyImage(image); image = 0; frameBuffer = 0; }
-        frameBuffer = Marshal.AllocHGlobal(width * height * 4);
-        image = XCreateImage(display, visual, 32, ZPixmap, 0, frameBuffer, (uint)width, (uint)height, 32, 0);
+            if (image != 0) { XDestroyImage(image); image = 0; frameBuffer = 0; }
+            frameBuffer = Marshal.AllocHGlobal(width * height * 4);
+            image = XCreateImage(display, visual, 32, ZPixmap, 0, frameBuffer, (uint)width, (uint)height, 32, 0);
 
-        // The XftDraw targets the scratch pixmap, so it is rebuilt with it.
-        if (draw != 0) { XftDrawDestroy(draw); draw = 0; }
-        if (scratchImage != 0) { XDestroyImage(scratchImage); scratchImage = 0; scratchBuffer = 0; }
-        if (scratchPixmap != 0) { XFreePixmap(display, scratchPixmap); scratchPixmap = 0; }
-        scratchBuffer = Marshal.AllocHGlobal(width * height * 4);
-        scratchImage = XCreateImage(display, visual, 32, ZPixmap, 0, scratchBuffer, (uint)width, (uint)height, 32, 0);
-        scratchPixmap = XCreatePixmap(display, window, (uint)width, (uint)height, 32);
-        draw = XftDrawCreate(display, scratchPixmap, visual, colormap);
+            // The XftDraw targets the scratch pixmap, so it is rebuilt with it.
+            if (draw != 0) { XftDrawDestroy(draw); draw = 0; }
+            if (scratchImage != 0) { XDestroyImage(scratchImage); scratchImage = 0; scratchBuffer = 0; }
+            if (scratchPixmap != 0) { XFreePixmap(display, scratchPixmap); scratchPixmap = 0; }
+            scratchBuffer = Marshal.AllocHGlobal(width * height * 4);
+            scratchImage = XCreateImage(display, visual, 32, ZPixmap, 0, scratchBuffer, (uint)width, (uint)height, 32, 0);
+            scratchPixmap = XCreatePixmap(display, window, (uint)width, (uint)height, 32);
+            draw = XftDrawCreate(display, scratchPixmap, visual, colormap);
+        }
 
         cardWidth = width;
+        cardHeight = height;
         XFlush(display);
     }
 
     /// <summary>
     /// Per-show reposition: the cursor may have moved to the other monitor since the last card,
-    /// and a same-width card would otherwise stay on the old screen. Cheap (one pointer query),
-    /// so it rides along every show.
+    /// and a same-size card would otherwise stay on the old screen. Cheap (one pointer query),
+    /// so it rides along every render.
     /// </summary>
     private void MoveToActiveMonitor()
     {
@@ -310,12 +355,31 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         xErrorHandler = HandleXError;
         XSetErrorHandler(xErrorHandler);
 
-        display = XOpenDisplay(null);
+        // Not a bare XOpenDisplay(null): at boot DISPLAY may be missing from this process's
+        // environment while XWayland is already listening, and the probe finds those sockets by
+        // name. A first-notification failure here used to disable the overlay for the whole
+        // session (see LinuxNotificationPresenter for the retry side of that).
+        display = LinuxX11.TryOpenDisplay();
         if (display == 0)
         {
             Console.WriteLine("Overlay: no X11 display (DISPLAY unset or XWayland absent); overlay disabled.");
             ready.Set();
             return;
+        }
+
+        // The Windows card scales every design unit by its monitor's DPI; the X11 answer is the
+        // Xft.dpi resource the desktop sets for HiDPI sessions. 96 (no scaling) is the default --
+        // the same "unknown means as-designed" rule the Windows card uses.
+        try
+        {
+            var dpiText = XGetDefault(display, "Xft", "dpi");
+            if (dpiText != 0 && float.TryParse(Marshal.PtrToStringAnsi(dpiText), out var dpi) && dpi > 0)
+                scale = dpi / 96f;
+        }
+        catch (DllNotFoundException)
+        {
+            // XGetDefault lives in libX11 itself, so this is unreachable in practice; the fallback
+            // is the unscaled card.
         }
 
         screen = XDefaultScreen(display);
@@ -333,8 +397,9 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
         // Fonts and colours first: a card without text is worse than no card, so an Xft failure
         // here degrades the whole overlay and lets the caller fall back to the desktop toast.
-        titleFont = XftFontOpenName(display, screen, $"Sans-{TitleFontPx}:bold");
-        messageFont = XftFontOpenName(display, screen, $"Sans-{MessageFontPx}");
+        // Same faces and weights as the Windows card: a bold title over a regular subtitle.
+        titleFont = XftFontOpenName(display, screen, $"{SansFamily}-{ScaledFont(TitleFontPx)}:bold");
+        messageFont = XftFontOpenName(display, screen, $"{SansFamily}-{ScaledFont(MessageFontPx)}");
         if (titleFont == 0 || messageFont == 0)
         {
             Console.WriteLine("Overlay: Xft could not open a font; overlay disabled.");
@@ -404,12 +469,16 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             ready.Set();
             return;
         }
+        // The card's tracked size is in PIXELS, matching the buffers just allocated -- EnsureSize
+        // compares against these, so the design numbers would desynchronise it on a HiDPI screen.
+        cardWidth = Scaled(BaseWidth);
+        cardHeight = Scaled(BaseHeight);
 
-        // The scratch pixmap is where text gets baked into the card ONCE per show (Xft draws via
-        // XRender, which only targets drawables, not our byte buffer). Drawing the text directly
-        // onto the window every animation frame would need two X operations per frame -- the
-        // compositor catches the state between them and the card visibly re-paints, text popping
-        // in and out. With the composite pre-baked, every frame is ONE XPutImage: atomic.
+        // The scratch pixmap is where text gets baked into the card ONCE per payload (Xft draws
+        // via XRender, which only targets drawables, not our byte buffer). Drawing the text
+        // directly onto the window every animation frame would need two X operations per frame --
+        // the compositor catches the state between them and the card visibly re-paints, text
+        // popping in and out. With the composite pre-baked, every frame is ONE XPutImage: atomic.
         scratchBuffer = Marshal.AllocHGlobal(Scaled(BaseWidth) * Scaled(BaseHeight) * 4);
         scratchImage = XCreateImage(display, visual, 32, ZPixmap, 0, scratchBuffer,
             (uint)Scaled(BaseWidth), (uint)Scaled(BaseHeight), 32, 0);
@@ -428,6 +497,12 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         IsReady = true;
         ready.Set();
     }
+
+    /// <summary>"Sans" -- fontconfig resolves it to the session's default sans (Noto, DejaVu...),
+    /// the closest thing X11 has to the Windows card's Segoe UI.</summary>
+    private const string SansFamily = "Sans";
+
+    private int ScaledFont(int designPx) => Math.Max(1, (int)MathF.Round(designPx * scale));
 
     private void TearDown()
     {
@@ -462,28 +537,36 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     /// <summary>
     /// Renders the card at full opacity into <see cref="cardBase"/>: premultiplied BGRA, the
-    /// stadium-left shape (semicircular cap = the green badge, rectangular body, 12 px rounded
-    /// right corners) with the hairline border, all anti-aliased by signed distance coverage, and
-    /// the two text lines baked in through Xft. The text is composited on the scratch pixmap --
-    /// XPutImage of the shape, XRender of the text, XGetImage of the result -- so the animation
-    /// frames afterwards are a single atomic XPutImage each and the card can never appear on
-    /// screen without its text.
+    /// Windows card's rectangle (12 px rounded corners on all four sides) with its hairline
+    /// border, all anti-aliased by signed distance coverage; the text baked in through Xft,
+    /// left-aligned at the text inset exactly like the Windows card's TextOut; and, when the
+    /// payload carries one, the progress track with its determinate fill baked in below the text.
     /// </summary>
-    private void RenderCardBase(string title, string message)
+    private void RenderCardBase(NotificationPayload payload)
     {
         // Layout first: it measures the lines and grows the card when a status message is wider
-        // than the 240 px design width -- every width below then reads the new cardWidth.
-        textLayout = ComputeTextLayout(title, message);
+        // than the 320 px design width or a bar payload adds its zone -- every width below then
+        // reads the new card size.
+        textLayout = ComputeTextLayout(payload);
         MoveToActiveMonitor();
         var width = cardWidth;
-        var height = Scaled(BaseHeight);
-        var tailRadius = Scaled(BaseCornerRadius);
+        var height = cardHeight;
+        var radius = Scaled(BaseCornerRadius);
         var border = Scaled(BaseBorder);
-        // The left cap: a semicircle on the card's vertical midline, and the badge inside it.
-        var capRadius = height / 2f;
-        var capCenterX = capRadius;
-        var capCenterY = height / 2f;
         var buffer = new byte[width * height * 4];
+
+        var hasBar = payload.Progress is not null || payload.Indeterminate;
+        sweepActive = payload.Indeterminate;
+        var trackX0 = Scaled(BaseTextX);
+        var trackX1 = width - Scaled(BaseTextX);
+        var barHeightPx = Scaled(BarHeight);
+        var zone = Scaled(BarZone);
+        var barY0 = height - zone + (zone - barHeightPx) / 2;
+        var barY1 = barY0 + barHeightPx;
+        this.trackX0 = trackX0;
+        this.trackX1 = trackX1;
+        this.barY0 = barY0;
+        this.barY1 = barY1;
 
         for (var y = 0; y < height; y++)
         {
@@ -492,48 +575,48 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
                 var px = x + 0.5f;
                 var py = y + 0.5f;
 
-                // The card is the union of three primitives: the left cap, the straight body,
-                // and the rounded right tail. Union = the nearest boundary = min of the SDFs.
-                var body = SdBox(px, py, capRadius, 0, width - tailRadius, height);
-                var cap = SdCircle(px, py, capCenterX, capCenterY, capRadius);
-                var tail = SdCircle(px, py, width - tailRadius, capCenterY, tailRadius);
-                var coverage = Math.Clamp(0.5f - MathF.Min(body, MathF.Min(cap, tail)), 0, 1);
-
-                // The interior is the same union eroded by the border; the cap/body junction is
-                // tangent-smooth, so union-of-erosions is exact there and the 1 px hairline keeps
-                // its thickness all the way around.
-                var bodyIn = SdBox(px, py, capRadius, border, width - tailRadius, height - border);
-                var capIn = SdCircle(px, py, capCenterX, capCenterY, capRadius - border);
-                var tailIn = SdCircle(px, py, width - tailRadius, capCenterY, tailRadius - border);
-                var interior = Math.Clamp(0.5f - MathF.Min(bodyIn, MathF.Min(capIn, tailIn)), 0, 1);
-
-                var ring = coverage - interior;
+                // The card is one rounded box: the Windows card's shape, anti-aliased by signed
+                // distance coverage.
+                var coverage = Math.Clamp(0.5f - SdRoundBox(px, py, width / 2f, height / 2f,
+                    width / 2f, height / 2f, radius), 0, 1);
                 if (coverage <= 0)
                     continue;
 
-                var r = BorderR * ring + BgR * interior;
-                var g = BorderG * ring + BgG * interior;
-                var b = BorderB * ring + BgB * interior;
+                // The interior is the same box eroded by the border, so the 1 px hairline keeps
+                // its thickness on all four sides.
+                var interior = Math.Clamp(0.5f - SdRoundBox(px, py, width / 2f, height / 2f,
+                    width / 2f - border, height / 2f - border, Math.Max(0, radius - border)), 0, 1);
 
-                // The accent badge fills the cap exactly -- its contour IS the card's contour on
-                // the left -- and carries the check, blended over the card in straight colour;
-                // everything is premultiplied once at the end. The coverage is the usual
-                // half-pixel form: 0.5 - (distance - radius); an extra radius term here would
-                // double the badge and spill green into the card body.
-                var badgeCov = Math.Clamp(0.5f - SdCircle(px, py, capCenterX, capCenterY, capRadius), 0, 1);
-                if (badgeCov > 0)
-                {
-                    r = r * (1 - badgeCov) + AccentR * badgeCov;
-                    g = g * (1 - badgeCov) + AccentG * badgeCov;
-                    b = b * (1 - badgeCov) + AccentB * badgeCov;
-                }
+                var r = BorderR * (coverage - interior) + BgR * interior;
+                var g = BorderG * (coverage - interior) + BgG * interior;
+                var b = BorderB * (coverage - interior) + BgB * interior;
 
-                var checkCov = CheckCoverage(px, py, capCenterX, capCenterY, capRadius);
-                if (checkCov > 0)
+                // The progress track rides in its zone below the text, same insets as the text:
+                // a rounded pill filled with the groove colour.
+                if (hasBar && py >= barY0 && py <= barY1 && px >= trackX0 && px <= trackX1)
                 {
-                    r = r * (1 - checkCov) + 255 * checkCov;
-                    g = g * (1 - checkCov) + 255 * checkCov;
-                    b = b * (1 - checkCov) + 255 * checkCov;
+                    var trackCov = Math.Clamp(0.5f - SdPill(px, py, trackX0, barY0, trackX1, barY1), 0, 1);
+                    if (trackCov > 0)
+                    {
+                        r = r * (1 - trackCov) + NotificationCenter.TrackR * trackCov;
+                        g = g * (1 - trackCov) + NotificationCenter.TrackG * trackCov;
+                        b = b * (1 - trackCov) + NotificationCenter.TrackB * trackCov;
+                    }
+
+                    // The determinate fill is part of the base render: it only moves when a new
+                    // payload arrives (throttled upstream), not per animation frame.
+                    if (payload.Progress is { } progress && progress > 0)
+                    {
+                        var fillWidth = (trackX1 - trackX0) * Math.Clamp((float)progress, 0f, 1f);
+                        var fillX1 = Math.Max(trackX0 + barHeightPx, trackX0 + fillWidth);
+                        var fillCov = Math.Clamp(0.5f - SdPill(px, py, trackX0, barY0, fillX1, barY1), 0, 1);
+                        if (fillCov > 0)
+                        {
+                            r = r * (1 - fillCov) + NotificationCenter.AccentR * fillCov;
+                            g = g * (1 - fillCov) + NotificationCenter.AccentG * fillCov;
+                            b = b * (1 - fillCov) + NotificationCenter.AccentB * fillCov;
+                        }
+                    }
                 }
 
                 var i = (y * width + x) * 4;
@@ -575,46 +658,26 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         }
     }
 
-    /// <summary>Signed distance to an axis-aligned box's boundary; negative inside.</summary>
-    private static float SdBox(float px, float py, float x0, float y0, float x1, float y1)
-    {
-        var qx = MathF.Abs(px - (x0 + x1) / 2) - (x1 - x0) / 2;
-        var qy = MathF.Abs(py - (y0 + y1) / 2) - (y1 - y0) / 2;
-        var ax = MathF.Max(qx, 0);
-        var ay = MathF.Max(qy, 0);
-        return MathF.Sqrt(ax * ax + ay * ay) + MathF.Min(MathF.Max(qx, qy), 0);
-    }
-
-    private static float SdCircle(float px, float py, float cx, float cy, float radius) =>
-        MathF.Sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) - radius;
-
     /// <summary>
-    /// Coverage of the check mark: two thick segments with round caps, clipped to the circle so
-    /// the stroke never pokes out of the badge. Half-pixel anti-aliasing like everything else.
+    /// Signed distance to a rounded rectangle's boundary; negative inside. The Windows card's
+    /// shape is exactly this: a box whose corners are cut at radius r.
     /// </summary>
-    private float CheckCoverage(float px, float py, float cx, float cy, float radius)
+    private static float SdRoundBox(float px, float py, float cx, float cy, float halfWidth, float halfHeight, float radius)
     {
-        var half = radius * 0.32f; // stroke half-width, proportional to the badge
-        var a = (cx - radius * 0.42f, cy + radius * 0.05f);
-        var b = (cx - radius * 0.10f, cy + radius * 0.38f);
-        var c = (cx + radius * 0.48f, cy - radius * 0.34f);
-
-        var cov = StrokeCoverage(px, py, a.Item1, a.Item2, b.Item1, b.Item2, half);
-        cov = MathF.Max(cov, StrokeCoverage(px, py, b.Item1, b.Item2, c.Item1, c.Item2, half));
-        return Math.Min(cov, Math.Clamp(0.5f - (SdCircle(px, py, cx, cy, radius) + 1.5f), 0, 1));
+        var qx = MathF.Abs(px - cx) - (halfWidth - radius);
+        var qy = MathF.Abs(py - cy) - (halfHeight - radius);
+        var outsideX = MathF.Max(qx, 0);
+        var outsideY = MathF.Max(qy, 0);
+        return MathF.Sqrt(outsideX * outsideX + outsideY * outsideY)
+            + MathF.Min(MathF.Max(qx, qy), 0)
+            - radius;
     }
 
-    private static float StrokeCoverage(float px, float py, float ax, float ay, float bx, float by, float halfWidth)
+    /// <summary>A pill (a fully-round-ended bar): the rounded box whose radius is half its height.</summary>
+    private static float SdPill(float px, float py, float x0, float y0, float x1, float y1)
     {
-        var abx = bx - ax;
-        var aby = by - ay;
-        var lengthSquared = abx * abx + aby * aby;
-        var t = lengthSquared > 0
-            ? Math.Clamp(((px - ax) * abx + (py - ay) * aby) / lengthSquared, 0, 1)
-            : 0;
-        var dx = px - (ax + abx * t);
-        var dy = py - (ay + aby * t);
-        return Math.Clamp(halfWidth + 0.5f - MathF.Sqrt(dx * dx + dy * dy), 0, 1);
+        var halfHeight = (y1 - y0) / 2f;
+        return SdRoundBox(px, py, (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, halfHeight, halfHeight);
     }
 
     // --- Text: Xft layout and per-frame drawing ---
@@ -623,27 +686,27 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     private (byte[] Title, byte[] Message, int TitleX, int TitleBaseline, int MessageX, int MessageBaseline)? textLayout;
 
     private (byte[] Title, byte[] Message, int TitleX, int TitleBaseline, int MessageX, int MessageBaseline)
-        ComputeTextLayout(string title, string message)
+        ComputeTextLayout(NotificationPayload payload)
     {
-        var height = Scaled(BaseHeight);
+        var hasBar = payload.Progress is not null || payload.Indeterminate;
+        var height = Scaled(hasBar ? BaseHeight + BarZone : BaseHeight);
         var textX = Scaled(BaseTextX);
         var inset = Scaled(BaseTextRightInset);
 
-        var titleBytes = Utf8(title);
-        var messageBytes = Utf8(message);
+        var titleBytes = Utf8(payload.Title);
+        var messageBytes = Utf8(payload.Subtitle);
         XftTextExtentsUtf8(display, titleFont, titleBytes, titleBytes.Length, out var titleExtents);
         XftTextExtentsUtf8(display, messageFont, messageBytes, messageBytes.Length, out var messageExtents);
 
-        // GROW, don't truncate: a status line like "You are on the latest version (v1.6.1)" is
-        // wider than the 240 px design card, and clipping it would defeat the announcement. The
-        // card widens to the longest line plus the badge band and the right inset; the screen
-        // width (margin on both sides) is the only hard ceiling, and past it the lines
-        // ellipsize as before.
+        // GROW, don't truncate: an update summary is longer than the 320 px design card, and
+        // clipping it would defeat the announcement. The card widens to the longest line plus the
+        // two insets; the screen width (margin on both sides) is the only hard ceiling, and past
+        // it the lines ellipsize as before.
         var textWidth = Math.Max(titleExtents.width, messageExtents.width);
         var screenRoom = XDisplayWidth(display, screen) - 2 * Scaled(BaseMargin) - textX - inset;
         var wanted = Math.Clamp(textX + textWidth + inset,
             Scaled(BaseWidth), Math.Max(Scaled(BaseWidth), textX + Math.Max(0, screenRoom) + inset));
-        EnsureWidth(wanted);
+        EnsureSize(wanted, height);
 
         var maxWidth = cardWidth - textX - inset;
         while (titleExtents.width > maxWidth && titleBytes.Length > 1)
@@ -657,29 +720,33 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
             XftTextExtentsUtf8(display, messageFont, messageBytes, messageBytes.Length, out messageExtents);
         }
 
-        // One centred block: title, small gap, message -- the Windows card's vertical rhythm.
+        // One centred block, left-aligned at the text inset -- the Windows card's exact rhythm:
+        // both lines start at TextX, the pair is centred vertically on the card (or, with a bar,
+        // on the space above the bar zone, so the growth happens BELOW the text).
         var gap = Scaled(BaseLineGap);
-        var blockHeight = titleExtents.height + gap + messageExtents.height;
-        var top = Math.Max(0, (height - blockHeight) / 2);
-        // XGlyphInfo.y is the ink's rise ABOVE the baseline (probed against Noto Sans: 17 for the
-        // 16 px face), so the baseline that puts the ink top at `top` is top + y, and the ink
-        // bottom sits at baseline - y + height.
+        var blockHeight = TitleFontPx + gap + MessageFontPx;
+        var zoneHeight = hasBar ? cardHeight - Scaled(BarZone) : cardHeight;
+        var top = Math.Max(0, (zoneHeight - blockHeight) / 2);
+        // XGlyphInfo.y is the ink's rise ABOVE the baseline, so the baseline that puts the ink top
+        // at `top` is top + y.
         var titleBaseline = top + titleExtents.y;
-        var messageBaseline = top + titleExtents.height + gap + messageExtents.y;
+        var messageBaseline = top + TitleFontPx + gap + messageExtents.y;
 
-        // Each line centred horizontally in the band right of the badge.
-        var titleX = textX + Math.Max(0, (maxWidth - titleExtents.width) / 2);
-        var messageX = textX + Math.Max(0, (maxWidth - messageExtents.width) / 2);
-        return (titleBytes, messageBytes, titleX, titleBaseline, messageX, messageBaseline);
+        return (titleBytes, messageBytes, textX, titleBaseline, textX, messageBaseline);
     }
 
-    /// <summary>Scales the full-opacity card by <paramref name="alpha"/> and pushes it to the window.</summary>
+    /// <summary>
+    /// Scales the full-opacity card by <paramref name="alpha"/> and pushes it to the window. When
+    /// the payload's bar is indeterminate, the sweep pill is composited onto the scaled copy here,
+    /// per frame -- the base (shape, text, track) stays untouched, so the animation costs nothing
+    /// but the pill's own few hundred pixels.
+    /// </summary>
     private unsafe void DrawFrame(int alpha)
     {
         if (cardBase is null || image == 0 || frameBuffer == 0 || !IsReady)
             return;
 
-        var bytes = cardWidth * Scaled(BaseHeight) * 4;
+        var bytes = cardWidth * cardHeight * 4;
         var target = new Span<byte>((void*)frameBuffer, bytes);
         var source = cardBase;
         // Premultiplied pixels scale channel-wise: multiplying all four bytes by the fade keeps
@@ -687,14 +754,61 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         for (var i = 0; i < bytes; i++)
             target[i] = (byte)(source[i] * alpha / 255);
 
+        // The indeterminate sweep, drawn over the copied track. Same 1.6 s ping-pong the Windows
+        // card runs; premultiplication means the pill's own channels carry the card's alpha.
+        if (sweepActive && alpha > 0)
+        {
+            var travel = trackX1 - trackX0;
+            if (travel > 0)
+            {
+                var pillWidth = Math.Max(barY1 - barY0, travel / 4);
+                var period = 1600;
+                var t = (Environment.TickCount64 % period) / (double)(period / 2);
+                if (t > 1)
+                    t = 2 - t;
+                var position = (int)((travel - pillWidth) * t);
+                DrawSweepPill(frameBuffer, trackX0 + position, pillWidth, alpha);
+            }
+        }
+
         // The single X operation per frame: no intermediate "card without text" state can ever
         // reach the compositor, which is what made the card flicker.
         XPutImage(display, window, graphicsContext, image, 0, 0, 0, 0,
-            (uint)cardWidth, (uint)Scaled(BaseHeight));
+            (uint)cardWidth, (uint)cardHeight);
         // Re-assert the stacking on every frame: a game or an IDE raising itself mid-fade must
         // never bury the card -- XRaiseWindow is fire-and-forget on the X stream, no round trip.
         XRaiseWindow(display, window);
         XFlush(display);
+    }
+
+    /// <summary>Whether the CURRENT payload's bar is the sweeping kind; set by RenderCardBase.</summary>
+    private bool sweepActive;
+
+    /// <summary>
+    /// Draws the moving pill over the track already in the buffer, straight in premultiplied
+    /// space: each pixel of the pill's coverage blends the accent over what the track left there.
+    /// </summary>
+    private unsafe void DrawSweepPill(nint buffer, int x0, int pillWidth, int alpha)
+    {
+        var y0 = barY0;
+        var y1 = barY1;
+        var x1 = Math.Min(x0 + pillWidth, trackX1);
+        for (var y = y0; y < y1; y++)
+        {
+            for (var x = x0; x < x1; x++)
+            {
+                var cov = Math.Clamp(0.5f - SdPill(x + 0.5f, y + 0.5f, x0, y0, x1, y1), 0, 1);
+                if (cov <= 0)
+                    continue;
+
+                var i = (y * cardWidth + x) * 4;
+                var ptr = (byte*)buffer + i;
+                var accentScale = cov * alpha / 255f;
+                ptr[0] = (byte)(ptr[0] * (1 - cov) + NotificationCenter.AccentB * accentScale);
+                ptr[1] = (byte)(ptr[1] * (1 - cov) + NotificationCenter.AccentG * accentScale);
+                ptr[2] = (byte)(ptr[2] * (1 - cov) + NotificationCenter.AccentR * accentScale);
+            }
+        }
     }
 
     private static byte[] Utf8(string text) => Encoding.UTF8.GetBytes(text);
@@ -710,7 +824,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         return [.. kept, .. Utf8("\u2026")];
     }
 
-    private int Scaled(int design) => design; // the per-display scale factor lands here
+    private int Scaled(int design) => Math.Max(1, (int)MathF.Round(design * scale));
 
     /// <summary>Swallows X protocol errors (BadMatch on a raced XPutImage, etc.) with a log line.</summary>
     private int HandleXError(nint displayPointer, nint errorEvent)
@@ -893,9 +1007,6 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         public short yOff;
     }
 
-    [LibraryImport("libX11.so.6", StringMarshalling = StringMarshalling.Utf8)]
-    private static partial nint XOpenDisplay(string? name);
-
     [LibraryImport("libX11.so.6")]
     private static partial int XCloseDisplay(nint display);
 
@@ -1039,5 +1150,10 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     [LibraryImport("libXft.so.2")]
     private static partial void XftTextExtentsUtf8(nint display, nint font, byte[] text, int length, out XGlyphInfo extents);
+
+    // XGetDefault reads the per-display resource database -- where the desktop parks Xft.dpi for
+    // HiDPI sessions. Same source of truth the Windows card gets from GetDpiForMonitor.
+    [LibraryImport("libX11.so.6", StringMarshalling = StringMarshalling.Utf8)]
+    private static partial nint XGetDefault(nint display, string program, string option);
 }
 #endif

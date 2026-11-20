@@ -60,6 +60,14 @@ internal sealed class LinuxTrayIcon : IDisposable
     private const string MenuInterface = "com.canonical.dbusmenu";
     private const string PropertiesInterface = "org.freedesktop.DBus.Properties";
     private const string WatcherName = "org.kde.StatusNotifierWatcher";
+    private const string BusInterface = "org.freedesktop.DBus";
+
+    // The registration retry cadence: often enough that a bar starting seconds behind the
+    // recorder shows the icon without the user noticing, rare enough that a session with no bar
+    // at all stays silent. The first failure is logged, then every QuietLogEveryNth attempt --
+    // an absent watcher is a legitimate configuration, not a flood-worthy event.
+    private const int RegisterRetryMs = 1500;
+    private const int QuietLogEveryN = 15;
 
     // Menu ids, copied from the Windows TrayIcon so the two menus mean the same thing everywhere:
     // actions in the 1000s, settings grouped by hundreds, hotkey tables at 3000/4000, the audio
@@ -205,13 +213,84 @@ internal sealed class LinuxTrayIcon : IDisposable
         Console.WriteLine(LinuxIconAssets.FrameDiagnostics());
         RegisterHandlers();
 
+        // The watcher's lifecycle, subscribed before anything can race it: every time
+        // org.kde.StatusNotifierWatcher changes owner, this item must re-register -- that is what
+        // the StatusNotifierItem spec asks of items, and what makes the icon survive a bar
+        // starting late or restarting under a live recorder (plasmashell crash recovery, waybar
+        // reload). The match rule filters at the daemon: only THIS name's events reach us.
+        bus.AddMatch($"type='signal',sender='{BusInterface}',interface='{BusInterface}'," +
+            $"member='NameOwnerChanged',arg0='{WatcherName}'");
+        bus.AddSignalHandler(BusInterface, "NameOwnerChanged", HandleWatcherOwnerChanged);
+
         // Registration happens BEFORE the dispatch loop starts: both read the same socket, and a
         // reply eaten by the dispatcher instead of the synchronous caller desynchronises the wire.
-        bus.Call(WatcherName, "/StatusNotifierWatcher", WatcherName, "RegisterStatusNotifierItem", "s",
-            w => w.String(ItemPath), 10_000);
+        // At boot the recorder can beat the panel to the bus by seconds -- a real boot logged
+        // "RegisterStatusNotifierItem failed: ServiceUnknown (The name is not activatable)" and
+        // then gave up, leaving the icon dead for the whole session. A watcher that is not up YET
+        // is not a session without a watcher: retry until it answers, however long that takes,
+        // then start serving the menu. The wait costs nothing but a background thread; the
+        // recording, hotkeys and portal run meanwhile.
+        var attempts = 0;
+        while (true)
+        {
+            try
+            {
+                bus.Call(WatcherName, "/StatusNotifierWatcher", WatcherName, "RegisterStatusNotifierItem", "s",
+                    w => w.String(ItemPath), 10_000);
+                break;
+            }
+            catch (Exception ex) when (ex is IOException or TimeoutException)
+            {
+                attempts++;
+                if (attempts == 1)
+                    Console.WriteLine($"Tray: StatusNotifierWatcher is not up yet ({ex.Message}); retrying every {RegisterRetryMs} ms until it appears.");
+                else if (attempts % QuietLogEveryN == 0)
+                    Console.WriteLine($"Tray: still waiting for StatusNotifierWatcher ({attempts} attempts so far).");
+                Thread.Sleep(RegisterRetryMs);
+            }
+        }
+
         registered = true;
         Console.WriteLine("Tray: StatusNotifierItem registered (left click saves the short clip, right click opens the menu).");
         bus.StartDispatch();
+    }
+
+    /// <summary>
+    /// NameOwnerChanged body: (name, old_owner, new_owner), all strings. An empty new owner is
+    /// the panel going away -- nothing to serve until it returns. A non-empty one is the watcher
+    /// arriving (or returning), which is this item's cue to re-register: a freshly started bar
+    /// knows nothing about items registered before it was.
+    ///
+    /// Runs on the dispatch thread, so the synchronous Call cannot race the dispatcher -- the
+    /// loop that reads the socket is blocked inside this handler. Method calls that arrive while
+    /// the re-registration waits for its reply are skipped by Call and answered by nobody; a
+    /// watcher restart is seconds-wide, the tray hosts retry, and the alternative (answering
+    /// calls from mid-restart) would need a second connection for no real gain.
+    /// </summary>
+    private void HandleWatcherOwnerChanged(DbusReader body)
+    {
+        body.ReadString(); // the name; the match rule already filtered on it
+        body.ReadString(); // the old owner
+        var newOwner = body.ReadString();
+
+        if (newOwner.Length == 0)
+        {
+            registered = false;
+            Console.WriteLine("Tray: the StatusNotifierWatcher is gone; re-registering when it returns.");
+            return;
+        }
+
+        try
+        {
+            bus!.Call(WatcherName, "/StatusNotifierWatcher", WatcherName, "RegisterStatusNotifierItem", "s",
+                w => w.String(ItemPath), 10_000);
+            registered = true;
+            Console.WriteLine("Tray: StatusNotifierItem re-registered with the new watcher.");
+        }
+        catch (Exception ex) when (ex is IOException or TimeoutException)
+        {
+            Console.WriteLine($"Tray: re-registration with the new watcher failed ({ex.Message}); the next owner change retries.");
+        }
     }
 
     private void RegisterHandlers()
@@ -836,14 +915,12 @@ internal sealed class LinuxTrayIcon : IDisposable
                 SaveConfig("Notifications: Game Overlay");
                 // A live preview of what was just picked: the card itself, or the desktop toast
                 // when the card could not come up.
-                LinuxNotifications.ShowStatus(config, "Overlay Enabled",
-                    "Clip notifications will appear here", forceVisual: true);
+                NotificationCenter.NotificationModePreview("Overlay Enabled — clip notifications will appear here");
                 break;
             case IdNotifyToast:
                 config.NotificationType = "windows_toast";
                 SaveConfig("Notifications: Windows Toast");
-                LinuxNotifications.ShowStatus(config, "System Toast Enabled",
-                    "Clip notifications will appear here");
+                NotificationCenter.NotificationModePreview("System Toast Enabled — clip notifications will appear here");
                 break;
             case IdNotifyNone:
                 config.NotificationType = "none";
@@ -980,30 +1057,28 @@ internal sealed class LinuxTrayIcon : IDisposable
     private void CheckForUpdates()
     {
         // Fire and forget: the check is a network call, and the tray must not stall on it. The
-        // result is ALWAYS announced with forceVisual: even a Sound Only user who explicitly asked
-        // for the check must see its outcome (overlay card, or the desktop toast as the fallback).
-        // An available update is applied right away -- the tarball path swaps the binary and
-        // restarts this process, exactly what the Windows tray's Check for Updates does.
+        // shared pipeline routes every step -- Checking, Downloading (with the live bar),
+        // Installing -- through the presenter, so a Sound Only user who explicitly asked for the
+        // check still sees the outcome. An available update is applied right away -- the tarball
+        // path swaps everything the release ships and execs this process into it.
         _ = Task.Run(async () =>
         {
             try
             {
+                NotificationCenter.CheckingForUpdates();
                 var found = await UpdateService.CheckForUpdateAsync();
                 if (!found.Available)
                 {
-                    LinuxNotifications.ShowStatus(host.Config, "Clippy Update",
-                        $"{UpdateService.Version} is current; nothing to install.", forceVisual: true);
+                    NotificationCenter.UpToDate(UpdateService.Version);
                     return;
                 }
 
-                LinuxNotifications.ShowStatus(host.Config, "Clippy Update",
-                    $"{found.Tag} is available. Updating...", forceVisual: true);
-                await UpdateService.ApplyUpdateAsync(found.DownloadUrl,
-                    (title, body) => LinuxNotifications.ShowStatus(host.Config, title, body));
+                await UpdateService.ApplyUpdateAsync(found.Tag, found.DownloadUrl, found.ReleaseNotes);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Tray: update check failed ({ex.Message}).");
+                NotificationCenter.UpdateFailed(ex.Message);
             }
         });
     }
