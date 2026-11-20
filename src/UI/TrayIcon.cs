@@ -742,27 +742,29 @@ public sealed partial class TrayIcon : IDisposable
     /// </summary>
     internal async Task RunUpdateCheck(bool userInitiated)
     {
+        // The shared pipeline: the same words and the same card as on Linux, live progress bar
+        // included (Checking → Downloading → Installing ride one in-place card).
+        NotificationCenter.CheckingForUpdates();
         var info = await UpdateService.CheckForUpdateAsync().ConfigureAwait(false);
 
         if (!info.Available)
         {
             Console.WriteLine($"Update: nothing newer than {UpdateService.Version}.");
             if (userInitiated)
-                ShowNotification("Clippy Update", $"You are on the latest version ({UpdateService.Version}).");
+                NotificationCenter.UpToDate(UpdateService.Version);
             return;
         }
 
         Console.WriteLine($"Update: {info.Tag} is available.");
         if (!userInitiated)
         {
-            ShowNotification(
+            NotificationCenter.Info(
                 "Clippy Update",
                 $"{info.Tag} is available. Right-click the tray icon and choose Check for Updates.");
             return;
         }
 
-        ShowNotification("Clippy Update", $"Installing {info.Tag}...");
-        await UpdateService.ApplyUpdateAsync(info.DownloadUrl, ShowNotification).ConfigureAwait(false);
+        await UpdateService.ApplyUpdateAsync(info.Tag, info.DownloadUrl, info.ReleaseNotes).ConfigureAwait(false);
     }
 
     /// <summary>
