@@ -27,7 +27,7 @@ internal sealed partial class OverlayNotification : IDisposable
     // scale before it is used: a card built at 320 physical pixels is a quarter of its intended size
     // on a 200% display, and its 16 px font with it. See Layout().
     private const int BaseWidth = 320;
-    private const int BaseHeight = 65;
+    private const int BaseHeight = 68;
     private const int BaseCornerRadius = 12;
     private const int BaseBorder = 1;
     private const int BaseMargin = 16;
@@ -38,17 +38,19 @@ internal sealed partial class OverlayNotification : IDisposable
     private const int BaseBarZone = NotificationCenter.BarZoneDesignPx;
 
     // Text only, no left-hand icon: the inset is the same on both sides, so the two lines read as
-    // one centred block instead of a label stuck beside a picture.
-    private const int BaseTextX = 14;
+    // one centred block instead of a label stuck beside a picture. 16 px of air on every side of
+    // the text block -- the 14/12 px fonts inside the 68 px card leave 18 px above and below, so
+    // the ink never touches the border.
+    private const int BaseTextX = 16;
     // Vertical rhythm of the two lines: title, a small gap, subtitle. Layout() centres the whole
     // block on the card's height, so this gap is the only thing separating the lines.
-    private const int BaseLineGap = 4;
+    private const int BaseLineGap = 5;
 
     // Font heights are in pixels here (the memory DC is a screen DC, so 1 unit = 1 pixel) and are
-    // the one place the scale has to reach: a 16 px title on a 200% monitor must be 32 px or it is
+    // the one place the scale has to reach: a 14 px title on a 200% monitor must be 28 px or it is
     // unreadable next to the game's own UI.
-    internal const int BaseTitleFontPx = 16;
-    private const int BaseMessageFontPx = 14;
+    internal const int BaseTitleFontPx = 14;
+    private const int BaseMessageFontPx = 12;
 
     // Enough to fit the 320 px card at Segoe UI without wrapping; a longer string is ellipsised
     // rather than allowed to spill past the rounded border. Character counts do not scale: the card
@@ -145,6 +147,12 @@ internal sealed partial class OverlayNotification : IDisposable
     // How long the current card holds before fading out; payload-driven, because the completed
     // card wants to be read rather than glimpsed.
     private int holdMs = HoldMs;
+    // The wall-clock moment the current card APPEARED, anchoring the lifecycle watchdogs.
+    private long shownAtTicks;
+
+    /// <summary>A sticky card parks for at most this long without a payload refresh; a hung
+    /// download step must not hold the screen hostage (same net the Linux card hangs).</summary>
+    private const int StickyRefreshTimeoutMs = 30_000;
 
     // The card's real pixel metrics for the monitor it is currently aimed at, derived from the
     // Base* design units by Layout(). Not constants: the game can sit on a 100% screen one clip and
@@ -584,6 +592,7 @@ internal sealed partial class OverlayNotification : IDisposable
             phaseStartTicks = Environment.TickCount64;
             holdMs = payload.HoldMs;
         }
+        shownAtTicks = Environment.TickCount64;
 
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(hwnd, TimerId, TimerIntervalMs, 0);
@@ -647,7 +656,26 @@ internal sealed partial class OverlayNotification : IDisposable
 
     private void StepAnimation()
     {
-        var elapsed = Environment.TickCount64 - phaseStartTicks;
+        var now = Environment.TickCount64;
+        var elapsed = now - phaseStartTicks;
+
+        // The safety nets of the lifecycle, on the wall clock since the card appeared: a non-sticky
+        // card must be gone holdMs + FadeIn + FadeOut + 500 ms after it was shown, whatever the
+        // phase machine believes; a sticky one must not hold the screen for more than 30 s without
+        // a payload refresh (a hung network step would otherwise park Checking forever).
+        if (!pendingPayload.Sticky && now - shownAtTicks > holdMs + FadeInMs + FadeOutMs + 500)
+        {
+            alpha = 0;
+            KillTimer(hwnd, TimerId);
+            ShowWindow(hwnd, SW_HIDE);
+            phase = Phase.Idle;
+            return;
+        }
+        if (phase == Phase.StickyHold && now - shownAtTicks > StickyRefreshTimeoutMs)
+        {
+            phase = Phase.FadeOut;
+            phaseStartTicks = now;
+        }
 
         switch (phase)
         {
@@ -655,8 +683,11 @@ internal sealed partial class OverlayNotification : IDisposable
                 if (elapsed >= FadeInMs)
                 {
                     alpha = 255;
-                    phase = Phase.StickyHold;
-                    phaseStartTicks = Environment.TickCount64;
+                    // THE stuck-card bug, fixed: the fade-in must land in the phase the PAYLOAD
+                    // asks for. Unconditionally entering StickyHold here parked every non-sticky
+                    // card on the screen until the next payload arrived to re-time it.
+                    phase = pendingPayload.Sticky ? Phase.StickyHold : Phase.Hold;
+                    phaseStartTicks = now;
                 }
                 else
                 {
@@ -669,7 +700,7 @@ internal sealed partial class OverlayNotification : IDisposable
                 if (elapsed >= holdMs)
                 {
                     phase = Phase.FadeOut;
-                    phaseStartTicks = Environment.TickCount64;
+                    phaseStartTicks = now;
                 }
                 break;
 
@@ -757,9 +788,11 @@ internal sealed partial class OverlayNotification : IDisposable
 
         // The text block's vertical centre: the space above the bar zone when one rides along, the
         // whole card otherwise -- which reproduces Layout()'s centring exactly (TitleY/MessageY are
-        // that same computation for the bar-less height).
+        // that same computation for the bar-less height). A single-line payload (empty subtitle)
+        // centres the title alone, with the same air above and below it.
         var lineGap = Scaled(BaseLineGap);
-        var blockHeight = TitleFontPx + lineGap + messageFontPx;
+        var singleLine = message.Length == 0;
+        var blockHeight = singleLine ? TitleFontPx : TitleFontPx + lineGap + messageFontPx;
         var zoneHeight = hasBar ? Height - Scaled(BaseBarZone) : Height;
         var titleY = (zoneHeight - blockHeight) / 2;
         var messageY = titleY + TitleFontPx + lineGap;
@@ -768,9 +801,12 @@ internal sealed partial class OverlayNotification : IDisposable
         SetTextColor(memDc, TitleColor);
         TextOut(memDc, TextX, titleY, title, title.Length);
 
-        SelectObject(memDc, messageFont);
-        SetTextColor(memDc, MessageColor);
-        TextOut(memDc, TextX, messageY, message, message.Length);
+        if (!singleLine)
+        {
+            SelectObject(memDc, messageFont);
+            SetTextColor(memDc, MessageColor);
+            TextOut(memDc, TextX, messageY, message, message.Length);
+        }
 
         if (hasBar)
             DrawProgress(payload, messageY + messageFontPx);

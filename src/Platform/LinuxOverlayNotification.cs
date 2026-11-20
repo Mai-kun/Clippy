@@ -37,20 +37,22 @@ namespace Clippy;
 internal sealed partial class LinuxOverlayNotification : IDisposable
 {
     // Design units, identical to the Windows card's (UI/OverlayNotification.cs) so the two cards
-    // are the same card: 320x65, 12 px radius on ALL four corners, 1 px hairline, 16 px margin,
-    // text inset 14 on both sides, 16/14 px fonts, 4 px line gap. Every use goes through Scaled.
+    // are the same card: 320x68, 12 px radius on ALL four corners, 1 px hairline, 16 px margin,
+    // 16 px text insets on both sides, 14/12 px fonts with a 5 px line gap -- the sizes that leave
+    // 18 px of air above and below the text block instead of ink touching the border. Every use
+    // goes through Scaled.
     private const int BaseWidth = 320;
-    private const int BaseHeight = 65;
+    private const int BaseHeight = 68;
     private const int BaseCornerRadius = 12;
     private const int BaseBorder = 1;
     private const int BaseMargin = 16;
 
-    private const int BaseTextX = 14;
-    private const int BaseTextRightInset = 14;
-    private const int BaseLineGap = 4;
+    private const int BaseTextX = 16;
+    private const int BaseTextRightInset = 16;
+    private const int BaseLineGap = 5;
 
-    private const int TitleFontPx = 16;
-    private const int MessageFontPx = 14;
+    private const int TitleFontPx = 14;
+    private const int MessageFontPx = 12;
 
     // The progress strip's design metrics, shared with the Windows card through NotificationCenter.
     private const int BarZone = NotificationCenter.BarZoneDesignPx;
@@ -68,7 +70,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     private const byte TitleR = 240, TitleG = 240, TitleB = 240;   // #F0F0F0
     private const byte MessageR = 170, MessageG = 170, MessageB = 170; // #AAAAAA
 
-    private enum Phase { FadeIn, Hold, StickyHold, FadeOut }
+    private enum Phase { Idle, FadeIn, Hold, StickyHold, FadeOut }
 
     private readonly ManualResetEventSlim ready = new(false);
     private Thread? thread;
@@ -224,6 +226,8 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         if (!TryDequeueLatest(out var payload))
             return;
 
+        currentPayload = payload;
+        shownAtTicks = Environment.TickCount64;
         RenderCardBase(payload);
 
         if (CurrentAlpha > 0)
@@ -234,11 +238,46 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         }
         else
         {
+            // The window may have been UNMAPPED at the end of the last fade-out: nothing the
+            // DrawFrame below writes is visible until it is mapped again.
+            ShowWindowMapped();
             phase = Phase.FadeIn;
             phaseStartTicks = Environment.TickCount64;
             holdMs = payload.HoldMs;
         }
     }
+
+    /// <summary>Mapping is state, not a per-frame concern: the fade-out unmaps once, the next
+    /// fade-in maps once, and every frame in between is a plain XPutImage.</summary>
+    private bool mapped;
+
+    private void ShowWindowMapped()
+    {
+        if (mapped || window == 0)
+            return;
+        XMapWindow(display, window);
+        XRaiseWindow(display, window);
+        XFlush(display); // the map must be on the wire before the first frame is drawn onto it
+        mapped = true;
+    }
+
+    private void HideWindowMapped()
+    {
+        if (!mapped || window == 0)
+            return;
+        XUnmapWindow(display, window);
+        // Xlib only queues the unmap: without a flush right here the command sits in the client's
+        // buffer while this thread moves on to sleep, and the card hangs on the screen past the
+        // end of its own animation -- exactly the stuck-card report.
+        XFlush(display);
+        mapped = false;
+    }
+
+    /// <summary>The payload the card is currently showing; its stickiness is what the fade-in
+    /// completion consults. A volatile field: ProcessPending and Tick share the overlay thread,
+    /// but keeping the payload named beats re-deriving it from the phase.</summary>
+    private volatile NotificationPayload currentPayload = new() { Title = "", Subtitle = "" };
+    private long shownAtTicks;
 
     /// <summary>The phase machine, one step per tick; mirrors the Windows card's StepAnimation.</summary>
     private Phase phase = Phase.FadeIn;
@@ -248,17 +287,56 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
     /// <summary>Alpha of the card on screen, read and written only on the overlay thread.</summary>
     private int CurrentAlpha;
 
+    /// <summary>
+    /// The safety nets of the lifecycle. A non-sticky card must be gone HoldMs + FadeIn + FadeOut
+    /// + 500 ms after it was shown, whatever the phase machine believes; a sticky one must not
+    /// hold the screen for more than 30 s without a payload refresh (a hung network step would
+    /// otherwise park Checking on the desktop forever). Neither fires in the normal flow -- they
+    /// exist because the normal flow is exactly what a bug bends.
+    /// </summary>
+    private const int StickyRefreshTimeoutMs = 30_000;
+
     private void Tick()
     {
-        var elapsed = Environment.TickCount64 - phaseStartTicks;
+        if (phase == Phase.Idle)
+            return;
+
+        var now = Environment.TickCount64;
+        var elapsed = now - phaseStartTicks;
+
+        // The watchdogs first: they inspect the WALL CLOCK since the card appeared, not the
+        // phase-local timer, so a wedged transition cannot outlive them.
+        if (!currentPayload.Sticky)
+        {
+            if (now - shownAtTicks > holdMs + FadeInMs + FadeOutMs + 500)
+            {
+                CurrentAlpha = 0;
+                HideWindowMapped();
+                phase = Phase.Idle;
+                return;
+            }
+        }
+        else if (phase == Phase.StickyHold && now - shownAtTicks > StickyRefreshTimeoutMs)
+        {
+            // A sticky operation that stopped updating: fade it out like a finished one, so a
+            // hung download does not hold the screen hostage for hours.
+            phase = Phase.FadeOut;
+            phaseStartTicks = now;
+        }
+
         switch (phase)
         {
             case Phase.FadeIn:
                 if (elapsed >= FadeInMs)
                 {
                     CurrentAlpha = 255;
-                    phase = Phase.StickyHold;
-                    phaseStartTicks = Environment.TickCount64;
+                    // THE stuck-card bug, fixed: the fade-in must land in the phase the PAYLOAD
+                    // asks for. Unconditionally entering StickyHold here parked every non-sticky
+                    // card on the screen until the next payload arrived to re-time it.
+                    phase = currentPayload.Sticky ? Phase.StickyHold : Phase.Hold;
+                    phaseStartTicks = now;
+                    if (phase == Phase.Hold)
+                        shownAtTicks = now; // the hold's clock and the watchdog's share the anchor
                 }
                 else
                     CurrentAlpha = (int)(elapsed * 255 / FadeInMs);
@@ -269,7 +347,7 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
                 if (elapsed >= holdMs)
                 {
                     phase = Phase.FadeOut;
-                    phaseStartTicks = Environment.TickCount64;
+                    phaseStartTicks = now;
                 }
                 break;
 
@@ -283,8 +361,12 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
                 var remaining = FadeOutMs - elapsed;
                 if (remaining <= 0)
                 {
+                    // Gone means GONE: alpha zero still leaves a mapped window on the screen, so
+                    // the card is unmapped (with the flush that puts the unmap on the wire now)
+                    // and the machine idles until the next payload.
                     CurrentAlpha = 0;
-                    DrawFrame(0);
+                    HideWindowMapped();
+                    phase = Phase.Idle;
                     return;
                 }
                 CurrentAlpha = (int)(remaining * 255 / FadeOutMs);
@@ -397,9 +479,12 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
         // Fonts and colours first: a card without text is worse than no card, so an Xft failure
         // here degrades the whole overlay and lets the caller fall back to the desktop toast.
-        // Same faces and weights as the Windows card: a bold title over a regular subtitle.
-        titleFont = XftFontOpenName(display, screen, $"{SansFamily}-{ScaledFont(TitleFontPx)}:bold");
-        messageFont = XftFontOpenName(display, screen, $"{SansFamily}-{ScaledFont(MessageFontPx)}");
+        // PIXELS, not points: a bare "Sans-14" pattern sets the size in POINTS, and Xft scales it
+        // by the display's DPI -- at 96 DPI the title rendered ~18 px and ate every padding the
+        // layout reserved. pixelsize is the exact pixel height the Windows card's CreateFont
+        // -height gives, already carrying the same scale factor.
+        titleFont = XftFontOpenName(display, screen, $"{SansFamily}:pixelsize={ScaledFont(TitleFontPx)}:bold");
+        messageFont = XftFontOpenName(display, screen, $"{SansFamily}:pixelsize={ScaledFont(MessageFontPx)}");
         if (titleFont == 0 || messageFont == 0)
         {
             Console.WriteLine("Overlay: Xft could not open a font; overlay disabled.");
@@ -490,8 +575,9 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
         titleColor = AllocColor(titleColorRef());
         messageColor = AllocColor(messageColorRef());
 
-        XMapWindow(display, window);
-        XRaiseWindow(display, window);
+        // The window stays UNMAPPED until the first payload fades it in: mapping it here would
+        // flash whatever the not-yet-drawn framebuffer holds, and an idle overlay must be exactly
+        // as invisible as it claims to be.
         XFlush(display);
 
         IsReady = true;
@@ -722,9 +808,11 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
         // One centred block, left-aligned at the text inset -- the Windows card's exact rhythm:
         // both lines start at TextX, the pair is centred vertically on the card (or, with a bar,
-        // on the space above the bar zone, so the growth happens BELOW the text).
+        // on the space above the bar zone, so the growth happens BELOW the text). A single-line
+        // payload (empty subtitle) centres the title alone, with the same air above and below.
         var gap = Scaled(BaseLineGap);
-        var blockHeight = TitleFontPx + gap + MessageFontPx;
+        var singleLine = messageBytes.Length == 0;
+        var blockHeight = singleLine ? TitleFontPx : TitleFontPx + gap + MessageFontPx;
         var zoneHeight = hasBar ? cardHeight - Scaled(BarZone) : cardHeight;
         var top = Math.Max(0, (zoneHeight - blockHeight) / 2);
         // XGlyphInfo.y is the ink's rise ABOVE the baseline, so the baseline that puts the ink top
@@ -1040,6 +1128,9 @@ internal sealed partial class LinuxOverlayNotification : IDisposable
 
     [LibraryImport("libX11.so.6")]
     private static partial int XMapWindow(nint display, nint window);
+
+    [LibraryImport("libX11.so.6")]
+    private static partial int XUnmapWindow(nint display, nint window);
 
     [LibraryImport("libX11.so.6")]
     private static partial int XResizeWindow(nint display, nint window, uint width, uint height);

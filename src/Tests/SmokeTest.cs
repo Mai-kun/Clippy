@@ -413,15 +413,15 @@ private static void FolderPickerApartment()
                 throw new InvalidOperationException(
                     $"{dpi} DPI: border is {overlay.Border} px, expected the {expectedBorder} px hairline");
 
-            var expectedTextX = (int)MathF.Round(14 * ratio);
+            var expectedTextX = (int)MathF.Round(16 * ratio);
             if (overlay.TextX != expectedTextX)
                 throw new InvalidOperationException(
                     $"{dpi} DPI: text inset {overlay.TextX}, expected {expectedTextX} (symmetric with the right inset)");
 
             // title + gap + subtitle is what TitleY centres on: the space above the block must equal
             // the space below it, to the pixel the odd/even split loses.
-            var expectedTextHeight = (int)MathF.Round(16 * ratio) + (int)MathF.Round(4 * ratio)
-                                   + (int)MathF.Round(14 * ratio);
+            var expectedTextHeight = (int)MathF.Round(14 * ratio) + (int)MathF.Round(5 * ratio)
+                                   + (int)MathF.Round(12 * ratio);
             if (overlay.TextHeight != expectedTextHeight)
                 throw new InvalidOperationException(
                     $"{dpi} DPI: text block is {overlay.TextHeight} px tall, expected {expectedTextHeight}");

@@ -19,6 +19,59 @@ if (platformHandled)
 if (args.Contains("--test-parsers"))
     return Clippy.ParserSelfTest.Run();
 
+// The overlay's lifecycle, watched from the X server's side of the wire: five shows with quick
+// in-place payload swaps, and after each one -- 3.5 s in, past hold plus both fades -- the card's
+// window MUST be IsUnmapped per XGetWindowAttributes. "I scaled the bitmap to zero" is not the
+// same as "the card left the screen"; this probe reads the server's map state, which is where a
+// missing XFlush (and the fade-in-into-StickyHold bug that parked cards for minutes) hides.
+// Does not touch the single-instance lock: it runs next to a live recorder.
+if (args.Contains("--test-overlay-lifecycle"))
+{
+#if LINUX
+    INotificationPresenter presenter = new LinuxNotificationPresenter(ClippyConfig.Load);
+    NotificationCenter.SetPresenter(presenter);
+    try
+    {
+        var failures = 0;
+        for (var i = 1; i <= 5; i++)
+        {
+            Console.WriteLine($"[test] show {i}: ClipSaved card, in-place swap 300 ms later");
+            NotificationCenter.ClipSaved(i * 10 + 29, 8.7);
+            await Task.Delay(300);
+            NotificationCenter.NotificationModePreview($"in-place swap {i}");
+            await Task.Delay(3200); // hold (2.6 s) + both fades are over by now
+            var state = LinuxOverlayProbe.GetMapState();
+            Console.WriteLine($"[test] after 3.5 s: map_state={state} ({(state == LinuxOverlayProbe.IsUnmapped ? "IsUnmapped" : "STILL MAPPED")})");
+            if (state != LinuxOverlayProbe.IsUnmapped)
+                failures++;
+        }
+
+        // The sticky leg: a Checking card refreshed in place, then replaced by a non-sticky one --
+        // the same hand-off the update flow makes, and the same trap the sticky bug hid in.
+        Console.WriteLine("[test] sticky cycle: Checking -> in-place refresh -> UpToDate");
+        NotificationCenter.CheckingForUpdates();
+        await Task.Delay(2000);
+        NotificationCenter.UpToDate(UpdateService.Version);
+        await Task.Delay(3500);
+        var stickyState = LinuxOverlayProbe.GetMapState();
+        Console.WriteLine($"[test] after the sticky cycle: map_state={stickyState} ({(stickyState == LinuxOverlayProbe.IsUnmapped ? "IsUnmapped" : "STILL MAPPED")})");
+        if (stickyState != LinuxOverlayProbe.IsUnmapped)
+            failures++;
+
+        Console.WriteLine(failures == 0 ? "OVERLAY LIFECYCLE: OK (all hidden)" : $"OVERLAY LIFECYCLE: FAILED ({failures} still mapped)");
+        return failures == 0 ? 0 : 1;
+    }
+    finally
+    {
+        NotificationCenter.SetPresenter(null);
+        presenter.Dispose();
+    }
+#else
+    Console.WriteLine("Linux-only test.");
+    return 0;
+#endif
+}
+
 if (args.Contains("--test-ring"))
     return Clippy.RingBufferSelfTest.Run();
 
