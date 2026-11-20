@@ -75,6 +75,9 @@ RestartSec=3
 WantedBy=graphical-session.target default.target
 SERVICE
     systemctl --user daemon-reload
+    # A previous install on a session without systemd may have left an XDG autostart entry: with
+    # the unit enabled too, the next login would launch two recorders -- the old entry goes.
+    rm -f "$HOME/.config/autostart/clippy.desktop"
     if pgrep -x Clippy >/dev/null 2>&1; then
         # An instance is already running (an update over a live session): enable
         # without --now, or two recorders would race for the portal.
